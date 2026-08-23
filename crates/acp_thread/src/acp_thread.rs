@@ -8301,6 +8301,23 @@ impl AcpThread {
         })
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn build_terminal_command(
+        shell: String,
+        is_windows: bool,
+        command: String,
+        args: &[String],
+    ) -> (String, Vec<String>) {
+        // The terminal task still allocates a PTY, so commands that need a terminal can use
+        // `/dev/tty`. The shell itself is non-interactive to avoid enabling job control for a
+        // one-shot command; interactive dash can fail to restore the TTY process group when the
+        // command runs in the Linux sandbox's PID namespace.
+        ShellBuilder::new(&Shell::Program(shell), is_windows)
+            .non_interactive()
+            .redirect_stdin_to_dev_null()
+            .build(Some(command), args)
+    }
+
     pub fn create_terminal(
         &self,
         command: String,
@@ -8336,6 +8353,7 @@ impl AcpThread {
         // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
         // setup fails with `ENOTTY`. Run the command non-interactively and
         // without a PTY in that case.
+        #[cfg(target_os = "windows")]
         let headless = HeadlessTerminal::is_enabled(cx);
 
         let terminal_id = acp_v2::TerminalId::new(Uuid::new_v4().to_string());
@@ -8400,13 +8418,12 @@ impl AcpThread {
 
                 #[cfg(not(target_os = "windows"))]
                 let (task_command, task_args, task_env, sandbox, spawn_cwd) = {
-                    let mut builder = ShellBuilder::new(&Shell::Program(shell), is_windows);
-                    if headless || (cfg!(target_os = "linux") && sandbox_wrap.is_some()) {
-                        builder = builder.non_interactive();
-                    }
-                    let (task_command, task_args) = builder
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                    let (task_command, task_args) = Self::build_terminal_command(
+                        shell,
+                        is_windows,
+                        command.clone(),
+                        &args,
+                    );
                     let (task_command, task_args, task_env, sandbox) = cx
                         .background_spawn(prepare_sandbox_wrap(
                             task_command,
@@ -8757,6 +8774,7 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use anyhow::anyhow;
     use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
@@ -8776,6 +8794,26 @@ mod tests {
         time::Duration,
     };
     use util::{path, path_list::PathList};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_agent_terminal_shell_is_non_interactive() {
+        let (program, args) = AcpThread::build_terminal_command(
+            "/bin/sh".to_string(),
+            false,
+            "printf 'works\\n'".to_string(),
+            &[],
+        );
+
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "exec </dev/null\nprintf 'works\\n'".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn test_text_cursor_reads_source_on_utf8_boundaries() {
