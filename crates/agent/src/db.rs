@@ -90,6 +90,8 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub action_log: action_log::SerializedActionLog,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -173,6 +175,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         }
     }
 
@@ -359,6 +362,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         })
     }
 }
@@ -983,6 +987,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         }
     }
 

@@ -1323,6 +1323,7 @@ async fn test_replayed_tool_call_ids_scoped_across_messages(cx: &mut TestAppCont
         let project = thread.project.clone();
         let context_server_registry = thread.context_server_registry.clone();
         let templates = thread.templates.clone();
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         cx.new(|cx| {
             Thread::from_db(
                 acp_v2::SessionId::new("restored"),
@@ -1331,6 +1332,7 @@ async fn test_replayed_tool_call_ids_scoped_across_messages(cx: &mut TestAppCont
                 project_context.clone(),
                 context_server_registry,
                 templates,
+                action_log,
                 cx,
             )
         })
@@ -3954,6 +3956,7 @@ async fn test_cumulative_token_usage(cx: &mut TestAppContext) {
         let project = thread.project.clone();
         let context_server_registry = thread.context_server_registry.clone();
         let templates = thread.templates.clone();
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         cx.new(|cx| {
             Thread::from_db(
                 acp_v2::SessionId::new("restored"),
@@ -3962,6 +3965,7 @@ async fn test_cumulative_token_usage(cx: &mut TestAppContext) {
                 project_context.clone(),
                 context_server_registry,
                 templates,
+                action_log,
                 cx,
             )
         })
