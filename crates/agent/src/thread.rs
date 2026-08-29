@@ -1751,6 +1751,7 @@ impl Thread {
         project_context: Entity<ProjectContext>,
         context_server_registry: Entity<ContextServerRegistry>,
         templates: Arc<Templates>,
+        action_log: Entity<ActionLog>,
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
@@ -1785,8 +1786,6 @@ impl Thread {
         let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(
             Self::prompt_capabilities(model.as_model().map(|model| model.as_ref())),
         );
-
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
         Self {
             id,
@@ -1935,6 +1934,7 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            action_log: self.action_log.read(cx).serialize(cx),
         };
 
         cx.background_spawn(async move {

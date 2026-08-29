@@ -11078,6 +11078,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            action_log: action_log::SerializedActionLog::default(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));

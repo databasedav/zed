@@ -33,6 +33,7 @@ use acp_thread::{
     AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
     AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId, TokenUsageRatio,
 };
+use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::{
     AGENTS_DIR_NAME, MAX_SKILL_DESCRIPTIONS_SIZE, MAX_SKILL_FILE_SIZE, ProjectSkillGroup,
@@ -842,11 +843,15 @@ impl NativeAgent {
             ));
         });
 
+        let thread_for_action_log = thread_handle.clone();
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
+            }),
+            cx.observe(&action_log, move |this, _, cx| {
+                this.save_thread(thread_for_action_log.clone(), cx)
             }),
         ];
 
@@ -1623,12 +1628,13 @@ impl NativeAgent {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let db_thread = database
+            let mut db_thread = database
                 .load_thread(id.clone())
                 .await?
                 .with_context(|| format!("no thread found with ID: {id:?}"))?;
+            let serialized_action_log = std::mem::take(&mut db_thread.action_log);
 
-            this.update(cx, |this, cx| {
+            let (thread, restore_action_log) = this.update(cx, |this, cx| {
                 let project_id = this.get_or_create_project_state(&project, cx);
                 let project_state = this
                     .projects
@@ -1637,8 +1643,11 @@ impl NativeAgent {
                 let summarization_model = LanguageModelRegistry::read_global(cx)
                     .thread_summary_model(cx)
                     .map(|c| c.model);
-
-                Ok(cx.new(|cx| {
+                let action_log = cx.new(|_| ActionLog::new(project_state.project.clone()));
+                let restore_action_log = action_log.update(cx, |action_log, cx| {
+                    action_log.restore(serialized_action_log, cx)
+                });
+                let thread = cx.new(|cx| {
                     let mut thread = Thread::from_db(
                         id.clone(),
                         db_thread,
@@ -1646,12 +1655,16 @@ impl NativeAgent {
                         project_state.project_context.clone(),
                         project_state.context_server_registry.clone(),
                         this.templates.clone(),
+                        action_log,
                         cx,
                     );
                     thread.set_summarization_model(summarization_model, cx);
                     thread
-                }))
-            })?
+                });
+                anyhow::Ok((thread, restore_action_log))
+            })??;
+            restore_action_log.await;
+            Ok(thread)
         })
     }
 
