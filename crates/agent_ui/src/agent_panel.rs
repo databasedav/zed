@@ -6900,7 +6900,7 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn install_custom_agent(id: &str, cx: &mut App) {
         SettingsStore::update_global(cx, |store, cx| {
@@ -9400,6 +9400,108 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<AgentPanel>, VisualTestContext) {
         setup_visible_panel_with_sidebar(cx, true).await
+    }
+
+    #[gpui::test]
+    async fn test_completed_assistant_response_toggles_markdown_source(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        panel.read_with(&cx, |panel, _cx| {
+            panel.language_registry.add(language::markdown_lang());
+        });
+        let connection = StubAgentConnection::new();
+        let markdown_source = "# Response\n\n- first item\n- second item";
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(markdown_source.into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.active_agent_thread(cx).unwrap().read(cx).status(),
+                ThreadStatus::Idle
+            );
+        });
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.toggle_markdown_source_for_tests(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |thread_view, cx| {
+            assert!(thread_view.markdown_source_is_shown_for_tests(1));
+            assert_eq!(
+                thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
+                Some(markdown_source)
+            );
+            assert_eq!(
+                thread_view
+                    .markdown_source_language_for_tests(1, cx)
+                    .as_ref()
+                    .map(|language| language.as_ref()),
+                Some("Markdown")
+            );
+            assert!(thread_view.markdown_source_is_read_only_for_tests(1, cx));
+        });
+
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.toggle_markdown_source_for_tests(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |thread_view, _cx| {
+            assert!(!thread_view.markdown_source_is_shown_for_tests(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_markdown_source_stays_synchronized_while_streaming(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        let session_id = active_session_id(&panel, &cx);
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("First".into())),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.toggle_markdown_source_for_tests(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |thread_view, cx| {
+            assert!(thread_view.markdown_source_is_shown_for_tests(1));
+            assert_eq!(
+                thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
+                Some("First")
+            );
+        });
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(" second".into())),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |thread_view, cx| {
+            assert!(thread_view.markdown_source_is_shown_for_tests(1));
+            assert_eq!(
+                thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
+                Some("First second")
+            );
+        });
     }
 
     async fn setup_visible_panel_with_sidebar(
