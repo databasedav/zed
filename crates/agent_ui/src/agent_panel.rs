@@ -9455,6 +9455,90 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_transcript_entry_navigation_selects_messages_without_moving_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .unwrap();
+            cx.bind_keys(default_key_bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("navigation-test-tool", "Inspect output")
+                    .kind(acp::ToolKind::Other)
+                    .status(acp::ToolCallStatus::Completed),
+            ),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Second response".into())),
+        ]);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.toggle_markdown_source_for_tests(1, window, cx);
+            thread_view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+        let markdown_source_editor = thread_view.read_with(&cx, |thread_view, _cx| {
+            thread_view.markdown_source_editor_for_tests(1).unwrap()
+        });
+        cx.update(|window, cx| {
+            markdown_source_editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-alt-shift-pagedown");
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 0, &cx);
+        thread_view.read_with(&cx, |thread_view, _cx| {
+            assert_eq!(thread_view.list_state.logical_scroll_top().item_ix, 0);
+        });
+
+        for expected_entry_index in [1, 2, 4, 4] {
+            thread_view.update_in(&mut cx, |thread_view, window, cx| {
+                thread_view.select_next_transcript_entry_for_tests(window, cx);
+            });
+            assert_transcript_selection(&thread_view, expected_entry_index, &cx);
+        }
+
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.select_previous_transcript_entry_for_tests(window, cx);
+        });
+        assert_transcript_selection(&thread_view, 2, &cx);
+
+        cx.update(|window, cx| {
+            assert!(markdown_source_editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    fn assert_transcript_selection(
+        thread_view: &Entity<ThreadView>,
+        expected_entry_index: usize,
+        cx: &VisualTestContext,
+    ) {
+        thread_view.read_with(cx, |thread_view, _cx| {
+            assert_eq!(
+                thread_view.selected_transcript_entry_for_tests(),
+                Some(expected_entry_index)
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_open_markdown_source_stays_synchronized_while_streaming(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
         let connection = StubAgentConnection::new();
@@ -9474,6 +9558,12 @@ mod tests {
         let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
         thread_view.update_in(&mut cx, |thread_view, window, cx| {
             thread_view.toggle_markdown_source_for_tests(1, window, cx);
+            thread_view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
         });
         cx.run_until_parked();
 
@@ -9483,6 +9573,7 @@ mod tests {
                 thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
                 Some("First")
             );
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(1));
         });
 
         cx.update(|_, cx| {
@@ -9501,6 +9592,7 @@ mod tests {
                 thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
                 Some("First second")
             );
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(1));
         });
     }
 
