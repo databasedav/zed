@@ -9906,6 +9906,505 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_transcript_entry_navigation_selects_messages_without_moving_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .unwrap();
+            cx.bind_keys(default_key_bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("navigation-test-tool", "Inspect output")
+                    .kind(acp::ToolKind::Other)
+                    .status(acp::ToolCallStatus::Completed),
+            ),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Second response".into())),
+        ]);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.toggle_markdown_source_for_tests(1, window, cx);
+            thread_view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+        let markdown_source_editor = thread_view.read_with(&cx, |thread_view, _cx| {
+            thread_view.markdown_source_editor_for_tests(1).unwrap()
+        });
+        cx.update(|window, cx| {
+            markdown_source_editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-alt-shift-pagedown");
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 0, &cx);
+        thread_view.read_with(&cx, |thread_view, _cx| {
+            assert_eq!(thread_view.list_state.logical_scroll_top().item_ix, 0);
+        });
+
+        for expected_entry_index in [1, 2, 4, 4] {
+            thread_view.update_in(&mut cx, |thread_view, window, cx| {
+                thread_view.select_next_transcript_entry_for_tests(window, cx);
+            });
+            assert_transcript_selection(&thread_view, expected_entry_index, &cx);
+        }
+
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.select_previous_transcript_entry_for_tests(window, cx);
+        });
+        assert_transcript_selection(&thread_view, 2, &cx);
+
+        cx.update(|window, cx| {
+            assert!(markdown_source_editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_input_output_focus_uses_active_message_editor(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default Linux keymap should load");
+            cx.bind_keys(default_key_bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let message_editor =
+            thread_view.read_with(&cx, |thread_view, _cx| thread_view.message_editor.clone());
+        let output_focus_handle =
+            thread_view.read_with(&cx, |thread_view, cx| thread_view.focus_handle(cx));
+
+        cx.focus(&message_editor);
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.update(|window, _cx| {
+            assert!(output_focus_handle.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.update(|window, cx| {
+            assert!(message_editor.focus_handle(cx).is_focused(window));
+        });
+
+        send_message(&panel, &mut cx);
+        let edited_message_editor = thread_view.read_with(&cx, |thread_view, cx| {
+            thread_view
+                .entry_view_state
+                .read(cx)
+                .entry(0)
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+                .expect("sent user message should have an editor")
+        });
+        cx.focus(&edited_message_editor);
+        cx.run_until_parked();
+        edited_message_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("Edited message", window, cx);
+        });
+
+        thread_view.read_with(&cx, |thread_view, _cx| {
+            assert_eq!(thread_view.editing_message, Some(0));
+        });
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.update(|window, _cx| {
+            assert!(output_focus_handle.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.update(|window, cx| {
+            assert!(edited_message_editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_transcript_selection_outline_requires_output_focus(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default Linux keymap should load");
+            cx.bind_keys(bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let message_editor = thread_view.read_with(&cx, |view, _cx| view.message_editor.clone());
+        cx.focus(&message_editor);
+        thread_view.update_in(&mut cx, |view, window, cx| {
+            view.select_next_transcript_entry_for_tests(window, cx);
+            view.select_next_transcript_entry_for_tests(window, cx);
+        });
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 1, &cx);
+        assert!(cx.debug_bounds("transcript-selection-outline").is_none());
+
+        for output_focused in [true, false, true] {
+            cx.simulate_keystrokes("ctrl-k o");
+            cx.run_until_parked();
+            assert_transcript_selection(&thread_view, 1, &cx);
+            assert_eq!(
+                cx.debug_bounds("transcript-selection-outline").is_some(),
+                output_focused,
+            );
+        }
+
+        cx.update(|window, cx| {
+            window.blur(cx);
+        });
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 1, &cx);
+        assert!(cx.debug_bounds("transcript-selection-outline").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_transcript_cursor_toggles_markdown_source_and_preserves_helix_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.helix_mode = Some(true);
+                });
+            });
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("alpha beta\ngamma delta".into()),
+        )]);
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let message_editor = thread_view.read_with(&cx, |view, _cx| view.message_editor.clone());
+        let output_focus_handle = thread_view.read_with(&cx, |view, cx| view.focus_handle(cx));
+
+        cx.focus(&message_editor);
+        cx.run_until_parked();
+        thread_view.read_with(&cx, |view, _cx| {
+            assert_eq!(view.selected_transcript_entry_for_tests(), None);
+        });
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        cx.update(|window, _cx| {
+            assert!(output_focus_handle.is_focused(window));
+        });
+        assert_transcript_selection(&thread_view, 1, &cx);
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let source_editor = thread_view.read_with(&cx, |view, _cx| {
+            assert!(view.markdown_source_is_shown_for_tests(1));
+            view.markdown_source_editor_for_tests(1)
+                .expect("markdown source editor should exist")
+        });
+        source_editor.update_in(&mut cx, |editor, window, cx| {
+            assert!(editor.is_focused(window));
+            assert_eq!(
+                editor
+                    .key_context(window, cx)
+                    .get("vim_mode")
+                    .map(|mode| mode.as_ref()),
+                Some("helix_normal"),
+            );
+            assert_eq!(
+                editor
+                    .selections
+                    .newest::<rope::Point>(&editor.display_snapshot(cx))
+                    .head()
+                    .row,
+                0
+            );
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        thread_view.read_with(&cx, |view, _cx| {
+            assert!(view.markdown_source_is_shown_for_tests(1));
+        });
+        source_editor.update_in(&mut cx, |editor, window, cx| {
+            assert!(editor.is_focused(window));
+            assert_eq!(
+                editor
+                    .selections
+                    .newest::<rope::Point>(&editor.display_snapshot(cx))
+                    .head()
+                    .row,
+                1,
+            );
+        });
+
+        cx.simulate_keystrokes("g w");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        source_editor.update_in(&mut cx, |editor, window, cx| {
+            assert!(editor.is_focused(window));
+            assert_eq!(
+                editor
+                    .key_context(window, cx)
+                    .get("vim_mode")
+                    .map(|mode| mode.as_ref()),
+                Some("helix_normal"),
+            );
+        });
+
+        cx.simulate_keystrokes("v");
+        cx.run_until_parked();
+        source_editor.update_in(&mut cx, |editor, window, cx| {
+            assert_eq!(
+                editor
+                    .key_context(window, cx)
+                    .get("vim_mode")
+                    .map(|mode| mode.as_ref()),
+                Some("helix_select"),
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        source_editor.update_in(&mut cx, |editor, window, cx| {
+            assert!(editor.is_focused(window));
+            assert_eq!(
+                editor
+                    .key_context(window, cx)
+                    .get("vim_mode")
+                    .map(|mode| mode.as_ref()),
+                Some("helix_normal"),
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, _cx| {
+            assert!(output_focus_handle.is_focused(window));
+        });
+        thread_view.read_with(&cx, |view, _cx| {
+            assert!(view.markdown_source_is_shown_for_tests(1));
+        });
+        assert_transcript_selection(&thread_view, 1, &cx);
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, _cx| {
+            assert!(output_focus_handle.is_focused(window));
+        });
+        thread_view.read_with(&cx, |view, _cx| {
+            assert!(!view.markdown_source_is_shown_for_tests(1));
+        });
+        assert_transcript_selection(&thread_view, 1, &cx);
+
+        cx.simulate_keystrokes("shift-pageup");
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 0, &cx);
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 0, &cx);
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("second turn response".into()),
+        )]);
+        send_message(&panel, &mut cx);
+        thread_view.read_with(&cx, |view, _cx| {
+            assert_eq!(view.selected_transcript_entry_for_tests(), None);
+        });
+
+        cx.focus(&message_editor);
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        assert_transcript_selection(&thread_view, 3, &cx);
+    }
+
+    #[gpui::test]
+    async fn test_transcript_cursor_activates_and_cancels_user_message_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let output_focus_handle = thread_view.read_with(&cx, |view, cx| view.focus_handle(cx));
+        let user_message_editor = thread_view.read_with(&cx, |view, cx| {
+            view.entry_view_state
+                .read(cx)
+                .entry(0)
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+                .expect("user message should have an editor")
+        });
+        let original_text = user_message_editor.read_with(&cx, |editor, cx| editor.text(cx));
+
+        for normal_mode in [None, Some("helix_normal"), Some("normal")] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.vim_mode = Some(normal_mode == Some("normal"));
+                        settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                    });
+                });
+            });
+            cx.run_until_parked();
+
+            cx.update(|window, cx| {
+                output_focus_handle.focus(window, cx);
+            });
+            cx.run_until_parked();
+            if thread_view.read_with(&cx, |view, _cx| view.selected_transcript_entry_for_tests())
+                != Some(0)
+            {
+                cx.simulate_keystrokes("shift-pageup");
+                cx.run_until_parked();
+            }
+            assert_transcript_selection(&thread_view, 0, &cx);
+
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                assert!(user_message_editor.focus_handle(cx).is_focused(window));
+            });
+            thread_view.read_with(&cx, |view, _cx| {
+                assert_eq!(view.editing_message, Some(0));
+            });
+
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("i");
+                cx.run_until_parked();
+            }
+            user_message_editor.update_in(&mut cx, |editor, window, cx| {
+                editor.set_text("Unsent draft edit", window, cx);
+            });
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("escape");
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    assert!(user_message_editor.focus_handle(cx).is_focused(window));
+                });
+            }
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            cx.update(|window, _cx| {
+                assert!(output_focus_handle.is_focused(window));
+            });
+            assert_transcript_selection(&thread_view, 0, &cx);
+            thread_view.read_with(&cx, |view, _cx| {
+                assert_eq!(view.editing_message, None);
+            });
+            user_message_editor.read_with(&cx, |editor, cx| {
+                assert_eq!(editor.text(cx), original_text);
+            });
+        }
+    }
+
+    fn assert_transcript_selection(
+        thread_view: &Entity<ThreadView>,
+        expected_entry_index: usize,
+        cx: &VisualTestContext,
+    ) {
+        thread_view.read_with(cx, |thread_view, _cx| {
+            assert_eq!(
+                thread_view.selected_transcript_entry_for_tests(),
+                Some(expected_entry_index)
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_open_markdown_source_stays_synchronized_while_streaming(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
         let connection = StubAgentConnection::new();
@@ -9925,6 +10424,12 @@ mod tests {
         let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
         thread_view.update_in(&mut cx, |thread_view, window, cx| {
             thread_view.toggle_markdown_source_for_tests(1, window, cx);
+            thread_view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
         });
         cx.run_until_parked();
 
@@ -9934,6 +10439,7 @@ mod tests {
                 thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
                 Some("First")
             );
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(1));
         });
 
         cx.update(|_, cx| {
@@ -9952,6 +10458,7 @@ mod tests {
                 thread_view.markdown_source_text_for_tests(1, cx).as_deref(),
                 Some("First second")
             );
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(1));
         });
     }
 

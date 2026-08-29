@@ -100,8 +100,9 @@ use crate::{
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
-    ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
+    ScrollOutputToTop, SelectNextTranscriptEntry, SelectPreviousTranscriptEntry, SendImmediately,
+    SendNextQueuedMessage, ToggleFastMode, ToggleInputOutputFocus, ToggleProfileSelector,
+    ToggleSelectedTranscriptEntry, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
     ToggleThinkingMode, UndoLastReject,
 };
 
@@ -11094,6 +11095,19 @@ pub(crate) mod tests {
             });
         });
 
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |thread_view, window, cx| {
+            thread_view.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
+        });
+        thread_view.read_with(cx, |thread_view, _cx| {
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(2));
+        });
+
         // Rewind to first message
         thread
             .update(cx, |thread, cx| thread.rewind(second_user_message_id, cx))
@@ -11104,6 +11118,9 @@ pub(crate) mod tests {
 
         thread.read_with(cx, |thread, _| {
             assert_eq!(thread.entries().len(), 2);
+        });
+        thread_view.read_with(cx, |thread_view, _cx| {
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(0));
         });
 
         conversation_view.read_with(cx, |view, cx| {

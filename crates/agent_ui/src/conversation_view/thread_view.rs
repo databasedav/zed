@@ -6,7 +6,7 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::v2::schema as acp_v2;
-use std::{cell::RefCell, path::Path};
+use std::{cell::RefCell, ops::Range, path::Path};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
@@ -136,6 +136,26 @@ struct MarkdownSourceEditor {
     editor: Entity<Editor>,
     observed_markdown: HashSet<EntityId>,
     _subscriptions: Vec<Subscription>,
+}
+
+fn closest_entry_not_below_viewport(
+    entry_indices: &[usize],
+    mut item_is_below_viewport: impl FnMut(usize) -> Option<bool>,
+) -> Option<usize> {
+    let mut has_measured_entry = false;
+    for entry_index in entry_indices.iter().rev().copied() {
+        match item_is_below_viewport(entry_index) {
+            Some(false) => return Some(entry_index),
+            Some(true) => has_measured_entry = true,
+            None => {}
+        }
+    }
+
+    if has_measured_entry {
+        None
+    } else {
+        entry_indices.last().copied()
+    }
 }
 
 #[derive(Default)]
@@ -765,6 +785,7 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    selected_transcript_entry: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
@@ -1183,8 +1204,10 @@ impl ThreadView {
                 |this, thread, event, window, cx| match event {
                     AcpThreadEvent::EntryUpdated(entry_index) => {
                         this.sync_markdown_source_editor(*entry_index, thread, window, cx);
+                        this.reconcile_selected_transcript_entry(*entry_index, cx);
                     }
                     AcpThreadEvent::EntriesRemoved(range) => {
+                        this.reconcile_selected_transcript_entry_after_removal(range.clone(), cx);
                         let focused_source_was_removed =
                             this.markdown_source_editors
                                 .iter()
@@ -1323,6 +1346,7 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            selected_transcript_entry: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1677,7 +1701,7 @@ impl ThreadView {
                 }
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Cancel) => {
-                self.cancel_editing(&Default::default(), window, cx);
+                self.cancel_editing_to_transcript(event.entry_index, window, cx);
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SlashAutocompleteOpened) => {
             }
@@ -2337,6 +2361,7 @@ impl ThreadView {
         self.thread_error.take();
         self.thread_feedback.clear();
         self.editing_message.take();
+        self.selected_transcript_entry.take();
 
         cx.spawn_in(window, async move |this, cx| {
             let (mut content, tracked_buffers) = contents.await?;
@@ -2392,6 +2417,7 @@ impl ThreadView {
         self.thread_error.take();
         self.thread_feedback.clear();
         self.editing_message.take();
+        self.selected_transcript_entry.take();
         // Sending a message is active engagement: un-freeze the queue if it
         // was paused by a manual stop.
         self.message_queue.resume();
@@ -3412,13 +3438,13 @@ impl ThreadView {
         });
     }
 
-    pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn revert_editing_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.editing_message.take()
             && let Some(editor) = &self
                 .entry_view_state
                 .read(cx)
                 .entry(index)
-                .and_then(|e| e.message_editor())
+                .and_then(|entry| entry.message_editor())
                 .cloned()
         {
             editor.update(cx, |editor, cx| {
@@ -3427,7 +3453,7 @@ impl ThreadView {
                     .read(cx)
                     .entries()
                     .get(index)
-                    .and_then(|e| e.user_message())
+                    .and_then(|entry| entry.user_message())
                 {
                     editor.set_source_message(
                         user_message.content.source_blocks().to_vec(),
@@ -3435,9 +3461,25 @@ impl ThreadView {
                         cx,
                     );
                 }
-            })
-        };
+            });
+        }
+    }
+
+    pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.revert_editing_message(window, cx);
         self.message_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_editing_to_transcript(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.revert_editing_message(window, cx);
+        self.selected_transcript_entry = Some(entry_index);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -7468,7 +7510,27 @@ impl ThreadView {
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
+                    let selected = this.selected_transcript_entry == Some(index)
+                        && this.focus_handle.is_focused(window);
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered =
+                        div()
+                            .relative()
+                            .w_full()
+                            .child(rendered)
+                            .when(selected, |this| {
+                                this.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "transcript-selection-outline".to_string()
+                                        })
+                                        .absolute()
+                                        .inset_0()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border_focused),
+                                )
+                            });
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
@@ -7545,6 +7607,7 @@ impl ThreadView {
 
                 v_flex()
                     .id(("user_message", entry_ix))
+                    .key_context("TranscriptMessageEditor")
                     .map(|this| {
                         if is_first_indented {
                             this.pt_0p5()
@@ -7692,6 +7755,7 @@ impl ThreadView {
                     .map(|source| source.editor.clone())
                 {
                     is_blank = false;
+                    let source_editor_focused = source_editor.focus_handle(cx).is_focused(window);
                     let settings = ThemeSettings::get_global(cx);
                     let source_editor = EditorElement::new(
                         &source_editor,
@@ -7714,10 +7778,22 @@ impl ThreadView {
                         },
                     );
                     v_flex()
+                        .key_context("MarkdownSourceEditor")
+                        .on_action(cx.listener(
+                            move |this, _: &editor::actions::Cancel, window, cx| {
+                                this.selected_transcript_entry = Some(entry_ix);
+                                this.focus_handle.focus(window, cx);
+                                cx.notify();
+                            },
+                        ))
                         .w_full()
                         .rounded_md()
                         .border_1()
-                        .border_color(cx.theme().colors().border)
+                        .border_color(if source_editor_focused {
+                            cx.theme().colors().border_focused
+                        } else {
+                            cx.theme().colors().border
+                        })
                         .bg(cx.theme().colors().editor_background)
                         .child(
                             h_flex()
@@ -8541,6 +8617,22 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn toggle_input_output_focus(
+        &mut self,
+        _: &ToggleInputOutputFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input_focus_handle = self.active_editor(cx).focus_handle(cx);
+        if input_focus_handle.contains_focused(window, cx) {
+            self.ensure_visible_transcript_selection_for_output_focus(cx);
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        } else {
+            input_focus_handle.focus(window, cx);
+        }
+    }
+
     fn scroll_output_page_up(
         &mut self,
         _: &ScrollOutputPageUp,
@@ -8642,6 +8734,255 @@ impl ThreadView {
                 offset_in_item: px(0.),
             });
             cx.notify();
+        }
+    }
+
+    fn is_navigable_transcript_entry(entry: &AgentThreadEntry) -> bool {
+        matches!(
+            entry,
+            AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+        )
+    }
+
+    fn select_previous_transcript_entry(
+        &mut self,
+        _: &SelectPreviousTranscriptEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.thread.read(cx).entries();
+        let end = self
+            .selected_transcript_entry
+            .unwrap_or_else(|| {
+                self.list_state
+                    .logical_scroll_top()
+                    .item_ix
+                    .saturating_add(1)
+            })
+            .min(entries.len());
+        let target = (0..end)
+            .rev()
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]));
+        if let Some(target) = target {
+            self.select_transcript_entry(target, cx);
+        }
+    }
+
+    fn select_next_transcript_entry(
+        &mut self,
+        _: &SelectNextTranscriptEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.thread.read(cx).entries();
+        let start = self
+            .selected_transcript_entry
+            .map_or_else(
+                || self.list_state.logical_scroll_top().item_ix,
+                |index| index.saturating_add(1),
+            )
+            .min(entries.len());
+        let target = (start..entries.len())
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]));
+        if let Some(target) = target {
+            self.select_transcript_entry(target, cx);
+        }
+    }
+
+    fn select_transcript_entry(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        self.selected_transcript_entry = Some(entry_index);
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry_index,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    fn reconcile_selected_transcript_entry(
+        &mut self,
+        updated_entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_transcript_entry != Some(updated_entry_index) {
+            return;
+        }
+
+        let entries = self.thread.read(cx).entries();
+        if entries
+            .get(updated_entry_index)
+            .is_some_and(Self::is_navigable_transcript_entry)
+        {
+            return;
+        }
+
+        let selected = Self::nearest_navigable_transcript_entry(entries, updated_entry_index);
+        if self.selected_transcript_entry != selected {
+            self.selected_transcript_entry = selected;
+            cx.notify();
+        }
+    }
+
+    fn reconcile_selected_transcript_entry_after_removal(
+        &mut self,
+        removed_range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected) = self.selected_transcript_entry else {
+            return;
+        };
+
+        let removed_count = removed_range.end.saturating_sub(removed_range.start);
+        let entries = self.thread.read(cx).entries();
+        let adjusted = if selected < removed_range.start {
+            Some(selected)
+        } else if selected >= removed_range.end {
+            Some(selected.saturating_sub(removed_count))
+        } else {
+            Self::nearest_navigable_transcript_entry(entries, removed_range.start)
+        };
+        let adjusted = adjusted.filter(|&index| {
+            entries
+                .get(index)
+                .is_some_and(Self::is_navigable_transcript_entry)
+        });
+
+        if self.selected_transcript_entry != adjusted {
+            self.selected_transcript_entry = adjusted;
+            cx.notify();
+        }
+    }
+
+    fn nearest_navigable_transcript_entry(
+        entries: &[AgentThreadEntry],
+        index: usize,
+    ) -> Option<usize> {
+        let index = index.min(entries.len());
+        (index..entries.len())
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]))
+            .or_else(|| {
+                (0..index)
+                    .rev()
+                    .find(|&index| Self::is_navigable_transcript_entry(&entries[index]))
+            })
+    }
+
+    fn is_rendered_navigable_transcript_entry(entry: &AgentThreadEntry, cx: &App) -> bool {
+        match entry {
+            AgentThreadEntry::UserMessage(message) => !message.content.source_blocks().is_empty(),
+            AgentThreadEntry::AssistantMessage(message) => {
+                message.chunks.iter().any(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block, .. }
+                    | AssistantMessageChunk::Thought { block, .. } => block.visible_content(cx),
+                })
+            }
+            _ => Self::is_navigable_transcript_entry(entry),
+        }
+    }
+
+    fn closest_navigable_transcript_entry_above_input(&self, cx: &App) -> Option<usize> {
+        let entry_indices: Vec<usize> = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| {
+                Self::is_rendered_navigable_transcript_entry(entry, cx).then_some(entry_index)
+            })
+            .collect();
+
+        // The list viewport ends above the activity bar and message editor, so choosing the
+        // last navigable item that is not below that viewport avoids jumping to an entry
+        // hidden beneath the visible conversation.
+        closest_entry_not_below_viewport(&entry_indices, |entry_index| {
+            self.list_state.item_is_below_viewport(entry_index)
+        })
+    }
+
+    fn ensure_visible_transcript_selection_for_output_focus(&mut self, cx: &mut Context<Self>) {
+        let has_visible_selection = self
+            .selected_transcript_entry
+            .is_some_and(|selected_index| {
+                let is_navigable = self
+                    .thread
+                    .read(cx)
+                    .entries()
+                    .get(selected_index)
+                    .is_some_and(|entry| Self::is_rendered_navigable_transcript_entry(entry, cx));
+                is_navigable
+                    && self.list_state.item_is_above_viewport(selected_index) != Some(true)
+                    && self.list_state.item_is_below_viewport(selected_index) != Some(true)
+            });
+        if !has_visible_selection {
+            self.selected_transcript_entry =
+                self.closest_navigable_transcript_entry_above_input(cx);
+            if let Some(selected_index) = self.selected_transcript_entry
+                && self.list_state.item_is_above_viewport(selected_index) == Some(true)
+            {
+                self.list_state.scroll_to_reveal_item(selected_index);
+            }
+        }
+    }
+
+    fn toggle_selected_transcript_entry(
+        &mut self,
+        _: &ToggleSelectedTranscriptEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry_index) = self
+            .selected_transcript_entry
+            .filter(|&entry_index| {
+                self.thread
+                    .read(cx)
+                    .entries()
+                    .get(entry_index)
+                    .is_some_and(Self::is_navigable_transcript_entry)
+            })
+            .or_else(|| self.closest_navigable_transcript_entry_above_input(cx))
+        else {
+            return;
+        };
+
+        self.selected_transcript_entry = Some(entry_index);
+
+        let Some(entry) = self.thread.read(cx).entries().get(entry_index) else {
+            return;
+        };
+
+        match entry {
+            AgentThreadEntry::UserMessage(_) => {
+                let Some(editor) = self
+                    .entry_view_state
+                    .read(cx)
+                    .entry(entry_index)
+                    .and_then(|entry| entry.message_editor())
+                    .cloned()
+                else {
+                    return;
+                };
+                self.list_state.scroll_to_reveal_item(entry_index);
+                editor.focus_handle(cx).focus(window, cx);
+                cx.notify();
+            }
+            AgentThreadEntry::AssistantMessage(_) => {
+                if let Some(source) = self.markdown_source_editors.remove(&entry_index) {
+                    if source.editor.focus_handle(cx).contains_focused(window, cx) {
+                        self.focus_handle.focus(window, cx);
+                    }
+                    cx.notify();
+                } else if self.show_markdown_source(entry_index, window, cx)
+                    && let Some(editor) = self
+                        .markdown_source_editors
+                        .get(&entry_index)
+                        .map(|source| source.editor.clone())
+                {
+                    self.list_state.scroll_to_reveal_item(entry_index);
+                    editor.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9442,6 +9783,29 @@ impl ThreadView {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_transcript_entry_for_tests(&self) -> Option<usize> {
+        self.selected_transcript_entry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_previous_transcript_entry_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_previous_transcript_entry(&SelectPreviousTranscriptEntry, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_next_transcript_entry_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_next_transcript_entry(&SelectNextTranscriptEntry, window, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn toggle_markdown_source_for_tests(
         &mut self,
         entry_index: usize,
@@ -9454,6 +9818,16 @@ impl ThreadView {
     #[cfg(test)]
     pub(crate) fn markdown_source_is_shown_for_tests(&self, entry_index: usize) -> bool {
         self.markdown_source_editors.contains_key(&entry_index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_editor_for_tests(
+        &self,
+        entry_index: usize,
+    ) -> Option<Entity<Editor>> {
+        self.markdown_source_editors
+            .get(&entry_index)
+            .map(|source| source.editor.clone())
     }
 
     #[cfg(test)]
@@ -14567,6 +14941,7 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::handle_toggle_command_pattern))
             .on_action(cx.listener(Self::open_permission_dropdown))
             .on_action(cx.listener(Self::open_add_context_menu))
+            .on_action(cx.listener(Self::toggle_input_output_focus))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
             .on_action(cx.listener(Self::scroll_output_line_up))
@@ -14575,6 +14950,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::select_previous_transcript_entry))
+            .on_action(cx.listener(Self::select_next_transcript_entry))
+            .on_action(cx.listener(Self::toggle_selected_transcript_entry))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
@@ -15345,6 +15723,37 @@ mod tests {
         acp_v2::AvailableCommand::Command(acp_v2::Command::new(name, "").meta(
             acp_thread::meta_with_command_category(acp_thread::CommandCategory::Mcp),
         ))
+    }
+
+    #[test]
+    fn test_closest_entry_not_below_viewport_skips_entries_below_viewport() {
+        let entry_indices = [1, 3, 5];
+
+        assert_eq!(
+            closest_entry_not_below_viewport(&entry_indices, |entry_index| match entry_index {
+                1 | 3 => Some(false),
+                5 => Some(true),
+                _ => None,
+            }),
+            Some(3)
+        );
+        assert_eq!(
+            closest_entry_not_below_viewport(&entry_indices, |entry_index| match entry_index {
+                1 => Some(false),
+                3 => Some(true),
+                5 => None,
+                _ => None,
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            closest_entry_not_below_viewport(&entry_indices, |_| None),
+            Some(5)
+        );
+        assert_eq!(
+            closest_entry_not_below_viewport(&entry_indices, |_| Some(true)),
+            None
+        );
     }
 
     #[test]

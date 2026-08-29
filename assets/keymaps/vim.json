@@ -1216,6 +1216,12 @@
       "enter": "agent::Chat",
     },
   },
+  {
+    "context": "((MarkdownSourceEditor > Editor) || (TranscriptMessageEditor > MessageEditor > Editor)) && (vim_mode == normal || vim_mode == helix_normal) && !menu && !BufferSearchBar",
+    "bindings": {
+      "escape": "editor::Cancel",
+    },
+  },
 
   {
     "context": "SettingsWindow > NavigationMenu && !search",
