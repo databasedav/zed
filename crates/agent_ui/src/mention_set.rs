@@ -169,6 +169,7 @@ impl MentionSet {
             ))),
             MentionUri::PastedImage { .. }
             | MentionUri::TerminalSelection { .. }
+            | MentionUri::AgentResponse
             | MentionUri::MergeConflict { .. }
             | MentionUri::Rule { .. } => {
                 Task::ready(Err(anyhow!("Unsupported mention URI type for paste")))
@@ -346,6 +347,9 @@ impl MentionSet {
                 debug_panic!("unexpected terminal URI");
                 Task::ready(Err(anyhow!("unexpected terminal URI")))
             }
+            MentionUri::AgentResponse => Task::ready(Err(anyhow!(
+                "Agent response mentions require owned content"
+            ))),
             MentionUri::GitDiff { base_ref } => {
                 self.confirm_mention_for_git_diff(base_ref.into(), cx)
             }
@@ -947,6 +951,28 @@ mod tests {
         )
         .await;
         assert_eq!(content, "project copy");
+    }
+
+    #[gpui::test]
+    async fn test_agent_response_mentions_are_not_supported_for_paste(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let mention_set = cx.new(|_cx| MentionSet::new(project.downgrade(), None));
+
+        let mention_task = mention_set.update(cx, |mention_set, cx| {
+            let http_client = project.read(cx).client().http_client();
+            mention_set.confirm_mention_for_uri(MentionUri::AgentResponse, false, http_client, cx)
+        });
+
+        let error = mention_task.await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported mention URI type for paste")
+        );
     }
 
     #[test]

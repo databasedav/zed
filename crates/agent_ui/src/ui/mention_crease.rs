@@ -213,6 +213,7 @@ fn open_mention_uri(
         | MentionUri::Selection { abs_path: None, .. }
         | MentionUri::Diagnostics { .. }
         | MentionUri::TerminalSelection { .. }
+        | MentionUri::AgentResponse
         | MentionUri::GitDiff { .. }
         | MentionUri::MergeConflict { .. } => {}
     });

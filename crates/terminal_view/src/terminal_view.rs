@@ -627,7 +627,10 @@ impl TerminalView {
                                 menu.action("Inline Assist", Box::new(InlineAssist::default()))
                             })
                             .when(has_selection && self.shows_workspace_actions(), |menu| {
-                                menu.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                                menu.action(
+                                    "Add to Agent Thread",
+                                    Box::new(AddSelectionToThread::default()),
+                                )
                             })
                     },
                 )

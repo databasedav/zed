@@ -6,7 +6,11 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::v2::schema as acp_v2;
-use std::{cell::RefCell, ops::Range, path::Path};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    path::Path,
+};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
@@ -791,6 +795,7 @@ pub struct ThreadView {
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
     markdown_source_editors: HashMap<usize, MarkdownSourceEditor>,
+    last_markdown_context_menu_capture_id: Cell<u64>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -1359,6 +1364,7 @@ impl ThreadView {
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             markdown_source_editors: HashMap::default(),
+            last_markdown_context_menu_capture_id: Cell::new(0),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -7036,7 +7042,8 @@ impl ThreadView {
                         .handler({
                             move |window, cx| {
                                 window.dispatch_action(
-                                    zed_actions::agent::AddSelectionToThread.boxed_clone(),
+                                    zed_actions::agent::AddSelectionToThread::default()
+                                        .boxed_clone(),
                                     cx,
                                 );
                             }
@@ -9532,6 +9539,23 @@ impl ThreadView {
                 ContextMenu::build(window, cx, move |menu, _, cx| {
                     let this = entity.read(cx);
                     let is_at_top = this.list_state.logical_scroll_top().item_ix == 0;
+                    let is_response = markdown.as_ref().is_some_and(|markdown| {
+                        this.thread
+                            .read(cx)
+                            .entries()
+                            .get(entry_ix)
+                            .is_some_and(|entry| {
+                                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                                    return false;
+                                };
+                                message.chunks.iter().any(|chunk| match chunk {
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdowns().any(|candidate| candidate == markdown)
+                                    }
+                                    AssistantMessageChunk::Thought { .. } => false,
+                                })
+                            })
+                    });
                     let markdown = markdown.as_ref().map(|markdown| markdown.read(cx));
                     let context_menu_link =
                         markdown.and_then(|markdown| markdown.context_menu_link().cloned());
@@ -9539,6 +9563,21 @@ impl ThreadView {
                         .and_then(|markdown| markdown.context_menu_selected_text().cloned());
                     let selected_markdown = markdown
                         .and_then(|markdown| markdown.context_menu_selected_markdown().cloned());
+                    let selected_response_excerpt = markdown
+                        .filter(|markdown| {
+                            let capture_id = markdown.context_menu_capture_id();
+                            if capture_id <= this.last_markdown_context_menu_capture_id.get() {
+                                return false;
+                            }
+                            this.last_markdown_context_menu_capture_id.set(capture_id);
+                            is_response
+                        })
+                        .and_then(|_| {
+                            selected_markdown
+                                .clone()
+                                .filter(|excerpt| !excerpt.is_empty())
+                        });
+                    let has_response_excerpt = selected_response_excerpt.is_some();
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -9632,6 +9671,13 @@ impl ThreadView {
                                 },
                             )
                         })
+                        .action_disabled_when(
+                            !has_response_excerpt,
+                            "Add to Agent Thread",
+                            Box::new(AddSelectionToThread {
+                                agent_response_excerpt: selected_response_excerpt,
+                            }),
+                        )
                         .item(copy_this_agent_response)
                         .when_some(show_markdown_source, |menu, item| menu.item(item))
                         .separator()
@@ -9742,6 +9788,42 @@ impl ThreadView {
             editor.set_read_only(true);
             editor.set_use_modal_editing(true);
             editor.disable_mouse_wheel_zoom();
+            editor.set_custom_context_menu(|editor, _point, window, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                let mut selected_markdown = String::new();
+                let mut has_selection = false;
+                for selection in editor
+                    .selections
+                    .all::<MultiBufferOffset>(&display_snapshot)
+                {
+                    if selection.is_empty() {
+                        continue;
+                    }
+                    if has_selection {
+                        selected_markdown.push('\n');
+                    }
+                    selected_markdown.extend(buffer.text_for_range(selection.start..selection.end));
+                    has_selection = true;
+                }
+                let selected_markdown =
+                    has_selection.then(|| SharedString::from(selected_markdown));
+
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.action_disabled_when(
+                        !has_selection,
+                        "Copy Selection",
+                        Box::new(editor::actions::Copy),
+                    )
+                    .action_disabled_when(
+                        !has_selection,
+                        "Add to Agent Thread",
+                        Box::new(AddSelectionToThread {
+                            agent_response_excerpt: selected_markdown,
+                        }),
+                    )
+                }))
+            });
             editor
         });
 
@@ -15497,6 +15579,7 @@ pub(crate) fn open_link(
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
+            MentionUri::AgentResponse => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
             MentionUri::Rule { name, .. } => {

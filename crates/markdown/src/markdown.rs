@@ -27,7 +27,10 @@ use std::mem;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
 
 use collections::{HashMap, HashSet};
@@ -55,6 +58,8 @@ use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, p
 use util::ResultExt;
 
 use crate::parser::CodeBlockKind;
+
+static NEXT_CONTEXT_MENU_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 const MERMAID_MAX_ZOOM: f32 = 2.0;
 /// Zoom levels within this distance of 1.0 snap back to exactly 1.0 so users
@@ -521,6 +526,7 @@ pub struct Markdown {
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
+    context_menu_capture_id: u64,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
 }
@@ -737,6 +743,7 @@ impl Markdown {
             context_menu_link: None,
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
+            context_menu_capture_id: 0,
             search_highlights: Rc::default(),
             active_search_highlight: None,
         };
@@ -1191,6 +1198,8 @@ impl Markdown {
         link: Option<SharedString>,
         rendered_text: Option<&RenderedText>,
     ) {
+        self.context_menu_capture_id =
+            NEXT_CONTEXT_MENU_CAPTURE_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let range = self.selection.start..self.selection.end;
         if range.end > range.start {
             self.context_menu_selected_markdown = Some(SharedString::new(
@@ -1206,6 +1215,11 @@ impl Markdown {
             self.context_menu_selected_text = None;
         }
         self.context_menu_link = link;
+    }
+
+    /// Identifies the most recent context-menu capture across all Markdown entities.
+    pub fn context_menu_capture_id(&self) -> u64 {
+        self.context_menu_capture_id
     }
 
     /// Returns the URL of the link that was most recently right-clicked, if any.
@@ -7627,6 +7641,9 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| TestWindow);
         let markdown = cx.new(|cx| Markdown::new("some text".into(), None, None, cx));
         cx.run_until_parked();
+        let initial_capture_id =
+            cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert_eq!(initial_capture_id, 0);
 
         // Simulates right-clicking on a link, with "text" selected
         let url: SharedString = "https://example.com".into();
@@ -7635,6 +7652,8 @@ mod tests {
             md.selection.end = 9;
             md.capture_for_context_menu(Some(url.clone()), None);
         });
+        let first_capture_id = cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert!(first_capture_id > initial_capture_id);
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
             assert_eq!(
@@ -7661,6 +7680,9 @@ mod tests {
             md.selection.end = 0;
             md.capture_for_context_menu(None, None);
         });
+        let second_capture_id =
+            cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert!(second_capture_id > first_capture_id);
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
             assert!(markdown.context_menu_link().is_none());
