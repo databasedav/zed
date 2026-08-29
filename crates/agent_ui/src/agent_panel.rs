@@ -641,7 +641,33 @@ pub fn init(cx: &mut App) {
                     },
                 )
                 .register_action(
-                    |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
+                    |workspace: &mut Workspace, action: &AddSelectionToThread, window, cx| {
+                        if let Some(excerpt) = action.agent_response_excerpt.clone() {
+                            if excerpt.is_empty() {
+                                return;
+                            }
+
+                            let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
+                                return;
+                            };
+                            agent_panel.update(cx, |_, cx| {
+                                cx.defer_in(window, move |panel, window, cx| {
+                                    if let Some(conversation_view) =
+                                        panel.active_conversation_view()
+                                    {
+                                        conversation_view.update(cx, |conversation_view, cx| {
+                                            conversation_view.insert_selection(
+                                                AgentContextSelection::AgentResponse(excerpt),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                });
+                            });
+                            return;
+                        }
+
                         let active_editor = workspace
                             .active_item(cx)
                             .and_then(|item| item.act_as::<Editor>(cx));
@@ -796,6 +822,7 @@ fn format_selection_for_terminal(
             }
         }
         AgentContextSelection::Terminal(texts) => texts.join("\n"),
+        AgentContextSelection::AgentResponse(_) => String::new(),
     }
 }
 
@@ -9334,7 +9361,7 @@ mod tests {
         // With only a cursor and nothing highlighted, the action is a no-op and
         // must not paste anything into the terminal.
         workspace.update_in(&mut cx, |_, window, cx| {
-            window.dispatch_action(AddSelectionToThread.boxed_clone(), cx);
+            window.dispatch_action(AddSelectionToThread::default().boxed_clone(), cx);
         });
         cx.run_until_parked();
         let pasted_without_selection =
@@ -9353,7 +9380,7 @@ mod tests {
         cx.run_until_parked();
 
         workspace.update_in(&mut cx, |_, window, cx| {
-            window.dispatch_action(AddSelectionToThread.boxed_clone(), cx);
+            window.dispatch_action(AddSelectionToThread::default().boxed_clone(), cx);
         });
         cx.run_until_parked();
 
@@ -9400,6 +9427,78 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<AgentPanel>, VisualTestContext) {
         setup_visible_panel_with_sidebar(cx, true).await
+    }
+
+    #[gpui::test]
+    async fn test_add_agent_response_selection_to_active_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let message_editor =
+            thread_view.read_with(&cx, |thread_view, _cx| thread_view.message_editor.clone());
+        let workspace = thread_view.read_with(&cx, |thread_view, _cx| {
+            thread_view
+                .workspace
+                .upgrade()
+                .expect("workspace should still exist")
+        });
+
+        cx.focus(&thread_view);
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(
+                AddSelectionToThread {
+                    agent_response_excerpt: Some("".into()),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            assert!(thread_view.focus_handle(cx).is_focused(window));
+            assert!(!message_editor.focus_handle(cx).is_focused(window));
+        });
+
+        let response = "Selected **rendered** response.\n\n- item";
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(
+                AddSelectionToThread {
+                    agent_response_excerpt: Some(response.into()),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            assert!(message_editor.focus_handle(cx).is_focused(window));
+        });
+        let thread_id = panel.read_with(&cx, |panel, cx| {
+            panel.active_thread_id(cx).expect("thread should be active")
+        });
+        let draft_blocks = panel.read_with(&cx, |panel, cx| {
+            panel
+                .draft_prompt_blocks_if_in_memory(thread_id, cx)
+                .expect("draft should be in memory")
+        });
+        assert!(matches!(
+            draft_blocks.as_slice(),
+            [acp::ContentBlock::Resource(acp::EmbeddedResource {
+                resource:
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents { uri, text, .. },
+                    ),
+                ..
+            })] if uri == MentionUri::AgentResponse.to_uri().as_str() && text == response
+        ));
     }
 
     #[gpui::test]

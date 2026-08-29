@@ -21,8 +21,8 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorElement, EditorEvent, EditorMode, EditorStyle, MultiBuffer, PathKey,
-    SelectionEffects, SizingBehavior,
+    Editor, EditorElement, EditorEvent, EditorMode, EditorStyle, MultiBuffer, MultiBufferOffset,
+    PathKey, SelectionEffects, SizingBehavior,
 };
 use file_icons::FileIcons;
 use fs::Fs;
@@ -74,7 +74,7 @@ use util::{
 use workspace::{
     CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
 };
-use zed_actions::agent::{Chat, ToggleModelSelector};
+use zed_actions::agent::{AddSelectionToThread, Chat, ToggleModelSelector};
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
@@ -3211,7 +3211,9 @@ impl ConversationView {
     ) {
         if let Some(active_thread) = self.active_thread() {
             active_thread.update(cx, |thread, cx| {
-                thread.active_editor(cx).update(cx, |editor, cx| {
+                let editor = thread.active_editor(cx);
+                editor.focus_handle(cx).focus(window, cx);
+                editor.update(cx, |editor, cx| {
                     editor.insert_selections(selection, window, cx);
                 })
             });

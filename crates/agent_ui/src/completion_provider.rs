@@ -45,6 +45,7 @@ use crate::mention_set::MentionSet;
 pub(crate) enum AgentContextSelection {
     Editor(Vec<(Entity<Buffer>, Range<text::Anchor>)>),
     Terminal(Vec<String>),
+    AgentResponse(SharedString),
 }
 
 #[derive(Clone)]
@@ -842,6 +843,14 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                         editor,
                         mention_set,
                         terminal_selections,
+                    )
+                }
+                AgentContextSelection::AgentResponse(response) => {
+                    completion_text_for_agent_response(
+                        source_range.clone(),
+                        editor,
+                        mention_set,
+                        response,
                     )
                 }
             },
@@ -2760,6 +2769,72 @@ fn completion_text_for_editor_selections(
     });
 
     (new_text, callback)
+}
+
+fn completion_text_for_agent_response(
+    source_range: Range<Anchor>,
+    editor: WeakEntity<Editor>,
+    mention_set: WeakEntity<MentionSet>,
+    response: SharedString,
+) -> (String, ConfirmCallback) {
+    const AGENT_RESPONSE_PLACEHOLDER: &str = "agent response ";
+
+    let callback: ConfirmCallback = Arc::new(move |_: CompletionIntent, window, cx| {
+        let editor = editor.clone();
+        let mention_set = mention_set.clone();
+        let source_range = source_range.clone();
+        let owned_string = response.to_string();
+        window.defer(cx, move |window, cx| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
+            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+            let Some(start) = snapshot.anchor_in_excerpt(source_range.start) else {
+                return;
+            };
+            let offset = start.to_offset(&snapshot);
+            let mention_uri = MentionUri::AgentResponse;
+            let range = snapshot.anchor_after(offset)
+                ..snapshot.anchor_after(offset + AGENT_RESPONSE_PLACEHOLDER.len() - 1);
+            let crease = crate::mention_set::crease_for_mention(
+                mention_uri.name().into(),
+                mention_uri.icon_path(cx),
+                None,
+                None,
+                None,
+                range,
+                editor.downgrade(),
+            );
+
+            let Some(crease_id) = editor.update(cx, |editor, cx| {
+                let crease_ids = editor.insert_creases(vec![crease.clone()], cx);
+                editor.fold_creases(vec![crease], false, window, cx);
+                crease_ids.first().copied()
+            }) else {
+                log::error!("insert_creases returned no ids for agent response");
+                return;
+            };
+
+            mention_set
+                .update(cx, |mention_set, cx| {
+                    mention_set.insert_mention(
+                        crease_id,
+                        mention_uri,
+                        Task::ready(Ok(crate::mention_set::Mention::Text {
+                            content: owned_string,
+                            tracked_buffers: Vec::new(),
+                        }))
+                        .shared(),
+                        None,
+                        cx,
+                    );
+                })
+                .ok();
+        });
+        false
+    });
+
+    (AGENT_RESPONSE_PLACEHOLDER.to_string(), callback)
 }
 
 fn completion_text_for_terminal_selections(

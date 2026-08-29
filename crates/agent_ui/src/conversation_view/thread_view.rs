@@ -6,7 +6,10 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::v1 as acp;
-use std::{cell::RefCell, ops::Range};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -601,6 +604,7 @@ pub struct ThreadView {
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     markdown_source_editors: HashMap<usize, MarkdownSourceEditor>,
+    last_markdown_context_menu_capture_id: Cell<u64>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1054,6 +1058,7 @@ impl ThreadView {
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             markdown_source_editors: HashMap::default(),
+            last_markdown_context_menu_capture_id: Cell::new(0),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -5668,7 +5673,8 @@ impl ThreadView {
                         .handler({
                             move |window, cx| {
                                 window.dispatch_action(
-                                    zed_actions::agent::AddSelectionToThread.boxed_clone(),
+                                    zed_actions::agent::AddSelectionToThread::default()
+                                        .boxed_clone(),
                                     cx,
                                 );
                             }
@@ -7882,15 +7888,44 @@ impl ThreadView {
                         })
                         .unwrap_or(false);
 
-                    let context_menu_link = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let md = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            md.and_then(|m| m.read(cx).context_menu_link().cloned())
+                    let context_menu_markdown = chunks
+                        .and_then(|chunks| {
+                            chunks
+                                .iter()
+                                .filter_map(|chunk| match chunk {
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdown().map(|markdown| (markdown, true))
+                                    }
+                                    AssistantMessageChunk::Thought { block, .. } => {
+                                        block.markdown().map(|markdown| (markdown, false))
+                                    }
+                                })
+                                .max_by_key(|(markdown, _)| {
+                                    markdown.read(cx).context_menu_capture_id()
+                                })
                         })
-                    });
+                        .filter(|(markdown, _)| {
+                            let capture_id = markdown.read(cx).context_menu_capture_id();
+                            if capture_id <= this.last_markdown_context_menu_capture_id.get() {
+                                return false;
+                            }
+                            this.last_markdown_context_menu_capture_id.set(capture_id);
+                            true
+                        });
+
+                    let selected_response_excerpt = context_menu_markdown
+                        .as_ref()
+                        .filter(|(_, is_message)| *is_message)
+                        .and_then(|(markdown, _)| {
+                            markdown
+                                .read(cx)
+                                .context_menu_selected_markdown()
+                                .cloned()
+                                .filter(|excerpt| !excerpt.is_empty())
+                        });
+                    let has_response_excerpt = selected_response_excerpt.is_some();
+                    let context_menu_link = context_menu_markdown
+                        .and_then(|(markdown, _)| markdown.read(cx).context_menu_link().cloned());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -7970,6 +8005,13 @@ impl ThreadView {
                             !has_selection,
                             "Copy Selection",
                             Box::new(markdown::CopyAsMarkdown),
+                        )
+                        .action_disabled_when(
+                            !has_response_excerpt,
+                            "Add to Agent Thread",
+                            Box::new(AddSelectionToThread {
+                                agent_response_excerpt: selected_response_excerpt,
+                            }),
                         )
                         .item(copy_this_agent_response)
                         .when_some(show_markdown_source, |menu, item| menu.item(item))
@@ -8057,6 +8099,42 @@ impl ThreadView {
             editor.set_read_only(true);
             editor.set_use_modal_editing(true);
             editor.disable_mouse_wheel_zoom();
+            editor.set_custom_context_menu(|editor, _point, window, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                let mut selected_markdown = String::new();
+                let mut has_selection = false;
+                for selection in editor
+                    .selections
+                    .all::<MultiBufferOffset>(&display_snapshot)
+                {
+                    if selection.is_empty() {
+                        continue;
+                    }
+                    if has_selection {
+                        selected_markdown.push('\n');
+                    }
+                    selected_markdown.extend(buffer.text_for_range(selection.start..selection.end));
+                    has_selection = true;
+                }
+                let selected_markdown =
+                    has_selection.then(|| SharedString::from(selected_markdown));
+
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.action_disabled_when(
+                        !has_selection,
+                        "Copy Selection",
+                        Box::new(editor::actions::Copy),
+                    )
+                    .action_disabled_when(
+                        !has_selection,
+                        "Add to Agent Thread",
+                        Box::new(AddSelectionToThread {
+                            agent_response_excerpt: selected_markdown,
+                        }),
+                    )
+                }))
+            });
             editor
         });
 
@@ -13227,6 +13305,7 @@ pub(crate) fn open_link(
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
+            MentionUri::AgentResponse => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
             MentionUri::Rule { name, .. } => {
