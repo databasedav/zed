@@ -33,7 +33,7 @@ use crate::{
     inlay_hint_settings,
     scroll::{
         ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
-        scroll_amount::ScrollAmount,
+        autoscroll::AutoscrollTarget, scroll_amount::ScrollAmount,
     },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
@@ -1017,6 +1017,34 @@ impl EditorElement {
         cursors
     }
 
+    fn autoscroll_bounds(
+        target: AutoscrollTarget,
+        text_origin: gpui::Point<Pixels>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        line_height: Pixels,
+        em_width: Pixels,
+        vertical_margin: ScrollOffset,
+    ) -> Bounds<Pixels> {
+        let top = text_origin.y
+            + ((target.top - scroll_position.y - vertical_margin).max(0.)
+                * ScrollPixelOffset::from(line_height))
+            .into();
+        let left = text_origin.x
+            + ((target.point.column() as ScrollOffset - scroll_position.x - 3.).max(0.)
+                * ScrollPixelOffset::from(em_width))
+            .into();
+        let bottom = text_origin.y
+            + ((target.bottom - scroll_position.y + vertical_margin)
+                * ScrollPixelOffset::from(line_height))
+            .into();
+        let right = text_origin.x
+            + ((target.point.column() as ScrollOffset - scroll_position.x + 4.)
+                * ScrollPixelOffset::from(em_width))
+            .into();
+
+        Bounds::from_corners(point(left, top), point(right, bottom))
+    }
+
     fn layout_visible_cursors(
         &self,
         snapshot: &EditorSnapshot,
@@ -1144,31 +1172,14 @@ impl EditorElement {
                         ));
 
                         if autoscroll_containing_element {
-                            let top = text_hitbox.origin.y
-                                + ((cursor_position.row().as_f64() - scroll_position.y - 3.)
-                                    .max(0.)
-                                    * ScrollPixelOffset::from(line_height))
-                                .into();
-                            let left = text_hitbox.origin.x
-                                + ((cursor_position.column() as ScrollOffset
-                                    - scroll_position.x
-                                    - 3.)
-                                    .max(0.)
-                                    * ScrollPixelOffset::from(em_width))
-                                .into();
-
-                            let bottom = text_hitbox.origin.y
-                                + ((cursor_position.row().as_f64() - scroll_position.y + 4.)
-                                    * ScrollPixelOffset::from(line_height))
-                                .into();
-                            let right = text_hitbox.origin.x
-                                + ((cursor_position.column() as ScrollOffset - scroll_position.x
-                                    + 4.)
-                                    * ScrollPixelOffset::from(em_width))
-                                .into();
-
-                            autoscroll_bounds =
-                                Some(Bounds::from_corners(point(left, top), point(right, bottom)))
+                            autoscroll_bounds = Some(Self::autoscroll_bounds(
+                                AutoscrollTarget::cursor(cursor_position),
+                                text_hitbox.origin,
+                                scroll_position,
+                                line_height,
+                                em_width,
+                                3.,
+                            ));
                         }
                     }
 
@@ -8022,6 +8033,10 @@ impl Element for EditorElement {
         }
 
         let rem_size = self.rem_size(cx);
+        let containing_visible_height = bounds
+            .size
+            .height
+            .min(window.content_mask().bounds.size.height);
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -8133,6 +8148,8 @@ impl Element for EditorElement {
                     let visible_height = (visible_bottom - visible_top).max(px(0.));
                     let clipped_top_in_lines = f64::from(clipped_top / line_height);
                     let visible_height_in_lines = f64::from(visible_height / line_height);
+                    let containing_visible_height_in_lines =
+                        f64::from(containing_visible_height / line_height);
 
                     // The max scroll position for the top of the window
                     let scroll_beyond_last_line = self.editor.read(cx).scroll_beyond_last_line(cx);
@@ -8150,21 +8167,25 @@ impl Element for EditorElement {
                         autoscroll_request,
                         autoscroll_containing_element,
                         needs_horizontal_autoscroll,
+                        containing_autoscroll_target,
                     ) = self.editor.update(cx, |editor, cx| {
                         let autoscroll_request = editor.scroll_manager.take_autoscroll_request();
 
                         let autoscroll_containing_element =
-                            autoscroll_request.is_some() || editor.has_pending_selection();
+                            autoscroll_request.is_none() && editor.has_pending_selection();
 
-                        let (needs_horizontal_autoscroll, was_scrolled) = editor
-                            .autoscroll_vertically(
-                                bounds,
-                                line_height,
-                                max_scroll_top,
-                                autoscroll_request,
-                                window,
-                                cx,
-                            );
+                        let (
+                            needs_horizontal_autoscroll,
+                            was_scrolled,
+                            containing_autoscroll_target,
+                        ) = editor.autoscroll_vertically(
+                            bounds,
+                            line_height,
+                            max_scroll_top,
+                            autoscroll_request,
+                            window,
+                            cx,
+                        );
                         if was_scrolled.0 {
                             snapshot = editor.snapshot(window, cx);
                         }
@@ -8172,6 +8193,7 @@ impl Element for EditorElement {
                             autoscroll_request,
                             autoscroll_containing_element,
                             needs_horizontal_autoscroll,
+                            containing_autoscroll_target,
                         )
                     });
 
@@ -9034,6 +9056,21 @@ impl Element for EditorElement {
 
                     let cursors = self.collect_cursors(&snapshot, cx);
                     let visible_row_range = start_row..end_row;
+                    if let Some(target) = containing_autoscroll_target {
+                        let target = target.fit_to_height(containing_visible_height_in_lines);
+                        let target_height = target.bottom - target.top;
+                        let vertical_margin =
+                            ((containing_visible_height_in_lines - target_height) / 2.)
+                                .clamp(0., 3.);
+                        window.request_autoscroll(Self::autoscroll_bounds(
+                            target,
+                            text_hitbox.origin,
+                            scroll_position,
+                            line_height,
+                            em_width,
+                            vertical_margin,
+                        ));
+                    }
                     let non_visible_cursors = cursors
                         .iter()
                         .any(|c| !visible_row_range.contains(&c.0.row()));
@@ -10793,12 +10830,15 @@ fn compute_auto_height_layout(
 mod tests {
     use super::*;
     use crate::{
-        Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,
-        NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
+        Editor, FoldPlaceholder, HighlightKey, Inlay, MoveToBeginning, MoveToEnd, MultiBuffer,
+        NavigationOverlayKey, NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
         display_map::{BlockPlacement, BlockProperties, DisplayMap},
         editor_tests::{init_test, update_test_language_settings},
+        scroll::Autoscroll,
     };
-    use gpui::{TestAppContext, VisualTestContext, font};
+    use gpui::{
+        ListAlignment, ListOffset, ListState, Render, TestAppContext, VisualTestContext, font, list,
+    };
     use language::{Buffer, SelectionGoal, language_settings, tree_sitter_python};
     use log::info;
     use rand::{RngCore, rngs::StdRng};
@@ -11309,6 +11349,288 @@ mod tests {
             .position_map
             .point_for_position(point(click_x, px(0.)));
         assert_eq!(point.nearest_valid, target_point);
+    }
+
+    struct AutoHeightEditorListTestView {
+        editor: Entity<Editor>,
+        list_state: ListState,
+        editor_item_ix: usize,
+    }
+
+    impl Render for AutoHeightEditorListTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let editor = self.editor.clone();
+            let editor_item_ix = self.editor_item_ix;
+            list(self.list_state.clone(), move |item_ix, _, _| {
+                if item_ix == editor_item_ix {
+                    editor.clone().into_any_element()
+                } else {
+                    div().h(px(100.)).into_any_element()
+                }
+            })
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn test_auto_height_editor_autoscrolls_parent_list_to_clipped_cursor(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let text = "line\n".repeat(40);
+        let list_state = ListState::new(1, ListAlignment::Top, Pixels::ZERO);
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let editor = cx.new(|cx| {
+                Editor::new(
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    buffer,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            AutoHeightEditorListTestView {
+                editor,
+                list_state: list_state.clone(),
+                editor_item_ix: 0,
+            }
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.simulate_resize(size(px(400.), px(100.)));
+        let view = window.root(cx).unwrap();
+        let editor = view.read_with(cx, |view, _| view.editor.clone());
+
+        cx.update(|window, cx| {
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+        });
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
+
+        draw(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            let end = Point::new(39, 0);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([end..end]);
+            });
+        });
+        list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(200.),
+        });
+        draw(cx);
+
+        let before = list_state.logical_scroll_top();
+        assert_eq!(before.item_ix, 0);
+        assert!(before.offset_in_item > Pixels::ZERO);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_beginning(&MoveToBeginning, window, cx);
+        });
+        draw(cx);
+
+        let after = list_state.logical_scroll_top();
+        assert_eq!(after.item_ix, 0);
+        assert_eq!(after.offset_in_item, Pixels::ZERO);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_end(&MoveToEnd, window, cx);
+        });
+        draw(cx);
+
+        let after = list_state.logical_scroll_top();
+        assert_eq!(after.item_ix, 0);
+        assert!(after.offset_in_item > Pixels::ZERO);
+
+        editor.update(cx, |editor, cx| {
+            editor.request_autoscroll(Autoscroll::center().for_anchor(Anchor::Min), cx);
+        });
+        draw(cx);
+
+        let after = list_state.logical_scroll_top();
+        assert_eq!(after.item_ix, 0);
+        assert_eq!(after.offset_in_item, Pixels::ZERO);
+
+        editor.update_in(cx, |editor, window, cx| {
+            let start = Point::new(0, 0);
+            let end = Point::new(39, 0);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([start..start, end..end]);
+            });
+        });
+        list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(200.),
+        });
+        draw(cx);
+        let fit_before = list_state.logical_scroll_top();
+        editor.update(cx, |editor, cx| {
+            editor.request_autoscroll(Autoscroll::fit(), cx);
+        });
+        draw(cx);
+
+        let after = list_state.logical_scroll_top();
+        assert_eq!(after.item_ix, 0);
+        assert!(after.offset_in_item > fit_before.offset_in_item);
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).y),
+            0.
+        );
+    }
+
+    #[gpui::test]
+    fn test_bounded_auto_height_editor_autoscrolls_parent_to_cursor(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let text = "line\n".repeat(40);
+        let list_state = ListState::new(2, ListAlignment::Top, Pixels::ZERO);
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let editor = cx.new(|cx| {
+                Editor::new(
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: Some(4),
+                    },
+                    buffer,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            AutoHeightEditorListTestView {
+                editor,
+                list_state: list_state.clone(),
+                editor_item_ix: 1,
+            }
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.simulate_resize(size(px(400.), px(100.)));
+        let view = window.root(cx).unwrap();
+        let editor = view.read_with(cx, |view, _| view.editor.clone());
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
+
+        cx.update(|window, cx| {
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+        });
+        draw(cx);
+        let line_height = editor.update_in(cx, |editor, window, cx| {
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+        list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: line_height,
+        });
+        draw(cx);
+
+        let viewport = list_state.viewport_bounds();
+        let editor_bounds = list_state.bounds_for_item(1).unwrap();
+        assert!(editor_bounds.intersect(&viewport).size.height <= line_height);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_end(&MoveToEnd, window, cx);
+        });
+        draw(cx);
+
+        let viewport = list_state.viewport_bounds();
+        let editor_bounds = list_state.bounds_for_item(1).unwrap();
+        assert!(editor_bounds.bottom() <= viewport.bottom());
+        assert!(editor.update(cx, |editor, cx| editor.scroll_position(cx).y) > 0.);
+    }
+
+    #[gpui::test]
+    fn test_auto_height_editor_fit_autoscroll_uses_parent_viewport(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let text = "line\n".repeat(40);
+        let list_state = ListState::new(2, ListAlignment::Top, Pixels::ZERO);
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let editor = cx.new(|cx| {
+                Editor::new(
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    buffer,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            AutoHeightEditorListTestView {
+                editor,
+                list_state: list_state.clone(),
+                editor_item_ix: 1,
+            }
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.simulate_resize(size(px(400.), px(100.)));
+        let view = window.root(cx).unwrap();
+        let editor = view.read_with(cx, |view, _| view.editor.clone());
+
+        cx.update(|window, cx| {
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let line_height = editor.update_in(cx, |editor, window, cx| {
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+
+        list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: line_height,
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let viewport = list_state.viewport_bounds();
+        let editor_bounds = list_state.bounds_for_item(1).unwrap();
+        assert!(editor_bounds.intersect(&viewport).size.height <= line_height);
+
+        editor.update_in(cx, |editor, window, cx| {
+            let start = Point::new(0, 0);
+            let end = Point::new(3, 0);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([start..start, end..end]);
+            });
+            editor.request_autoscroll(Autoscroll::fit(), cx);
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let viewport = list_state.viewport_bounds();
+        let editor_bounds = list_state.bounds_for_item(1).unwrap();
+        assert!(editor_bounds.top() >= viewport.top());
+        assert!(editor_bounds.top() + line_height * 4. <= viewport.bottom());
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).y),
+            0.
+        );
     }
 
     #[gpui::test]
