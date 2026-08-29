@@ -6525,18 +6525,8 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status, ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content.iter().any(|content| match content {
-                            ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
+                if !Self::should_render_tool_call(tool_call, cx) {
+                    return Empty.into_any();
                 }
 
                 let tool_call = self.render_any_tool_call(
@@ -7331,11 +7321,20 @@ impl ThreadView {
         }
     }
 
-    fn is_navigable_transcript_entry(entry: &AgentThreadEntry) -> bool {
-        matches!(
-            entry,
-            AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
-        )
+    fn should_render_tool_call(tool_call: &ToolCall, cx: &App) -> bool {
+        !matches!(tool_call.status, ToolCallStatus::Canceled)
+            || tool_call.content.iter().any(|content| match content {
+                ToolCallContent::ContentBlock(block) => block.visible_content(cx),
+                ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
+            })
+    }
+
+    fn is_navigable_transcript_entry(entry: &AgentThreadEntry, cx: &App) -> bool {
+        match entry {
+            AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => true,
+            AgentThreadEntry::ToolCall(tool_call) => Self::should_render_tool_call(tool_call, cx),
+            _ => false,
+        }
     }
 
     fn select_previous_transcript_entry(
@@ -7356,7 +7355,7 @@ impl ThreadView {
             .min(entries.len());
         let target = (0..end)
             .rev()
-            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]));
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx));
         if let Some(target) = target {
             self.select_transcript_entry(target, cx);
         }
@@ -7377,7 +7376,7 @@ impl ThreadView {
             )
             .min(entries.len());
         let target = (start..entries.len())
-            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]));
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx));
         if let Some(target) = target {
             self.select_transcript_entry(target, cx);
         }
@@ -7404,12 +7403,12 @@ impl ThreadView {
         let entries = self.thread.read(cx).entries();
         if entries
             .get(updated_entry_index)
-            .is_some_and(Self::is_navigable_transcript_entry)
+            .is_some_and(|entry| Self::is_navigable_transcript_entry(entry, cx))
         {
             return;
         }
 
-        let selected = Self::nearest_navigable_transcript_entry(entries, updated_entry_index);
+        let selected = Self::nearest_navigable_transcript_entry(entries, updated_entry_index, cx);
         if self.selected_transcript_entry != selected {
             self.selected_transcript_entry = selected;
             cx.notify();
@@ -7432,12 +7431,12 @@ impl ThreadView {
         } else if selected >= removed_range.end {
             Some(selected.saturating_sub(removed_count))
         } else {
-            Self::nearest_navigable_transcript_entry(entries, removed_range.start)
+            Self::nearest_navigable_transcript_entry(entries, removed_range.start, cx)
         };
         let adjusted = adjusted.filter(|&index| {
             entries
                 .get(index)
-                .is_some_and(Self::is_navigable_transcript_entry)
+                .is_some_and(|entry| Self::is_navigable_transcript_entry(entry, cx))
         });
 
         if self.selected_transcript_entry != adjusted {
@@ -7449,14 +7448,15 @@ impl ThreadView {
     fn nearest_navigable_transcript_entry(
         entries: &[AgentThreadEntry],
         index: usize,
+        cx: &App,
     ) -> Option<usize> {
         let index = index.min(entries.len());
         (index..entries.len())
-            .find(|&index| Self::is_navigable_transcript_entry(&entries[index]))
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx))
             .or_else(|| {
                 (0..index)
                     .rev()
-                    .find(|&index| Self::is_navigable_transcript_entry(&entries[index]))
+                    .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx))
             })
     }
 
