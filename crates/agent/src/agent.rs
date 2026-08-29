@@ -3393,6 +3393,18 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         })
     }
 
+    fn fork(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        // Forking copies the thread out of the database, so it works whether
+        // or not the source session is currently loaded.
+        Some(Rc::new(NativeAgentSessionFork {
+            session_id: session_id.clone(),
+        }) as _)
+    }
+
     fn set_title(
         &self,
         session_id: &acp_v2::SessionId,
@@ -3608,6 +3620,18 @@ impl AgentSessionList for NativeAgentSessionList {
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
+    }
+}
+
+struct NativeAgentSessionFork {
+    session_id: acp_v2::SessionId,
+}
+
+impl acp_thread::AgentSessionFork for NativeAgentSessionFork {
+    fn run(&self, work_dirs: PathList, cx: &mut App) -> Task<Result<acp_v2::SessionId>> {
+        crate::ThreadStore::global(cx).update(cx, |store, cx| {
+            store.fork_thread(self.session_id.clone(), work_dirs, cx)
+        })
     }
 }
 

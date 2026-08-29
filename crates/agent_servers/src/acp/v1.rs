@@ -23,7 +23,7 @@ use agent_client_protocol::{
 };
 use anyhow::anyhow;
 use async_channel;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
@@ -32,7 +32,7 @@ use project::agent_server_store::{AgentServerCommand, AgentServerStore, AllAgent
 use project::{AgentId, Project};
 use serde::Deserialize;
 use settings::{AgentConfigOptionValue, SettingsStore};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{any::Any, cell::RefCell};
@@ -1258,10 +1258,16 @@ fn session_directories_from_work_dirs(
     let mut ordered_paths = work_dirs.ordered_paths();
     let cwd = ordered_paths
         .next()
-        .cloned()
+        .map(|path| session_directory_for_path(path))
         .ok_or_else(|| anyhow!("Working directory cannot be empty"))?;
     let additional_directories = if supports_additional_directories {
-        ordered_paths.cloned().collect()
+        // Normalizing file paths to their parents can produce duplicates
+        // (e.g. two single-file worktrees in the same directory).
+        let mut seen_directories = HashSet::from_iter([cwd.clone()]);
+        ordered_paths
+            .map(|path| session_directory_for_path(path))
+            .filter(|path| seen_directories.insert(path.clone()))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1317,6 +1323,52 @@ fn meta_terminal_auth_task(
         terminal_auth.args,
         terminal_auth.env,
     ))
+}
+
+/// Threads opened in a single-file workspace store the file's path as their
+/// worktree path, but sessions require a directory, so substitute the parent —
+/// the same normalization `Project::default_path_list` applies when creating
+/// new sessions. Only positively-identified local files are remapped: remote
+/// project paths can't be stat'ed locally and must pass through untouched.
+fn session_directory_for_path(path: &Path) -> PathBuf {
+    if path.is_file()
+        && let Some(parent) = path.parent()
+    {
+        parent.to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    supports_additional_directories: bool,
+}
+
+impl acp_thread::AgentSessionFork for AcpSessionFork {
+    fn run(&self, work_dirs: PathList, cx: &mut App) -> Task<Result<acp_v2::SessionId>> {
+        let directories = match session_directories_from_work_dirs(
+            &work_dirs,
+            self.supports_additional_directories,
+        ) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        // MCP servers are omitted: the forked session isn't opened as a
+        // thread here, and they are passed again when it is later loaded.
+        let request = acp::ForkSessionRequest::new(acp::SessionId::new(self.session_id.0.clone()), directories.cwd)
+            .additional_directories(directories.additional_directories);
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(acp_v2::SessionId::new(response.session_id.0))
+        })
+    }
 }
 
 impl AgentConnection for AcpConnection {
@@ -1497,6 +1549,19 @@ impl AgentConnection for AcpConnection {
                 .map_err(|_| anyhow!("ACP new-session ordering callback ended before registration"))?;
             Ok(thread)
         })
+    }
+
+    fn fork(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        self.agent_capabilities.session_capabilities.fork.as_ref()?;
+        Some(Rc::new(AcpSessionFork {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            supports_additional_directories: self.supports_session_additional_directories(),
+        }) as _)
     }
 
     fn supports_load_session(&self) -> bool {
@@ -6064,6 +6129,35 @@ mod tests {
             ])
         );
         assert_eq!(task.label, "Login");
+    }
+
+    #[test]
+    fn session_directories_normalize_single_file_worktree_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let file_path = dir.join("file.txt");
+        std::fs::write(&file_path, "").unwrap();
+        let other_file_path = dir.join("other.txt");
+        std::fs::write(&other_file_path, "").unwrap();
+
+        // A file path as the first entry becomes its parent directory, and
+        // additional entries that normalize to the cwd are deduplicated.
+        let work_dirs = PathList::new(&[file_path.clone(), other_file_path, dir.clone()]);
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Without additional-directory support, only the cwd is normalized.
+        let work_dirs = PathList::new(&[file_path]);
+        let directories = session_directories_from_work_dirs(&work_dirs, false).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Nonexistent paths (e.g. remote project paths) pass through untouched.
+        let missing = PathBuf::from("/nonexistent/remote/path");
+        let work_dirs = PathList::new(std::slice::from_ref(&missing));
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, missing);
     }
 
     #[test]
