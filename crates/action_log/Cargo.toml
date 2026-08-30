@@ -17,6 +17,7 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 buffer_diff.workspace = true
+diffy = "0.4.2"
 log.workspace = true
 clock.workspace = true
 collections.workspace = true
