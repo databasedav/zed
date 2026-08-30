@@ -157,18 +157,36 @@ impl ActionLog {
                     continue;
                 };
                 let current_text = buffer.read_with(cx, |buffer, _cx| buffer.text());
-                if current_text != serialized_buffer.current_text {
+                let restored_diff_base = if current_text == serialized_buffer.current_text {
+                    serialized_buffer.diff_base
+                } else if matches!(
+                    serialized_buffer.status,
+                    SerializedTrackedBufferStatus::Modified
+                ) {
+                    let Ok(restored_diff_base) = diffy::merge(
+                        &serialized_buffer.current_text,
+                        &serialized_buffer.diff_base,
+                        &current_text,
+                    ) else {
+                        log::warn!(
+                            "can't restore agent edits for {}: external changes overlap pending agent edits",
+                            path.display()
+                        );
+                        continue;
+                    };
+                    restored_diff_base
+                } else {
                     log::warn!(
-                        "can't restore agent edits for {}: file contents changed while the thread was closed",
+                        "can't restore agent edits for {}: file contents changed while a file-level agent edit was pending",
                         path.display()
                     );
                     continue;
-                }
+                };
 
                 let Some((buffer_snapshot, diff_base)) = this
                     .update(cx, |this, cx| {
                         let buffer_snapshot = buffer.read(cx).text_snapshot();
-                        let diff_base = Rope::from(serialized_buffer.diff_base);
+                        let diff_base = Rope::from(restored_diff_base);
                         let is_created = matches!(
                             &serialized_buffer.status,
                             SerializedTrackedBufferStatus::Created { .. }
@@ -1615,6 +1633,144 @@ mod tests {
         assert_eq!(
             buffer.read_with(cx, |buffer, _cx| buffer.text()),
             "abc\ndef\nghi\njkl\nmnO"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_reconciles_non_overlapping_external_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "abc\ndef\nghi\njkl\nmno"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        cx.update(|cx| {
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_read(buffer.clone(), cx)
+            });
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit([(Point::new(1, 1)..Point::new(1, 2), "E")], None, cx)
+                    .unwrap();
+                buffer
+                    .edit([(Point::new(4, 2)..Point::new(4, 3), "O")], None, cx)
+                    .unwrap();
+            });
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_edited(buffer.clone(), cx)
+            });
+        });
+        cx.run_until_parked();
+
+        action_log.update(cx, |action_log, cx| {
+            action_log.keep_edits_in_range(
+                buffer.clone(),
+                Point::new(3, 0)..Point::new(4, 3),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let serialized = action_log.read_with(cx, |action_log, cx| action_log.serialize(cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer
+                .edit(
+                    [(Point::new(0, 0)..Point::new(0, 0), "external\n")],
+                    None,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let restored_action_log = cx.new(|_| ActionLog::new(project));
+        restored_action_log
+            .update(cx, |action_log, cx| action_log.restore(serialized, cx))
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!(
+            unreviewed_hunks(&restored_action_log, cx),
+            vec![(
+                buffer.clone(),
+                vec![HunkStatus {
+                    range: Point::new(2, 0)..Point::new(3, 0),
+                    diff_status: DiffHunkStatusKind::Modified,
+                    old_text: "def\n".into(),
+                }],
+            )]
+        );
+
+        restored_action_log
+            .update(cx, |action_log, cx| action_log.reject_all_edits(None, cx))
+            .await;
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _cx| buffer.text()),
+            "external\nabc\ndef\nghi\njkl\nmnO"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_skips_conflicting_external_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "abc\ndef\nghi"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        cx.update(|cx| {
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_read(buffer.clone(), cx)
+            });
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit([(Point::new(1, 1)..Point::new(1, 2), "E")], None, cx)
+                    .unwrap();
+            });
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_edited(buffer.clone(), cx)
+            });
+        });
+        cx.run_until_parked();
+
+        let serialized = action_log.read_with(cx, |action_log, cx| action_log.serialize(cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer
+                .edit([(Point::new(1, 1)..Point::new(1, 2), "X")], None, cx)
+                .unwrap();
+        });
+
+        let restored_action_log = cx.new(|_| ActionLog::new(project));
+        restored_action_log
+            .update(cx, |action_log, cx| action_log.restore(serialized, cx))
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!(unreviewed_hunks(&restored_action_log, cx), vec![]);
+        restored_action_log
+            .update(cx, |action_log, cx| action_log.reject_all_edits(None, cx))
+            .await;
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _cx| buffer.text()),
+            "abc\ndXf\nghi"
         );
     }
 
