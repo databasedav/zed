@@ -28,6 +28,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
+use text::ToPoint as _;
 use ui::{CommonAnimationExt, Divider, IconButtonShape, KeyBinding, Tooltip, prelude::*};
 use util::{ResultExt, truncate_and_trailoff};
 use workspace::{
@@ -316,13 +317,19 @@ fn keep_edits_in_selection(
     thread: &Entity<AcpThread>,
     window: &mut Window,
     cx: &mut Context<Editor>,
-) {
+) -> bool {
     let ranges = editor
         .selections
         .disjoint_anchor_ranges()
         .collect::<Vec<_>>();
+    let has_selection = ranges.iter().any(|range| range.start != range.end);
 
-    keep_edits_in_ranges(editor, buffer_snapshot, thread, ranges, window, cx)
+    if has_selection {
+        keep_edits_in_selected_ranges(editor, buffer_snapshot, thread, ranges, cx);
+    } else {
+        keep_edits_in_ranges(editor, buffer_snapshot, thread, ranges, window, cx);
+    }
+    has_selection
 }
 
 fn reject_edits_in_selection(
@@ -332,20 +339,99 @@ fn reject_edits_in_selection(
     workspace: WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut Context<Editor>,
-) {
+) -> bool {
     let ranges = editor
         .selections
         .disjoint_anchor_ranges()
         .collect::<Vec<_>>();
-    reject_edits_in_ranges(
-        editor,
-        buffer_snapshot,
-        thread,
-        ranges,
-        workspace,
-        window,
-        cx,
-    )
+    let has_selection = ranges.iter().any(|range| range.start != range.end);
+
+    if has_selection {
+        reject_edits_in_selected_ranges(editor, buffer_snapshot, thread, ranges, workspace, cx);
+    } else {
+        reject_edits_in_ranges(
+            editor,
+            buffer_snapshot,
+            thread,
+            ranges,
+            workspace,
+            window,
+            cx,
+        );
+    }
+    has_selection
+}
+
+fn selected_ranges_by_buffer(
+    editor: &Editor,
+    buffer_snapshot: &MultiBufferSnapshot,
+    ranges: Vec<Range<editor::Anchor>>,
+    cx: &App,
+) -> HashMap<Entity<Buffer>, Vec<Range<Point>>> {
+    let multibuffer = editor.buffer().read(cx);
+    let mut ranges_by_buffer = HashMap::default();
+
+    for range in ranges {
+        for (snapshot, buffer_range, _) in buffer_snapshot.range_to_buffer_ranges(range) {
+            let Some(buffer) = multibuffer.buffer(snapshot.remote_id()) else {
+                continue;
+            };
+            ranges_by_buffer
+                .entry(buffer)
+                .or_insert_with(Vec::new)
+                .push(buffer_range.start.to_point(snapshot)..buffer_range.end.to_point(snapshot));
+        }
+    }
+    ranges_by_buffer
+}
+
+fn keep_edits_in_selected_ranges(
+    editor: &Editor,
+    buffer_snapshot: &MultiBufferSnapshot,
+    thread: &Entity<AcpThread>,
+    ranges: Vec<Range<editor::Anchor>>,
+    cx: &mut Context<Editor>,
+) {
+    let ranges_by_buffer = selected_ranges_by_buffer(editor, buffer_snapshot, ranges, cx);
+    let action_log = thread.read(cx).action_log().clone();
+    let telemetry = ActionLogTelemetry::from(thread.read(cx));
+
+    for (buffer, ranges) in ranges_by_buffer {
+        action_log.update(cx, |action_log, cx| {
+            action_log.keep_edits_partially_in_ranges(buffer, ranges, Some(telemetry.clone()), cx);
+        });
+    }
+}
+
+fn reject_edits_in_selected_ranges(
+    editor: &Editor,
+    buffer_snapshot: &MultiBufferSnapshot,
+    thread: &Entity<AcpThread>,
+    ranges: Vec<Range<editor::Anchor>>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut Context<Editor>,
+) {
+    let ranges_by_buffer = selected_ranges_by_buffer(editor, buffer_snapshot, ranges, cx);
+    let action_log = thread.read(cx).action_log().clone();
+    let telemetry = ActionLogTelemetry::from(thread.read(cx));
+    let mut undo_buffers = Vec::new();
+
+    for (buffer, ranges) in ranges_by_buffer {
+        action_log
+            .update(cx, |action_log, cx| {
+                let (task, undo_info) = action_log.reject_edits_partially_in_ranges(
+                    buffer,
+                    ranges,
+                    Some(telemetry.clone()),
+                    cx,
+                );
+                undo_buffers.extend(undo_info);
+                task
+            })
+            .detach_and_log_err(cx);
+    }
+
+    show_reject_undo(undo_buffers, action_log, workspace, cx);
 }
 
 fn keep_edits_in_ranges(
@@ -422,20 +508,31 @@ fn reject_edits_in_ranges(
             })
             .detach_and_log_err(cx);
     }
-    if !undo_buffers.is_empty() {
-        action_log.update(cx, |action_log, _cx| {
-            action_log.set_last_reject_undo(LastRejectUndo {
-                buffers: undo_buffers,
+    show_reject_undo(undo_buffers, action_log, workspace, cx);
+}
+
+fn show_reject_undo(
+    undo_buffers: Vec<action_log::PerBufferUndo>,
+    action_log: Entity<action_log::ActionLog>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut App,
+) {
+    if undo_buffers.is_empty() {
+        return;
+    }
+
+    action_log.update(cx, |action_log, _cx| {
+        action_log.set_last_reject_undo(LastRejectUndo {
+            buffers: undo_buffers,
+        });
+    });
+
+    if let Some(workspace) = workspace.upgrade() {
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::ui::show_undo_reject_toast(workspace, action_log, cx);
             });
         });
-
-        if let Some(workspace) = workspace.upgrade() {
-            cx.defer(move |cx| {
-                workspace.update(cx, |workspace, cx| {
-                    crate::ui::show_undo_reject_toast(workspace, action_log, cx);
-                });
-            });
-        }
     }
 }
 
@@ -1747,8 +1844,11 @@ impl AgentDiff {
     ) -> PostReviewState {
         editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            keep_edits_in_selection(editor, &snapshot, thread, window, cx);
-            Self::post_review_state(&snapshot)
+            if keep_edits_in_selection(editor, &snapshot, thread, window, cx) {
+                PostReviewState::Pending
+            } else {
+                Self::post_review_state(&snapshot)
+            }
         })
     }
 
@@ -1761,8 +1861,11 @@ impl AgentDiff {
     ) -> PostReviewState {
         editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            reject_edits_in_selection(editor, &snapshot, thread, workspace.clone(), window, cx);
-            Self::post_review_state(&snapshot)
+            if reject_edits_in_selection(editor, &snapshot, thread, workspace.clone(), window, cx) {
+                PostReviewState::Pending
+            } else {
+                Self::post_review_state(&snapshot)
+            }
         })
     }
 
@@ -2022,6 +2125,109 @@ mod tests {
                 .range(),
             Point::new(3, 0)..Point::new(3, 0)
         );
+    }
+
+    #[gpui::test]
+    async fn test_partially_review_selection_in_single_file(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            workspace::register_project_item::<Editor>(cx);
+
+            SettingsStore::update_global(cx, |store, _cx| {
+                let mut agent_settings = store.get::<AgentSettings>(None).clone();
+                agent_settings.single_file_review = true;
+                store.override_global(agent_settings);
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file": "a\nd"}))
+            .await;
+        let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+        let buffer_path = project
+            .read_with(cx, |project, cx| project.find_project_path("test/file", cx))
+            .unwrap();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        cx.update(|window, cx| {
+            AgentDiff::set_active_thread(&workspace.downgrade(), thread.clone(), window, cx)
+        });
+
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(buffer_path, cx))
+            .await
+            .unwrap();
+        let editor = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_read(buffer.clone(), cx)
+            });
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit([(Point::new(1, 0)..Point::new(1, 0), "b\nc\n")], None, cx)
+                    .unwrap();
+            });
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_edited(buffer.clone(), cx)
+            });
+        });
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 1)]);
+            });
+        });
+        workspace.update(cx, |_, cx| cx.dispatch_action(&Keep));
+        cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "a\nb\nc\nd"
+        );
+        assert!(action_log.read_with(cx, |action_log, cx| {
+            action_log.changed_buffers(cx).next().is_some()
+        }));
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(2, 0)..Point::new(2, 1)]);
+            });
+        });
+        workspace.update(cx, |_, cx| cx.dispatch_action(&Reject));
+        cx.run_until_parked();
+
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "a\nb\nd");
+        assert!(action_log.read_with(cx, |action_log, cx| {
+            action_log.changed_buffers(cx).next().is_none()
+        }));
     }
 
     #[gpui::test]
