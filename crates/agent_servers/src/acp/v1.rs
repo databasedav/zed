@@ -13,7 +13,7 @@ use acp_thread::{
 use action_log::ActionLog;
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::{
-    Agent, Client, HandleDispatchFrom, JsonRpcRequest, Lines,
+    Agent, Client, HandleDispatchFrom, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Lines,
     v1::{Builder, ConnectionTo, Responder},
     v2::Builder as V2Builder,
 };
@@ -23,16 +23,16 @@ use agent_client_protocol::{
 };
 use anyhow::anyhow;
 use async_channel;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
 use futures::{Future, FutureExt as _};
 use project::agent_server_store::{AgentServerCommand, AgentServerStore, AllAgentServersSettings};
 use project::{AgentId, Project};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{any::Any, cell::RefCell};
@@ -51,6 +51,53 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/diagnostics", response = ZedDiagnosticsResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedDiagnosticsRequest {
+    session_id: acp::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedDiagnosticsResponse {
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/set_end_turn_at_next_boundary")]
+#[serde(rename_all = "camelCase")]
+struct ZedSetEndTurnAtNextBoundaryNotification {
+    session_id: acp::SessionId,
+    end_at_boundary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/interrupt_for_follow_up")]
+#[serde(rename_all = "camelCase")]
+struct ZedInterruptForFollowUpNotification {
+    session_id: acp::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/subagent_continuation")]
+#[serde(rename_all = "camelCase")]
+struct ZedSubagentContinuationNotification {
+    session_id: acp::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/message_subagent")]
+#[serde(rename_all = "camelCase")]
+struct ZedMessageSubagentNotification {
+    parent_session_id: acp::SessionId,
+    session_id: acp::SessionId,
+    message: String,
+    interrupt: bool,
+}
 async fn close_session_and_drain(
     connection: &ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
@@ -460,6 +507,10 @@ fn client_builder(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            on_request!(handle_zed_diagnostics),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             on_request!(handle_create_terminal),
             agent_client_protocol::on_receive_request!(),
         )
@@ -492,6 +543,10 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            on_notification!(handle_zed_subagent_continuation),
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 /// `acp_beta` advertises the unstable subagents and plan operations RFDs, which Zed only
@@ -500,7 +555,13 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        ("zed_diagnostics".into(), true.into()),
+        ("zed_steer_at_boundary".into(), true.into()),
+        ("zed_async_subagents".into(), true.into()),
+        ("zed_subagent_messaging".into(), true.into()),
     ]);
+
+    meta.insert("zed_markup_format".into(), "typst".into());
 
     if agent_id.as_ref() == CURSOR_ID {
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
@@ -1249,6 +1310,16 @@ impl SessionDirectories {
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp_v2::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
 }
 
 fn session_directories_from_work_dirs(
@@ -1258,10 +1329,16 @@ fn session_directories_from_work_dirs(
     let mut ordered_paths = work_dirs.ordered_paths();
     let cwd = ordered_paths
         .next()
-        .cloned()
+        .map(|path| session_directory_for_path(path))
         .ok_or_else(|| anyhow!("Working directory cannot be empty"))?;
     let additional_directories = if supports_additional_directories {
-        ordered_paths.cloned().collect()
+        // Normalizing file paths to their parents can produce duplicates
+        // (e.g. two single-file worktrees in the same directory).
+        let mut seen_directories = HashSet::from_iter([cwd.clone()]);
+        ordered_paths
+            .map(|path| session_directory_for_path(path))
+            .filter(|path| seen_directories.insert(path.clone()))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1317,6 +1394,117 @@ fn meta_terminal_auth_task(
         terminal_auth.args,
         terminal_auth.env,
     ))
+}
+
+/// Threads opened in a single-file workspace store the file's path as their
+/// worktree path, but sessions require a directory, so substitute the parent —
+/// the same normalization `Project::default_path_list` applies when creating
+/// new sessions. Only positively-identified local files are remapped: remote
+/// project paths can't be stat'ed locally and must pass through untouched.
+pub(super) fn session_directory_for_path(path: &Path) -> PathBuf {
+    if path.is_file()
+        && let Some(parent) = path.parent()
+    {
+        parent.to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    supports_additional_directories: bool,
+    supports_close: bool,
+}
+
+impl acp_thread::AgentSessionFork for AcpSessionFork {
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>> {
+        let directories = match session_directories_from_work_dirs(
+            &work_dirs,
+            self.supports_additional_directories,
+        ) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let request = directories.into_fork_session_request(self.session_id.clone(), mcp_servers);
+        let connection = self.connection.clone();
+        let supports_close = self.supports_close;
+        let source_id = self.session_id.clone();
+        cx.foreground_executor().spawn(async move {
+            let (sender, received) = futures::channel::oneshot::channel();
+            let request = connection.prepare_request(request);
+            let cancellation = request.cancellation_handle();
+            request
+                .on_receiving_result({
+                    let connection = connection.clone();
+                    async move |result: Result<
+                        acp::ForkSessionResponse,
+                        agent_client_protocol::Error,
+                    >| {
+                        let result = result.map_err(map_acp_error).and_then(|response| {
+                            anyhow::ensure!(
+                                response.session_id.0 != source_id.0,
+                                "Agent returned the source session as its fork"
+                            );
+                            let session_id = response.session_id;
+                            let abandoned = util::defer({
+                                let session_id = session_id.clone();
+                                move || {
+                                    if supports_close {
+                                        connection
+                                            .prepare_request(acp::CloseSessionRequest::new(
+                                                session_id,
+                                            ))
+                                            .on_receiving_result(async move |result| {
+                                                result.log_err();
+                                                Ok(())
+                                            })
+                                            .log_err();
+                                    }
+                                }
+                            });
+                            Ok((session_id, abandoned))
+                        });
+                        if let Err(result) = sender.send(result) {
+                            drop(result);
+                        }
+                        Ok(())
+                    }
+                })
+                .map_err(map_acp_error)?;
+            let request_guard = util::defer(move || {
+                cancellation.cancel().log_err();
+            });
+            let (session_id, abandoned) = received
+                .await
+                .context("ACP fork response callback was cancelled")??;
+            request_guard.abort();
+            // The sidebar stores the ID, not an open thread. Release the fork
+            // before a later load/resume attaches it to a project.
+            if supports_close {
+                connection
+                    .send_request(acp::CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await
+                    .map_err(map_acp_error)?;
+            }
+            abandoned.abort();
+            Ok(acp_v2::SessionId::new(session_id.0))
+        })
+    }
+}
+
+fn supports_openable_session_fork(agent_capabilities: &acp::AgentCapabilities) -> bool {
+    agent_capabilities.session_capabilities.fork.is_some()
+        && (agent_capabilities.load_session
+            || agent_capabilities.session_capabilities.resume.is_some())
 }
 
 impl AgentConnection for AcpConnection {
@@ -1497,6 +1685,22 @@ impl AgentConnection for AcpConnection {
                 .map_err(|_| anyhow!("ACP new-session ordering callback ended before registration"))?;
             Ok(thread)
         })
+    }
+
+    fn fork(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        if !supports_openable_session_fork(&self.agent_capabilities) {
+            return None;
+        }
+        Some(Rc::new(AcpSessionFork {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            supports_additional_directories: self.supports_session_additional_directories(),
+            supports_close: self.agent_supports_session_close(),
+        }) as _)
     }
 
     fn supports_load_session(&self) -> bool {
@@ -1744,8 +1948,71 @@ impl AgentConnection for AcpConnection {
         Ok(())
     }
 
+    fn interrupt_for_follow_up(&self, session_id: &acp_v2::SessionId, _cx: &mut App) -> Result<()> {
+        let params = ZedInterruptForFollowUpNotification {
+            session_id: acp::SessionId::new(session_id.0.clone()),
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
+    }
+
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
+    }
+
+    fn supports_steer_at_boundary(&self) -> bool {
+        true
+    }
+
+    fn set_end_turn_at_next_boundary(
+        &self,
+        session_id: &acp_v2::SessionId,
+        end_at_boundary: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let params = ZedSetEndTurnAtNextBoundaryNotification {
+            session_id: acp::SessionId::new(session_id.0.clone()),
+            end_at_boundary,
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if end_at_boundary && let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
+    }
+
+    fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        !self.announces_subagents() && self.supports_load_session()
+    }
+
+    fn message_subagent(
+        &self,
+        parent_session_id: &acp_v2::SessionId,
+        subagent_session_id: &acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let params = ZedMessageSubagentNotification {
+            parent_session_id: acp::SessionId::new(parent_session_id.0.clone()),
+            session_id: acp::SessionId::new(subagent_session_id.0.clone()),
+            message,
+            interrupt,
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if let Some(session) = self.sessions.borrow_mut().get_mut(subagent_session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
     }
 
     fn session_modes(
@@ -2069,12 +2336,63 @@ pub mod test_support {
             self.inner.retry(session_id, cx)
         }
 
+        fn fork(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+            self.inner.fork(session_id, cx)
+        }
+
         fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
             self.inner.cancel(session_id, cx)
         }
 
+        fn interrupt_for_follow_up(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner.interrupt_for_follow_up(session_id, cx)
+        }
+
         fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
             self.inner.request_elicitations()
+        }
+
+        fn supports_steer_at_boundary(&self) -> bool {
+            self.inner.supports_steer_at_boundary()
+        }
+
+        fn set_end_turn_at_next_boundary(
+            &self,
+            session_id: &acp_v2::SessionId,
+            end_at_boundary: bool,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner
+                .set_end_turn_at_next_boundary(session_id, end_at_boundary, cx)
+        }
+
+        fn supports_subagent_messaging(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
+            self.inner.supports_subagent_messaging(session_id, cx)
+        }
+
+        fn message_subagent(
+            &self,
+            parent_session_id: &acp_v2::SessionId,
+            subagent_session_id: &acp_v2::SessionId,
+            message: String,
+            interrupt: bool,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner.message_subagent(
+                parent_session_id,
+                subagent_session_id,
+                message,
+                interrupt,
+                cx,
+            )
         }
 
         fn truncate(
@@ -5748,6 +6066,10 @@ mod tests {
         );
         assert_eq!(meta.get("terminal_output"), Some(&serde_json::json!(true)));
         assert_eq!(meta.get("terminal-auth"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            meta.get("zed_markup_format"),
+            Some(&serde_json::json!("typst"))
+        );
     }
 
     #[test]
@@ -6067,6 +6389,61 @@ mod tests {
     }
 
     #[test]
+    fn session_directories_normalize_single_file_worktree_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let file_path = dir.join("file.txt");
+        std::fs::write(&file_path, "").unwrap();
+        let other_file_path = dir.join("other.txt");
+        std::fs::write(&other_file_path, "").unwrap();
+
+        // A file path as the first entry becomes its parent directory, and
+        // additional entries that normalize to the cwd are deduplicated.
+        let work_dirs = PathList::new(&[file_path.clone(), other_file_path, dir.clone()]);
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Without additional-directory support, only the cwd is normalized.
+        let work_dirs = PathList::new(&[file_path]);
+        let directories = session_directories_from_work_dirs(&work_dirs, false).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Nonexistent paths (e.g. remote project paths) pass through untouched.
+        let missing = PathBuf::from("/nonexistent/remote/path");
+        let work_dirs = PathList::new(std::slice::from_ref(&missing));
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, missing);
+    }
+
+    #[test]
+    fn openable_session_fork_requires_fork_and_load_or_resume() {
+        let capabilities = |load_session: bool, fork: bool, resume: bool| {
+            acp::AgentCapabilities::new()
+                .load_session(load_session)
+                .session_capabilities(
+                    acp::SessionCapabilities::new()
+                        .fork(fork.then(acp::SessionForkCapabilities::new))
+                        .resume(resume.then(acp::SessionResumeCapabilities::new)),
+                )
+        };
+
+        assert!(!supports_openable_session_fork(&capabilities(
+            true, false, false
+        )));
+        assert!(!supports_openable_session_fork(&capabilities(
+            false, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            true, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            false, true, true
+        )));
+    }
+
+    #[test]
     fn session_directories_use_ordered_paths_when_supported() {
         let work_dirs = PathList::new(&[
             std::path::PathBuf::from("/workspace-b"),
@@ -6089,12 +6466,19 @@ mod tests {
         );
 
         let session_id = acp_v2::SessionId::new("session-1");
+        let mcp_servers = vec![acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "test-server",
+            "/usr/bin/test-server",
+        ))];
         let new_session_request = directories.clone().into_new_session_request(Vec::new());
         let load_session_request = directories
             .clone()
             .into_load_session_request(session_id.clone(), Vec::new());
-        let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+        let resume_session_request = directories
+            .clone()
+            .into_resume_session_request(session_id.clone(), Vec::new());
+        let fork_session_request =
+            directories.into_fork_session_request(session_id.clone(), mcp_servers.clone());
 
         assert_eq!(
             new_session_request.cwd,
@@ -6115,6 +6499,13 @@ mod tests {
             resume_session_request.additional_directories,
             new_session_request.additional_directories
         );
+        assert_eq!(fork_session_request.session_id.0, session_id.0);
+        assert_eq!(fork_session_request.cwd, new_session_request.cwd);
+        assert_eq!(
+            fork_session_request.additional_directories,
+            new_session_request.additional_directories
+        );
+        assert_eq!(fork_session_request.mcp_servers, mcp_servers);
     }
 
     #[test]
@@ -6129,9 +6520,12 @@ mod tests {
             let load = directories
                 .clone()
                 .into_load_session_request(session_id.clone(), Vec::new());
-            let resume = directories.into_resume_session_request(session_id, Vec::new());
+            let resume = directories
+                .clone()
+                .into_resume_session_request(session_id.clone(), Vec::new());
+            let fork = directories.into_fork_session_request(session_id, Vec::new());
 
-            for wire_id in [&load.session_id, &resume.session_id] {
+            for wire_id in [&load.session_id, &resume.session_id, &fork.session_id] {
                 assert_eq!(wire_id.0.as_ref(), value);
                 assert!(Arc::ptr_eq(&backing, &wire_id.0));
                 assert_eq!(
@@ -10019,6 +10413,105 @@ exit 7
         );
     }
 
+    #[test]
+    fn test_zed_parity_capabilities_and_extension_wire_shapes() {
+        use agent_client_protocol::JsonRpcMessage as _;
+
+        let caps = client_capabilities_for_agent(&AgentId::new("custom-agent"), true);
+        let meta = caps.meta.expect("client capabilities meta");
+        assert_eq!(
+            meta.get("zed_diagnostics"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            meta.get("zed_steer_at_boundary"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            meta.get("zed_async_subagents"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            meta.get("zed_subagent_messaging"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let diag_req = ZedDiagnosticsRequest {
+            session_id: acp::SessionId::new("sess-1"),
+            path: Some("/tmp/main.rs".to_string()),
+        };
+        assert_eq!(diag_req.method(), "_zed/diagnostics");
+        let untyped_diag = diag_req.to_untyped_message().unwrap();
+        assert_eq!(untyped_diag.method, "_zed/diagnostics");
+        assert_eq!(
+            untyped_diag.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "path": "/tmp/main.rs",
+            })
+        );
+
+        let steer_notif = ZedSetEndTurnAtNextBoundaryNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            end_at_boundary: true,
+        };
+        assert_eq!(steer_notif.method(), "_zed/set_end_turn_at_next_boundary");
+        let untyped_steer = steer_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_steer.method, "_zed/set_end_turn_at_next_boundary");
+        assert_eq!(
+            untyped_steer.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "endAtBoundary": true,
+            })
+        );
+
+        let interrupt_notif = ZedInterruptForFollowUpNotification {
+            session_id: acp::SessionId::new("sess-1"),
+        };
+        assert_eq!(interrupt_notif.method(), "_zed/interrupt_for_follow_up");
+        let untyped_interrupt = interrupt_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_interrupt.method, "_zed/interrupt_for_follow_up");
+        assert_eq!(
+            untyped_interrupt.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+            })
+        );
+
+        let cont_notif = ZedSubagentContinuationNotification {
+            session_id: acp::SessionId::new("sess-1"),
+        };
+        assert_eq!(cont_notif.method(), "_zed/subagent_continuation");
+        let untyped_cont = cont_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_cont.method, "_zed/subagent_continuation");
+        assert_eq!(
+            untyped_cont.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+            })
+        );
+
+        let msg_sub_notif = ZedMessageSubagentNotification {
+            parent_session_id: acp::SessionId::new("parent-1"),
+            session_id: acp::SessionId::new("sub-1"),
+            message: "Focus on crates/agent_ui".to_string(),
+            interrupt: true,
+        };
+        assert_eq!(msg_sub_notif.method(), "_zed/message_subagent");
+        let untyped_msg_sub = msg_sub_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_msg_sub.method, "_zed/message_subagent");
+        assert_eq!(
+            untyped_msg_sub.params,
+            serde_json::json!({
+                "parentSessionId": "parent-1",
+                "sessionId": "sub-1",
+                "message": "Focus on crates/agent_ui",
+                "interrupt": true,
+            })
+        );
+    }
+
     fn release_dropped_entities(cx: &mut gpui::TestAppContext) {
         // Cancelled task futures may own entities until the executor drops them.
         cx.run_until_parked();
@@ -10376,6 +10869,37 @@ fn handle_read_text_file(
     .detach();
 }
 
+fn handle_zed_diagnostics(
+    args: ZedDiagnosticsRequest,
+    responder: Responder<ZedDiagnosticsResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+        Ok(t) => t,
+        Err(e) => return respond_err(responder, e),
+    };
+
+    cx.spawn(async move |cx| {
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async {
+                thread
+                    .update(cx, |thread, cx| thread.read_diagnostics(args.path, cx))
+                    .map_err(agent_client_protocol::Error::from)?
+                    .await
+                    .map_err(agent_client_protocol::Error::from)
+            })
+            .await;
+
+        respond_result(
+            responder,
+            result.map(|content| ZedDiagnosticsResponse { content }),
+        );
+    })
+    .detach();
+}
+
 fn apply_v1_subagent_update(
     parent: &Entity<AcpThread>,
     update: acp::SubagentUpdate,
@@ -10391,6 +10915,27 @@ fn apply_v1_subagent_update(
         MaybeUndefined::Null => subagent.clear_session_state(cx),
         MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
     })
+}
+
+fn handle_zed_subagent_continuation(
+    notification: ZedSubagentContinuationNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let session_id = acp_v2::SessionId::new(notification.session_id.0);
+    let thread = {
+        let sessions = ctx.sessions.borrow();
+        sessions
+            .get(&session_id)
+            .map(|session| session.thread.clone())
+    };
+    if let Some(thread) = thread {
+        thread
+            .update(cx, |thread, cx| {
+                thread.request_subagent_continuation(cx);
+            })
+            .ok();
+    }
 }
 
 fn handle_session_notification(
@@ -10478,42 +11023,67 @@ fn handle_session_notification(
         return;
     }
 
-    // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
-    if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
-        if let Some(meta) = &tc.meta {
-            if let Some(terminal_info) = meta.get("terminal_info") {
-                if let Some(id_str) = terminal_info.get("terminal_id").and_then(|v| v.as_str()) {
-                    let terminal_id = acp::TerminalId::new(id_str);
-                    let cwd = terminal_info
-                        .get("cwd")
-                        .and_then(|v| v.as_str().map(PathBuf::from));
+    // Pre-handle: if a ToolCall or ToolCallUpdate carries terminal_info, create/register a display-only terminal.
+    let terminal_meta_and_label = match &notification.update {
+        acp::SessionUpdate::ToolCall(tc) => Some((
+            tc.meta.as_ref(),
+            Some(tc.title.clone()),
+            &tc.tool_call_id,
+            false,
+        )),
+        acp::SessionUpdate::ToolCallUpdate(tcu) => Some((
+            tcu.meta.as_ref(),
+            tcu.fields.title.clone(),
+            &tcu.tool_call_id,
+            true,
+        )),
+        _ => None,
+    };
+    if let Some((Some(meta), title, tool_call_id, is_update)) = terminal_meta_and_label
+        && let Some(terminal_info) = meta.get("terminal_info")
+        && let Some(id_str) = terminal_info.get("terminal_id").and_then(|v| v.as_str())
+    {
+        let terminal_id = acp::TerminalId::new(id_str);
+        let cwd = terminal_info
+            .get("cwd")
+            .and_then(|v| v.as_str().map(PathBuf::from));
 
-                    thread
-                        .update(cx, |thread, cx| {
-                            let builder = TerminalBuilder::new_display_only(
-                                CursorShape::default(),
-                                AlternateScroll::On,
-                                None,
-                                0,
-                                cx.background_executor(),
-                                thread.project().read(cx).path_style(cx),
-                            );
-                            let lower = cx.new(|cx| builder.subscribe(cx));
-                            thread.on_terminal_provider_event(
-                                TerminalProviderEvent::Created {
-                                    terminal_id,
-                                    label: tc.title.clone(),
-                                    cwd,
-                                    output_byte_limit: None,
-                                    terminal: lower,
-                                },
-                                cx,
-                            );
-                        })
-                        .log_err();
+        thread
+            .update(cx, |thread, cx| {
+                if is_update
+                    && thread
+                        .terminal(acp_v2::TerminalId::new(id_str.to_owned()))
+                        .is_ok()
+                {
+                    return;
                 }
-            }
-        }
+                let label = title.unwrap_or_else(|| {
+                    thread
+                        .tool_call(&acp_v2::ToolCallId::new(tool_call_id.0.clone()))
+                        .map(|(_, call)| call.label.read(cx).source().to_string())
+                        .unwrap_or_default()
+                });
+                let builder = TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    thread.project().read(cx).path_style(cx),
+                );
+                let lower = cx.new(|cx| builder.subscribe(cx));
+                thread.on_terminal_provider_event(
+                    TerminalProviderEvent::Created {
+                        terminal_id,
+                        label,
+                        cwd,
+                        output_byte_limit: None,
+                        terminal: lower,
+                    },
+                    cx,
+                );
+            })
+            .log_err();
     }
 
     // Forward the update to the acp_thread as usual.

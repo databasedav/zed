@@ -47,13 +47,20 @@ use language::{
     Bias, CharClassifier, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights, Rope,
 };
 use parser::CodeBlockMetadata;
+#[cfg(test)]
+use parser::parse_markdown_with_options;
 use parser::{
-    MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, ParsedTypstSource,
+    parse_links_only, parse_markdown_with_full_options, parse_typst_document_with_options,
 };
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;
+use typst_render::{
+    CompiledTypstLayout, PreparedTypstSegment, TypstFontCatalog, TypstFrameElement,
+    TypstRenderStyle,
+};
+pub use typst_render::{set_user_typst_preamble, user_typst_preamble};
 use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 
@@ -541,6 +548,11 @@ pub struct MarkdownOptions {
     /// Defers parsing until the first [`MarkdownElement`] layout or [`Markdown::ensure_parsed`].
     /// After parsing starts, source updates parse eagerly even when off-screen.
     pub defer_parsing: bool,
+    /// Enables native Typst math rendering (`$...$` / `$$...$$`) in Markdown documents.
+    pub render_typst: bool,
+    /// Parses prose blocks natively as Typst markup (with fenced code blocks preserved for
+    /// Tree-sitter highlighting and Mermaid diagrams).
+    pub prefer_typst_markup: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1096,6 +1108,15 @@ impl Markdown {
         self.parse(cx);
     }
 
+    pub fn set_prefer_typst_markup(&mut self, prefer_typst_markup: bool, cx: &mut Context<Self>) {
+        if self.options.prefer_typst_markup != prefer_typst_markup {
+            self.options.prefer_typst_markup = prefer_typst_markup;
+            if !self.source.is_empty() {
+                self.parse(cx);
+            }
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn parsed_markdown(&self) -> &ParsedMarkdown {
         &self.parsed_markdown
@@ -1294,6 +1315,9 @@ impl Markdown {
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
+        let should_render_typst = self.options.render_typst || self.options.prefer_typst_markup;
+        let prefer_typst_markup = self.options.prefer_typst_markup;
+        let asset_source = cx.asset_source().clone();
         let language_registry = self.language_registry.clone();
         let fallback = self.fallback_code_block_language.clone();
 
@@ -1314,17 +1338,27 @@ impl Markdown {
                         link_definition_spans: Arc::default(),
                         fallback_code_block_language: None,
                         code_block_highlights: Arc::default(),
+                        typst_segments: Arc::default(),
                     },
                     Default::default(),
                 );
             }
 
-            let parsed = parse_markdown_with_options(
-                &source,
-                should_parse_html,
-                should_parse_heading_slugs,
-                should_parse_metadata_blocks,
-            );
+            let parsed = if prefer_typst_markup {
+                parse_typst_document_with_options(
+                    &source,
+                    should_parse_heading_slugs,
+                    should_parse_metadata_blocks,
+                )
+            } else {
+                parse_markdown_with_full_options(
+                    &source,
+                    should_parse_html,
+                    should_parse_heading_slugs,
+                    should_parse_metadata_blocks,
+                    should_render_typst,
+                )
+            };
             let events = parsed.events;
             let language_names = parsed.language_names;
             let paths = parsed.language_paths;
@@ -1335,6 +1369,41 @@ impl Markdown {
             let footnote_definitions = parsed.footnote_definitions;
             let link_definition_spans = parsed.link_definition_spans;
             let has_untagged_code_block = parsed.has_untagged_code_block;
+            let typst_sources = parsed.typst_sources;
+            let typst_segments: Arc<[Arc<PreparedTypstSegment>]> = if typst_sources.is_empty() {
+                Arc::default()
+            } else {
+                let font_catalog = TypstFontCatalog::shared(asset_source.as_ref());
+                let empty_links = HashMap::default();
+                typst_sources
+                    .into_iter()
+                    .map(|source_item| match source_item {
+                        ParsedTypstSource::Markup(source_range) => {
+                            Arc::new(PreparedTypstSegment::new(
+                                &source[source_range.clone()],
+                                source_range,
+                                &empty_links,
+                                font_catalog.clone(),
+                            ))
+                        }
+                        ParsedTypstSource::Math {
+                            full_range,
+                            math_content,
+                            display,
+                        } => {
+                            let typst_math =
+                                typst_render::convert_math_to_typst(&math_content, display);
+                            Arc::new(PreparedTypstSegment::from_exact_typst(
+                                typst_math,
+                                source[full_range.clone()].to_string(),
+                                full_range,
+                                font_catalog.clone(),
+                            ))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            };
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
             } else {
@@ -1411,6 +1480,7 @@ impl Markdown {
                 link_definition_spans: Arc::from(link_definition_spans),
                 fallback_code_block_language,
                 code_block_highlights: Arc::default(),
+                typst_segments,
             };
             parsed.code_block_highlights = Arc::new(compute_code_block_highlights(&parsed));
             (parsed, images_by_source_offset)
@@ -1530,11 +1600,7 @@ impl Selection {
             }
             SelectMode::All => {
                 self.start = 0;
-                self.end = rendered_text
-                    .lines
-                    .last()
-                    .map(|line| line.source_end)
-                    .unwrap_or(0);
+                self.end = rendered_text.document_source_end();
                 self.reversed = false;
             }
         }
@@ -1560,6 +1626,7 @@ pub struct ParsedMarkdown {
     pub(crate) link_definition_spans: Arc<[Range<usize>]>,
     pub(crate) fallback_code_block_language: Option<Arc<Language>>,
     pub(crate) code_block_highlights: Arc<CodeBlockHighlights>,
+    pub(crate) typst_segments: Arc<[Arc<PreparedTypstSegment>]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1880,12 +1947,16 @@ impl MarkdownElement {
             size(px(600.0), px(600.0)),
             |window, cx| Self::new(markdown, style(window, cx)),
         );
-        text.text
-            .lines
-            .iter()
-            .map(|line| line.layout.wrapped_text())
-            .collect::<Vec<_>>()
-            .join("\n")
+        if text.text.typst_blocks.is_empty() {
+            text.text
+                .lines
+                .iter()
+                .map(|line| line.layout.wrapped_text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text.text.text_for_range(0..usize::MAX)
+        }
     }
 
     pub fn code_block_renderer(mut self, variant: CodeBlockRenderer) -> Self {
@@ -2367,6 +2438,117 @@ impl MarkdownElement {
         builder.pop_div();
     }
 
+    fn typst_render_style(
+        &self,
+        tight_bounds: bool,
+        window: &Window,
+        cx: &App,
+    ) -> TypstRenderStyle {
+        let defaults = TypstRenderStyle::default();
+        let theme_colors = cx
+            .has_global::<theme::GlobalTheme>()
+            .then(|| cx.theme().colors());
+        let rem_size = window.rem_size();
+        let base_font_size = self.style.base_text_style.font_size.to_pixels(rem_size);
+        let line_height_px = self
+            .style
+            .paragraph_line_height
+            .to_pixels(self.style.base_text_style.font_size, rem_size);
+        let base_font_size_pt = f32::from(base_font_size).max(6.0);
+        let line_height_pt = f32::from(line_height_px).max(base_font_size_pt * 1.28);
+        let paragraph_spacing_pt = f32::from(self.style.paragraph_spacing).max(4.0);
+        let configured_code_pt = self
+            .style
+            .inline_code
+            .font_size
+            .or(self.style.code_block.text.font_size)
+            .map(|length| f32::from(length.to_pixels(rem_size)))
+            .unwrap_or(base_font_size_pt * 0.875);
+        let code_font_size_pt = configured_code_pt.max(6.0);
+        let min_heading_scale = [1.22_f32, 1.14, 1.07, 1.00, 0.95, 0.90];
+        let resolve_heading_pt = |refinement: Option<&TextStyleRefinement>, min_scale: f32| {
+            let min_pt = base_font_size_pt * min_scale;
+            match refinement.and_then(|style| style.font_size) {
+                Some(length) => f32::from(length.to_pixels(rem_size)).max(min_pt),
+                None => min_pt,
+            }
+        };
+        let heading_styles = self.style.heading_level_styles.as_ref();
+        let heading_font_sizes_pt = [
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h1.as_ref()),
+                min_heading_scale[0],
+            ),
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h2.as_ref()),
+                min_heading_scale[1],
+            ),
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h3.as_ref()),
+                min_heading_scale[2],
+            ),
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h4.as_ref()),
+                min_heading_scale[3],
+            ),
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h5.as_ref()),
+                min_heading_scale[4],
+            ),
+            resolve_heading_pt(
+                heading_styles.and_then(|styles| styles.h6.as_ref()),
+                min_heading_scale[5],
+            ),
+        ];
+        let monospace_font_family = self
+            .style
+            .inline_code
+            .font_family
+            .clone()
+            .or_else(|| self.style.code_block.text.font_family.clone())
+            .unwrap_or_else(|| SharedString::new_static("Lilex"));
+        TypstRenderStyle {
+            text_color: self.style.base_text_style.color,
+            muted_text_color: self
+                .style
+                .block_quote
+                .color
+                .or_else(|| theme_colors.map(|colors| colors.text_muted))
+                .unwrap_or(defaults.muted_text_color),
+            link_color: self
+                .style
+                .link
+                .color
+                .or_else(|| theme_colors.map(|colors| colors.text_accent))
+                .unwrap_or(defaults.link_color),
+            code_background_color: self
+                .style
+                .inline_code
+                .background_color
+                .or_else(|| theme_colors.map(|colors| colors.editor_foreground.opacity(0.08)))
+                .unwrap_or(defaults.code_background_color),
+            border_color: theme_colors
+                .map(|colors| colors.border_variant)
+                .unwrap_or(defaults.border_color),
+            table_header_background_color: theme_colors
+                .map(|colors| colors.title_bar_background)
+                .unwrap_or(defaults.table_header_background_color),
+            table_row_stripe_color: theme_colors
+                .map(|colors| colors.panel_background)
+                .unwrap_or(defaults.table_row_stripe_color),
+            font_family: self.style.base_text_style.font_family.clone(),
+            monospace_font_family,
+            base_font_size_pt,
+            code_font_size_pt,
+            line_height_pt,
+            paragraph_spacing_pt,
+            heading_font_sizes_pt,
+            page_width_pt: None,
+            tight_bounds,
+            user_preamble: user_typst_preamble(),
+        }
+    }
+
     fn paint_mouse_listeners(
         &mut self,
         hitbox: &Hitbox,
@@ -2378,19 +2560,20 @@ impl MarkdownElement {
             return;
         }
 
+        let mouse_position = window.mouse_position();
         let is_hovering_clickable = hitbox.is_hovered(window)
             && !self.markdown.read(cx).selection.pending
             && (rendered_text
-                .image_link_for_position(window.mouse_position())
+                .image_link_for_position(mouse_position)
                 .is_some()
+                || rendered_text.link_for_position(mouse_position).is_some()
                 || rendered_text
-                    .source_index_for_position(window.mouse_position())
+                    .source_index_for_position(mouse_position)
                     .ok()
                     .is_some_and(|source_index| {
-                        rendered_text.link_for_source_index(source_index).is_some()
-                            || rendered_text
-                                .footnote_ref_for_source_index(source_index)
-                                .is_some()
+                        rendered_text
+                            .footnote_ref_for_source_index(source_index)
+                            .is_some()
                     }));
 
         if is_hovering_clickable {
@@ -2412,10 +2595,8 @@ impl MarkdownElement {
                     && hitbox.is_hovered(window)
                 {
                     let link = rendered_text
-                        .source_index_for_position(event.position)
-                        .ok()
-                        .and_then(|ix| rendered_text.link_for_source_index(ix))
-                        .map(|link| link.destination_url.clone());
+                        .link_for_position(event.position)
+                        .map(|link| link.destination_url);
                     markdown.capture_for_context_menu(link, Some(&rendered_text));
                 }
             }
@@ -2430,16 +2611,13 @@ impl MarkdownElement {
                         let position_result =
                             rendered_text.source_index_for_position(event.position);
 
-                        if let Ok(source_index) = position_result {
-                            if let Some(footnote_ref) =
+                        if let Ok(source_index) = position_result
+                            && let Some(footnote_ref) =
                                 rendered_text.footnote_ref_for_source_index(source_index)
-                            {
-                                markdown.pressed_footnote_ref = Some(footnote_ref.clone());
-                            } else if let Some(link) =
-                                rendered_text.link_for_source_index(source_index)
-                            {
-                                markdown.pressed_link = Some(link.clone());
-                            }
+                        {
+                            markdown.pressed_footnote_ref = Some(footnote_ref.clone());
+                        } else if let Some(link) = rendered_text.link_for_position(event.position) {
+                            markdown.pressed_link = Some(link);
                         }
 
                         if markdown.pressed_footnote_ref.is_none()
@@ -2482,11 +2660,7 @@ impl MarkdownElement {
                                     (range.clone(), SelectMode::Line(range), false)
                                 }
                                 _ => {
-                                    let range = 0..rendered_text
-                                        .lines
-                                        .last()
-                                        .map(|line| line.source_end)
-                                        .unwrap_or(0);
+                                    let range = 0..rendered_text.document_source_end();
                                     (range, SelectMode::All, false)
                                 }
                             };
@@ -2538,11 +2712,10 @@ impl MarkdownElement {
                         .flatten()
                         .map(|image| image.destination_url.clone())
                         .or_else(|| {
-                            source_index
-                                .and_then(|source_index| {
-                                    rendered_text.link_for_source_index(source_index)
-                                })
-                                .map(|link| link.destination_url.clone())
+                            is_hitbox_hovered
+                                .then(|| rendered_text.link_for_position(event.position))
+                                .flatten()
+                                .map(|link| link.destination_url)
                         });
                     let is_hovering_clickable = hovered_url.is_some()
                         || source_index.is_some_and(|source_index| {
@@ -2576,8 +2749,8 @@ impl MarkdownElement {
                             cx.notify();
                         }
                     } else if let Some(pressed_link) = markdown.pressed_link.take()
-                        && source_index.and_then(|ix| rendered_text.link_for_source_index(ix))
-                            == Some(&pressed_link)
+                        && rendered_text.link_for_position(event.position)
+                            == Some(pressed_link.clone())
                     {
                         if let Some(open_url) = on_open_url.as_ref() {
                             open_url(pressed_link.destination_url, window, cx);
@@ -3456,6 +3629,93 @@ impl Element for MarkdownElement {
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
                 }
+                MarkdownEvent::TypstSegment(segment_index) => {
+                    let Some(base_segment) = parsed_markdown.typst_segments.get(*segment_index)
+                    else {
+                        continue;
+                    };
+                    let segment = if !self.style.prevent_mouse_interaction
+                        && let Some(code_span_callback) = self.code_span_link.as_ref()
+                        && !base_segment.inline_code_spans().is_empty()
+                    {
+                        let mut resolved_links = HashMap::default();
+                        for code_span in base_segment.inline_code_spans() {
+                            if let Some(url) = code_span_callback(&code_span.text, cx) {
+                                builder.push_link(url.clone(), code_span.full_range.clone());
+                                resolved_links.insert(code_span.full_range.clone(), url);
+                            }
+                        }
+                        base_segment.with_inline_code_links(&resolved_links)
+                    } else {
+                        base_segment.clone()
+                    };
+
+                    let highlights = builder
+                        .highlights
+                        .highlights_for_line(range.clone())
+                        .into_vec();
+                    let typst_style = self.typst_render_style(false, window, cx);
+                    let origin = Rc::new(Cell::new(None));
+                    let layout = Rc::new(Cell::new(None));
+                    builder.push_typst_block(RenderedTypstBlock {
+                        source_range: range.clone(),
+                        segment: segment.clone(),
+                        fallback_style: typst_style.clone(),
+                        origin: origin.clone(),
+                        layout: layout.clone(),
+                    });
+                    let frame_element = TypstFrameElement::new(segment, typst_style)
+                        .with_highlights(highlights)
+                        .with_tracking(origin, layout);
+                    let wrapper = div()
+                        .w_full()
+                        .when(!self.style.height_is_multiple_of_line_height, |el| {
+                            el.mb(self.style.paragraph_spacing)
+                        })
+                        .child(frame_element);
+                    builder.push_div(wrapper, range, markdown_end);
+                    builder.pop_div();
+                }
+                MarkdownEvent::TypstMath {
+                    segment_index,
+                    display,
+                } => {
+                    let Some(segment) = parsed_markdown.typst_segments.get(*segment_index) else {
+                        continue;
+                    };
+                    let highlights = builder
+                        .highlights
+                        .highlights_for_line(range.clone())
+                        .into_vec();
+                    let typst_style = self.typst_render_style(!display, window, cx);
+                    let origin = Rc::new(Cell::new(None));
+                    let layout = Rc::new(Cell::new(None));
+                    builder.push_typst_block(RenderedTypstBlock {
+                        source_range: range.clone(),
+                        segment: segment.clone(),
+                        fallback_style: typst_style.clone(),
+                        origin: origin.clone(),
+                        layout: layout.clone(),
+                    });
+                    let frame_element = TypstFrameElement::new(segment.clone(), typst_style)
+                        .with_highlights(highlights)
+                        .with_tracking(origin, layout);
+                    if *display {
+                        builder.push_div(
+                            div()
+                                .w_full()
+                                .my_1()
+                                .flex()
+                                .justify_center()
+                                .child(frame_element),
+                            range,
+                            markdown_end,
+                        );
+                        builder.pop_div();
+                    } else {
+                        builder.push_image_child(frame_element);
+                    }
+                }
             }
         }
         if self.style.code_block_overflow_x_scroll {
@@ -3856,6 +4116,7 @@ struct MetadataCellStyle {
 struct MarkdownElementBuilder {
     div_stack: Vec<DivStackEntry>,
     rendered_lines: Vec<Rc<RenderedLine>>,
+    rendered_typst_blocks: Vec<RenderedTypstBlock>,
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
     rendered_image_links: Vec<RenderedImageLink>,
@@ -3978,6 +4239,7 @@ impl MarkdownElementBuilder {
                 DivStackEntry::new(base_div.debug_selector(|| "inner".into()))
             }],
             rendered_lines: Vec::new(),
+            rendered_typst_blocks: Vec::new(),
             pending_line: PendingLine::default(),
             rendered_links: Vec::new(),
             rendered_image_links: Vec::new(),
@@ -4237,6 +4499,12 @@ impl MarkdownElementBuilder {
         });
     }
 
+    fn push_typst_block(&mut self, block: RenderedTypstBlock) {
+        self.flush_text();
+        self.current_source_index = self.current_source_index.max(block.source_range.end);
+        self.rendered_typst_blocks.push(block);
+    }
+
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
         self.push_highlighted_text(text, source_range, None);
     }
@@ -4436,6 +4704,7 @@ impl MarkdownElementBuilder {
             element: self.div_stack.pop().unwrap().div.into_any_element(),
             text: RenderedText {
                 lines: self.rendered_lines.into(),
+                typst_blocks: self.rendered_typst_blocks.into(),
                 links: self.rendered_links.into(),
                 image_links: self.rendered_image_links.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
@@ -4891,9 +5160,63 @@ pub struct RenderedMarkdown {
 #[derive(Clone)]
 struct RenderedText {
     lines: Rc<[Rc<RenderedLine>]>,
+    typst_blocks: Rc<[RenderedTypstBlock]>,
     links: Rc<[RenderedLink]>,
     image_links: Rc<[RenderedImageLink]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
+}
+
+#[derive(Clone)]
+struct RenderedTypstBlock {
+    source_range: Range<usize>,
+    segment: Arc<PreparedTypstSegment>,
+    fallback_style: TypstRenderStyle,
+    origin: Rc<Cell<Option<Point<Pixels>>>>,
+    layout: Rc<Cell<Option<Arc<CompiledTypstLayout>>>>,
+}
+
+impl RenderedTypstBlock {
+    fn current_layout(&self) -> Option<Arc<CompiledTypstLayout>> {
+        let layout = self.layout.take();
+        self.layout.set(layout.clone());
+        layout
+    }
+
+    fn layout_or_compile(&self) -> Arc<CompiledTypstLayout> {
+        self.current_layout()
+            .unwrap_or_else(|| self.segment.layout_for_style(&self.fallback_style))
+    }
+
+    fn bounds(&self) -> Option<(Point<Pixels>, Arc<CompiledTypstLayout>, Bounds<Pixels>)> {
+        let origin = self.origin.get()?;
+        let layout = self.current_layout()?;
+        let bounds = Bounds {
+            origin,
+            size: layout.size(),
+        };
+        Some((origin, layout, bounds))
+    }
+}
+
+enum RenderedItemRef<'a> {
+    Line(&'a Rc<RenderedLine>, usize),
+    Typst(&'a RenderedTypstBlock),
+}
+
+impl RenderedItemRef<'_> {
+    fn source_start(&self) -> usize {
+        match self {
+            Self::Line(_, start) => *start,
+            Self::Typst(block) => block.source_range.start,
+        }
+    }
+
+    fn source_end(&self) -> usize {
+        match self {
+            Self::Line(line, _) => line.source_end,
+            Self::Typst(block) => block.source_range.end,
+        }
+    }
 }
 
 struct WrappedLineSegment {
@@ -4924,25 +5247,104 @@ struct RenderedFootnoteRef {
 }
 
 impl RenderedText {
+    fn document_source_end(&self) -> usize {
+        let line_end = self.lines.last().map_or(0, |line| line.source_end);
+        let typst_end = self
+            .typst_blocks
+            .last()
+            .map_or(0, |block| block.source_range.end);
+        line_end.max(typst_end)
+    }
+
+    fn ordered_items(&self) -> Vec<RenderedItemRef<'_>> {
+        let mut items = Vec::with_capacity(self.lines.len() + self.typst_blocks.len());
+        let mut line_iter = self.lines.iter().peekable();
+        let mut typst_iter = self.typst_blocks.iter().peekable();
+
+        while line_iter.peek().is_some() || typst_iter.peek().is_some() {
+            let next_line_start = line_iter.peek().map(|line| {
+                line.source_mappings
+                    .first()
+                    .map_or(line.source_end, |mapping| mapping.source_index)
+            });
+            let next_typst_start = typst_iter.peek().map(|block| block.source_range.start);
+
+            match (next_line_start, next_typst_start) {
+                (Some(line_start), Some(typst_start)) if line_start <= typst_start => {
+                    if let Some(line) = line_iter.next() {
+                        items.push(RenderedItemRef::Line(line, line_start));
+                    }
+                }
+                (None, Some(_)) | (Some(_), Some(_)) => {
+                    if let Some(block) = typst_iter.next() {
+                        items.push(RenderedItemRef::Typst(block));
+                    }
+                }
+                (Some(line_start), None) => {
+                    if let Some(line) = line_iter.next() {
+                        items.push(RenderedItemRef::Line(line, line_start));
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+        items
+    }
+
     fn bounds_for_source_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         let mut all_bounds = Vec::new();
-        for line in self.lines.iter() {
-            let Some(first_mapping) = line.source_mappings.first() else {
-                continue;
-            };
-            let line_source_start = first_mapping.source_index;
-            if range.end <= line_source_start {
+        if self.typst_blocks.is_empty() {
+            for line in self.lines.iter() {
+                let Some(first_mapping) = line.source_mappings.first() else {
+                    continue;
+                };
+                let line_source_start = first_mapping.source_index;
+                if range.end <= line_source_start {
+                    break;
+                }
+                if range.start >= line.source_end {
+                    continue;
+                }
+                let wrapped_line_segments = line.wrapped_line_segments();
+                line.for_each_bounds_in_source_range(
+                    &wrapped_line_segments,
+                    range.start.max(line_source_start)..range.end.min(line.source_end),
+                    |bounds| all_bounds.push(bounds),
+                );
+            }
+            return all_bounds;
+        }
+
+        for item in self.ordered_items() {
+            let item_start = item.source_start();
+            let item_end = item.source_end();
+            if range.end <= item_start {
                 break;
             }
-            if range.start >= line.source_end {
+            if range.start >= item_end {
                 continue;
             }
-            let wrapped_line_segments = line.wrapped_line_segments();
-            line.for_each_bounds_in_source_range(
-                &wrapped_line_segments,
-                range.start.max(line_source_start)..range.end.min(line.source_end),
-                |bounds| all_bounds.push(bounds),
-            );
+            let clamped = range.start.max(item_start)..range.end.min(item_end);
+            match item {
+                RenderedItemRef::Line(line, _) => {
+                    let wrapped_line_segments = line.wrapped_line_segments();
+                    line.for_each_bounds_in_source_range(
+                        &wrapped_line_segments,
+                        clamped,
+                        |bounds| all_bounds.push(bounds),
+                    );
+                }
+                RenderedItemRef::Typst(block) => {
+                    if let Some((origin, layout, _)) = block.bounds() {
+                        for local in layout.local_bounds_for_source_range(clamped) {
+                            all_bounds.push(Bounds {
+                                origin: point(origin.x + local.origin.x, origin.y + local.origin.y),
+                                size: local.size,
+                            });
+                        }
+                    }
+                }
+            }
         }
         all_bounds
     }
@@ -4959,23 +5361,77 @@ impl RenderedText {
         let mut line_start_utf16 = 0;
         let mut last_source_end = 0;
 
-        for (line_index, line) in self.lines.iter().enumerate() {
-            let line_text = line.layout.text();
-            let line_utf16_len = line_text.encode_utf16().count();
-            let line_end_utf16 = line_start_utf16 + line_utf16_len;
-            last_source_end = line.source_end;
+        if self.typst_blocks.is_empty() {
+            for (line_index, line) in self.lines.iter().enumerate() {
+                let line_text = line.layout.text();
+                let line_utf16_len = line_text.encode_utf16().count();
+                let line_end_utf16 = line_start_utf16 + line_utf16_len;
+                last_source_end = line.source_end;
 
-            if utf16_index <= line_end_utf16 {
-                let local_utf16_index = utf16_index.saturating_sub(line_start_utf16);
-                let rendered_text = Rope::from(line_text.as_str());
-                let rendered_index = rendered_text.offset_utf16_to_offset(
-                    rendered_text.clip_offset_utf16(OffsetUtf16(local_utf16_index), Bias::Left),
-                );
-                return line.source_index_for_rendered_index(rendered_index);
+                if utf16_index <= line_end_utf16 {
+                    let local_utf16_index = utf16_index.saturating_sub(line_start_utf16);
+                    let rendered_text = Rope::from(line_text.as_str());
+                    let rendered_index = rendered_text.offset_utf16_to_offset(
+                        rendered_text.clip_offset_utf16(OffsetUtf16(local_utf16_index), Bias::Left),
+                    );
+                    return line.source_index_for_rendered_index(rendered_index);
+                }
+
+                line_start_utf16 = line_end_utf16;
+                if line_index + 1 < self.lines.len() {
+                    line_start_utf16 += 1;
+                }
             }
+            return last_source_end;
+        }
 
-            line_start_utf16 = line_end_utf16;
-            if line_index + 1 < self.lines.len() {
+        let items = self.ordered_items();
+        for (item_index, item) in items.iter().enumerate() {
+            match item {
+                RenderedItemRef::Line(line, _) => {
+                    let line_text = line.layout.text();
+                    let line_utf16_len = line_text.encode_utf16().count();
+                    let line_end_utf16 = line_start_utf16 + line_utf16_len;
+                    last_source_end = line.source_end;
+
+                    if utf16_index <= line_end_utf16 {
+                        let local_utf16_index = utf16_index.saturating_sub(line_start_utf16);
+                        let rendered_text = Rope::from(line_text.as_str());
+                        let rendered_index = rendered_text.offset_utf16_to_offset(
+                            rendered_text
+                                .clip_offset_utf16(OffsetUtf16(local_utf16_index), Bias::Left),
+                        );
+                        return line.source_index_for_rendered_index(rendered_index);
+                    }
+                    line_start_utf16 = line_end_utf16;
+                }
+                RenderedItemRef::Typst(block) => {
+                    let layout = block.layout_or_compile();
+                    let block_text = layout.rendered_text();
+                    let block_utf16_len = block_text.encode_utf16().count();
+                    let block_end_utf16 = line_start_utf16 + block_utf16_len;
+                    last_source_end = block.source_range.end;
+
+                    if utf16_index <= block_end_utf16 {
+                        let local_utf16_index = utf16_index.saturating_sub(line_start_utf16);
+                        let rope = Rope::from(block_text.as_ref());
+                        let rendered_index = rope.offset_utf16_to_offset(
+                            rope.clip_offset_utf16(OffsetUtf16(local_utf16_index), Bias::Left),
+                        );
+                        for cluster in layout.clusters() {
+                            if rendered_index <= cluster.rendered_range.start {
+                                return cluster.source_range.start;
+                            }
+                            if rendered_index <= cluster.rendered_range.end {
+                                return cluster.source_range.end;
+                            }
+                        }
+                        return block.source_range.end;
+                    }
+                    line_start_utf16 = block_end_utf16;
+                }
+            }
+            if item_index + 1 < items.len() {
                 line_start_utf16 += 1;
             }
         }
@@ -4993,13 +5449,18 @@ impl RenderedText {
         range_utf16: Range<usize>,
         adjusted_range: &mut Option<Range<usize>>,
     ) -> String {
-        let mut rendered_text = String::new();
-        for (line_index, line) in self.lines.iter().enumerate() {
-            if line_index > 0 {
-                rendered_text.push('\n');
+        let rendered_text = if self.typst_blocks.is_empty() {
+            let mut accumulated = String::new();
+            for (line_index, line) in self.lines.iter().enumerate() {
+                if line_index > 0 {
+                    accumulated.push('\n');
+                }
+                accumulated.push_str(&line.layout.text());
             }
-            rendered_text.push_str(&line.layout.text());
-        }
+            accumulated
+        } else {
+            self.text_for_range(0..usize::MAX)
+        };
 
         let rendered_text = Rope::from(rendered_text);
         let start = rendered_text.clip_offset_utf16(OffsetUtf16(range_utf16.start), Bias::Left);
@@ -5018,31 +5479,84 @@ impl RenderedText {
     }
 
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
-        let mut lines = self.lines.iter().peekable();
-        let mut fallback_line: Option<&Rc<RenderedLine>> = None;
-        let mut gap_source_index: Option<usize> = None;
+        if self.typst_blocks.is_empty() {
+            let mut lines = self.lines.iter().peekable();
+            let mut fallback_line: Option<&Rc<RenderedLine>> = None;
+            let mut gap_source_index: Option<usize> = None;
 
-        while let Some(line) = lines.next() {
-            let line_bounds = line.layout.bounds();
+            while let Some(line) = lines.next() {
+                let line_bounds = line.layout.bounds();
 
-            // Exact match: position is within bounds (handles overlapping bounds like table columns)
-            if line_bounds.contains(&position) {
+                if line_bounds.contains(&position) {
+                    return line.source_index_for_position(position);
+                }
+
+                if position.y <= line_bounds.bottom() && fallback_line.is_none() {
+                    fallback_line = Some(line);
+                }
+
+                if position.y > line_bounds.bottom() {
+                    if let Some(next_line) = lines.peek()
+                        && position.y < next_line.layout.bounds().top()
+                        && gap_source_index.is_none()
+                    {
+                        gap_source_index = Some(line.source_end);
+                    }
+                }
+            }
+
+            if let Some(source_index) = gap_source_index {
+                return Err(source_index);
+            }
+
+            if let Some(line) = fallback_line {
                 return line.source_index_for_position(position);
             }
 
-            // Track fallback for Y-coordinate based matching
-            if position.y <= line_bounds.bottom() && fallback_line.is_none() {
-                fallback_line = Some(line);
+            return Err(self.lines.last().map_or(0, |line| line.source_end));
+        }
+
+        let items = self.ordered_items();
+        let mut fallback_item: Option<&RenderedItemRef<'_>> = None;
+        let mut gap_source_index: Option<usize> = None;
+
+        for (index, item) in items.iter().enumerate() {
+            let Some(item_bounds) = (match item {
+                RenderedItemRef::Line(line, _) => Some(line.layout.bounds()),
+                RenderedItemRef::Typst(block) => block.bounds().map(|(_, _, bounds)| bounds),
+            }) else {
+                continue;
+            };
+
+            if item_bounds.contains(&position) {
+                return match item {
+                    RenderedItemRef::Line(line, _) => line.source_index_for_position(position),
+                    RenderedItemRef::Typst(block) => {
+                        if let Some((origin, layout, _)) = block.bounds() {
+                            layout.source_index_for_local_position(point(
+                                position.x - origin.x,
+                                position.y - origin.y,
+                            ))
+                        } else {
+                            Err(block.source_range.end)
+                        }
+                    }
+                };
             }
 
-            // Handle gap between lines
-            if position.y > line_bounds.bottom() {
-                if let Some(next_line) = lines.peek()
-                    && position.y < next_line.layout.bounds().top()
-                    && gap_source_index.is_none()
+            if position.y <= item_bounds.bottom() && fallback_item.is_none() {
+                fallback_item = Some(item);
+            }
+
+            if position.y > item_bounds.bottom() && gap_source_index.is_none() {
+                let next_bounds = items.get(index + 1).and_then(|next| match next {
+                    RenderedItemRef::Line(line, _) => Some(line.layout.bounds()),
+                    RenderedItemRef::Typst(block) => block.bounds().map(|(_, _, bounds)| bounds),
+                });
+                if let Some(next_bounds) = next_bounds
+                    && position.y < next_bounds.top()
                 {
-                    // A later table cell may contain the position, so defer the gap fallback.
-                    gap_source_index = Some(line.source_end);
+                    gap_source_index = Some(item.source_end());
                 }
             }
         }
@@ -5051,40 +5565,143 @@ impl RenderedText {
             return Err(source_index);
         }
 
-        // Fall back to Y-coordinate matched line
-        if let Some(line) = fallback_line {
-            return line.source_index_for_position(position);
+        if let Some(item) = fallback_item {
+            return match item {
+                RenderedItemRef::Line(line, _) => line.source_index_for_position(position),
+                RenderedItemRef::Typst(block) => {
+                    if let Some((origin, layout, _)) = block.bounds() {
+                        layout.source_index_for_local_position(point(
+                            position.x - origin.x,
+                            position.y - origin.y,
+                        ))
+                    } else {
+                        Err(block.source_range.start)
+                    }
+                }
+            };
         }
 
-        Err(self.lines.last().map_or(0, |line| line.source_end))
+        Err(self.document_source_end())
     }
 
     fn source_index_for_visible_position(&self, position: Point<Pixels>) -> Option<usize> {
-        self.lines.iter().find_map(|line| {
-            if line.visible_bounds.get()?.contains(&position) {
-                line.source_index_for_position(position).ok()
-            } else {
-                None
-            }
-        })
+        self.lines
+            .iter()
+            .find_map(|line| {
+                if line.visible_bounds.get()?.contains(&position) {
+                    line.source_index_for_position(position).ok()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.typst_blocks.iter().find_map(|block| {
+                    let (origin, layout, bounds) = block.bounds()?;
+                    if bounds.contains(&position) {
+                        layout
+                            .source_index_for_local_position(point(
+                                position.x - origin.x,
+                                position.y - origin.y,
+                            ))
+                            .ok()
+                    } else {
+                        None
+                    }
+                })
+            })
     }
 
     fn position_for_source_index(&self, source_index: usize) -> Option<(Point<Pixels>, Pixels)> {
-        for line in self.lines.iter() {
-            if source_index > line.source_end {
+        if self.typst_blocks.is_empty() {
+            for line in self.lines.iter() {
+                if source_index > line.source_end {
+                    continue;
+                }
+                let line_source_start = line.source_mappings.first()?.source_index;
+                let source_index = source_index.max(line_source_start);
+                let line_height = line.layout.line_height();
+                let rendered_index_within_line = line.rendered_index_for_source_index(source_index);
+                let position = line.layout.position_for_index(rendered_index_within_line)?;
+                return Some((position, line_height));
+            }
+            return None;
+        }
+
+        for item in self.ordered_items() {
+            if source_index > item.source_end() {
                 continue;
             }
-            let line_source_start = line.source_mappings.first().unwrap().source_index;
-            let source_index = source_index.max(line_source_start);
-            let line_height = line.layout.line_height();
-            let rendered_index_within_line = line.rendered_index_for_source_index(source_index);
-            let position = line.layout.position_for_index(rendered_index_within_line)?;
-            return Some((position, line_height));
+            match item {
+                RenderedItemRef::Line(line, line_source_start) => {
+                    let clamped_index = source_index.max(line_source_start);
+                    let line_height = line.layout.line_height();
+                    let rendered_index_within_line =
+                        line.rendered_index_for_source_index(clamped_index);
+                    let position = line.layout.position_for_index(rendered_index_within_line)?;
+                    return Some((position, line_height));
+                }
+                RenderedItemRef::Typst(block) => {
+                    let (origin, layout, _) = block.bounds()?;
+                    let clamped_index = source_index.max(block.source_range.start);
+                    let (local_pos, height) =
+                        layout.local_position_for_source_index(clamped_index)?;
+                    return Some((
+                        point(origin.x + local_pos.x, origin.y + local_pos.y),
+                        height,
+                    ));
+                }
+            }
         }
         None
     }
 
     fn surrounding_word_range(&self, source_index: usize) -> Range<usize> {
+        for block in self.typst_blocks.iter() {
+            if source_index >= block.source_range.start && source_index <= block.source_range.end {
+                let layout = block.layout_or_compile();
+                let rendered = layout.rendered_text();
+                let clusters = layout.clusters();
+                let Some(target_idx) = clusters
+                    .iter()
+                    .position(|cluster| source_index <= cluster.source_range.end)
+                else {
+                    return source_index..source_index;
+                };
+                let classifier = CharClassifier::new(None);
+                let cluster_kind = |cluster: &typst_render::TypstGlyphCluster| {
+                    rendered
+                        .get(cluster.rendered_range.clone())
+                        .and_then(|slice| slice.chars().next())
+                        .map(|character| classifier.kind(character))
+                };
+                let target_kind = cluster_kind(&clusters[target_idx]);
+                let target_top = clusters[target_idx].local_bounds.top();
+                let mut start_idx = target_idx;
+                while start_idx > 0 {
+                    let prev = &clusters[start_idx - 1];
+                    if (prev.local_bounds.top() - target_top).abs() <= px(3.0)
+                        && cluster_kind(prev) == target_kind
+                    {
+                        start_idx -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut end_idx = target_idx;
+                while end_idx + 1 < clusters.len() {
+                    let next = &clusters[end_idx + 1];
+                    if (next.local_bounds.top() - target_top).abs() <= px(3.0)
+                        && cluster_kind(next) == target_kind
+                    {
+                        end_idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return clusters[start_idx].source_range.start..clusters[end_idx].source_range.end;
+            }
+        }
+
         for line in self.lines.iter() {
             if source_index > line.source_end {
                 continue;
@@ -5132,6 +5749,33 @@ impl RenderedText {
     }
 
     fn surrounding_line_range(&self, source_index: usize) -> Range<usize> {
+        for block in self.typst_blocks.iter() {
+            if source_index >= block.source_range.start && source_index <= block.source_range.end {
+                let layout = block.layout_or_compile();
+                let clusters = layout.clusters();
+                let Some(target_idx) = clusters
+                    .iter()
+                    .position(|cluster| source_index <= cluster.source_range.end)
+                else {
+                    return block.source_range.clone();
+                };
+                let target_top = clusters[target_idx].local_bounds.top();
+                let mut start_idx = target_idx;
+                while start_idx > 0
+                    && (clusters[start_idx - 1].local_bounds.top() - target_top).abs() <= px(3.0)
+                {
+                    start_idx -= 1;
+                }
+                let mut end_idx = target_idx;
+                while end_idx + 1 < clusters.len()
+                    && (clusters[end_idx + 1].local_bounds.top() - target_top).abs() <= px(3.0)
+                {
+                    end_idx += 1;
+                }
+                return clusters[start_idx].source_range.start..clusters[end_idx].source_range.end;
+            }
+        }
+
         for line in self.lines.iter() {
             if source_index > line.source_end {
                 continue;
@@ -5146,33 +5790,76 @@ impl RenderedText {
     fn text_for_range(&self, range: Range<usize>) -> String {
         let mut accumulator = String::new();
 
-        for line in self.lines.iter() {
-            if range.start > line.source_end {
+        if self.typst_blocks.is_empty() {
+            for line in self.lines.iter() {
+                if range.start > line.source_end {
+                    continue;
+                }
+                let line_source_start = line.source_mappings.first().unwrap().source_index;
+                if range.end < line_source_start {
+                    break;
+                }
+
+                let text = line.layout.text();
+
+                let start = if range.start < line_source_start {
+                    0
+                } else {
+                    line.rendered_index_for_source_index(range.start)
+                };
+                let end = if range.end > line.source_end {
+                    line.rendered_index_for_source_index(line.source_end)
+                } else {
+                    line.rendered_index_for_source_index(range.end)
+                }
+                .min(text.len());
+
+                accumulator.push_str(&text[start..end]);
+                accumulator.push('\n');
+            }
+            accumulator.pop();
+            return accumulator;
+        }
+
+        for item in self.ordered_items() {
+            let item_start = item.source_start();
+            let item_end = item.source_end();
+            if range.start > item_end {
                 continue;
             }
-            let line_source_start = line.source_mappings.first().unwrap().source_index;
-            if range.end < line_source_start {
+            if range.end < item_start {
                 break;
             }
-
-            let text = line.layout.text();
-
-            let start = if range.start < line_source_start {
-                0
-            } else {
-                line.rendered_index_for_source_index(range.start)
-            };
-            let end = if range.end > line.source_end {
-                line.rendered_index_for_source_index(line.source_end)
-            } else {
-                line.rendered_index_for_source_index(range.end)
+            match item {
+                RenderedItemRef::Line(line, line_source_start) => {
+                    let text = line.layout.text();
+                    let start = if range.start < line_source_start {
+                        0
+                    } else {
+                        line.rendered_index_for_source_index(range.start)
+                    };
+                    let end = if range.end > line.source_end {
+                        line.rendered_index_for_source_index(line.source_end)
+                    } else {
+                        line.rendered_index_for_source_index(range.end)
+                    }
+                    .min(text.len());
+                    accumulator.push_str(&text[start..end]);
+                    accumulator.push('\n');
+                }
+                RenderedItemRef::Typst(block) => {
+                    let clamped = range.start.max(item_start)..range.end.min(item_end);
+                    if clamped.start < clamped.end {
+                        let layout = block.layout_or_compile();
+                        let text = layout.text_for_source_range(clamped);
+                        if !text.is_empty() {
+                            accumulator.push_str(&text);
+                            accumulator.push('\n');
+                        }
+                    }
+                }
             }
-            .min(text.len());
-
-            accumulator.push_str(&text[start..end]);
-            accumulator.push('\n');
         }
-        // Remove trailing newline
         accumulator.pop();
         accumulator
     }
@@ -5181,6 +5868,40 @@ impl RenderedText {
         self.links
             .iter()
             .find(|link| link.source_range.contains(&source_index))
+    }
+
+    fn link_for_position(&self, position: Point<Pixels>) -> Option<RenderedLink> {
+        for block in self.typst_blocks.iter() {
+            let Some((origin, layout, bounds)) = block.bounds() else {
+                continue;
+            };
+            if bounds.contains(&position) {
+                let local_position = point(position.x - origin.x, position.y - origin.y);
+                if let Some((link_index, typst_link)) = layout
+                    .links()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, link)| link.local_bounds.contains(&local_position))
+                {
+                    let synthetic_start =
+                        (block.source_range.start + link_index).min(block.source_range.end);
+                    let synthetic_end = (synthetic_start + 1).min(block.source_range.end);
+                    return Some(RenderedLink {
+                        source_range: typst_link
+                            .source_range
+                            .clone()
+                            .unwrap_or(synthetic_start..synthetic_end),
+                        destination_url: typst_link.destination_url.clone(),
+                    });
+                }
+            }
+        }
+
+        self.source_index_for_position(position)
+            .ok()
+            .and_then(|source_index| self.link_for_source_index(source_index))
+            .cloned()
     }
 
     fn image_link_for_position(&self, position: Point<Pixels>) -> Option<&RenderedImageLink> {
@@ -9564,4 +10285,175 @@ mod tests {
         (321, "- a\n  > b\n  ```\n  c\n  ```\n- d\n", &["c\n"]),
         (324, "1. ```\n   foo\n   ```\n\n   bar\n", &["foo\n"]),
     ];
+
+    #[gpui::test]
+    fn test_typst_markup_mode_renders_headings_math_links_and_code_blocks(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+
+        let source = concat!(
+            "= Architecture\n\n",
+            "Pipeline: $ -> \"Mind LLM\" -> $ and legacy $\\rightarrow$ arrow.\n\n",
+            "Inspect #link(\"file:///src/main.rs\")[main.rs] and `AgentThread`.\n\n",
+            "```rust\nfn main() {}\n```\n",
+        );
+
+        let options = MarkdownOptions {
+            render_typst: true,
+            prefer_typst_markup: true,
+            ..Default::default()
+        };
+        let markdown =
+            cx.new(|cx| Markdown::new_with_options(source.into(), None, None, options, cx));
+        cx.run_until_parked();
+
+        let (rendered, _) = cx.draw(
+            Default::default(),
+            size(px(640.0), px(600.0)),
+            |_window, _cx| {
+                MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
+                    .on_code_span_link(|code_text, _cx| {
+                        (code_text == "AgentThread")
+                            .then(|| "file:///crates/acp_thread/src/acp_thread.rs".into())
+                    })
+                    .code_block_renderer(CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    })
+            },
+        );
+
+        assert!(
+            !rendered.text.typst_blocks.is_empty(),
+            "expected Typst blocks to be laid out"
+        );
+        assert!(
+            rendered
+                .text
+                .lines
+                .iter()
+                .any(|line| line.layout.text().contains("fn main()")),
+            "expected fenced Rust code block to render through standard code block pipeline"
+        );
+
+        let typst_block = &rendered.text.typst_blocks[0];
+        let (origin, layout, _) = typst_block
+            .bounds()
+            .expect("Typst block should record painted bounds");
+        let destinations: Vec<String> = layout
+            .links()
+            .iter()
+            .map(|link| {
+                let target_point = origin + link.local_bounds.center();
+                rendered
+                    .text
+                    .link_for_position(target_point)
+                    .expect("expected link at Typst link region center")
+                    .destination_url
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            destinations.iter().any(|url| url == "file:///src/main.rs"),
+            "expected explicit #link destination, got {destinations:?}"
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|url| url == "file:///crates/acp_thread/src/acp_thread.rs"),
+            "expected resolved code-span destination, got {destinations:?}"
+        );
+
+        let mind_start = source.find("Pipeline").expect("Pipeline in source");
+        let mind_end = mind_start + "Pipeline".len();
+        assert!(
+            !rendered
+                .text
+                .bounds_for_source_range(mind_start..mind_end)
+                .is_empty(),
+            "expected selection bounds for Typst prose"
+        );
+        assert_eq!(
+            rendered.text.text_for_range(mind_start..mind_end),
+            "Pipeline"
+        );
+    }
+
+    #[gpui::test]
+    fn test_typst_search_highlights_and_source_positions(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+
+        let source = "= Search Target\n\nFind needle inside Typst $ x -> y $ output.\n";
+        let needle_start = source.find("needle").expect("needle in source");
+        let needle_range = needle_start..(needle_start + "needle".len());
+
+        let options = MarkdownOptions {
+            render_typst: true,
+            prefer_typst_markup: true,
+            ..Default::default()
+        };
+        let markdown =
+            cx.new(|cx| Markdown::new_with_options(source.into(), None, None, options, cx));
+        cx.run_until_parked();
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_search_highlights(vec![needle_range.clone()], Some(0), cx);
+        });
+
+        let (rendered, _) = cx.draw(
+            Default::default(),
+            size(px(640.0), px(400.0)),
+            |_window, _cx| MarkdownElement::new(markdown.clone(), MarkdownStyle::default()),
+        );
+
+        let position = rendered
+            .text
+            .position_for_source_index(needle_range.start)
+            .expect("expected scroll/caret position for source index inside Typst block");
+        let round_trip_index = rendered
+            .text
+            .source_index_for_position(point(position.0.x + px(2.0), position.0.y + px(4.0)));
+        assert!(
+            round_trip_index.is_ok(),
+            "expected hit-testing inside Typst block to map back to source offset"
+        );
+    }
+
+    #[gpui::test]
+    fn test_markdown_mode_with_render_typst_math(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+
+        let source = "# Markdown Heading\n\nInline $a \\rightarrow b$ and display:\n\n$$\\sum_{i=1}^n x_i$$\n";
+        let options = MarkdownOptions {
+            render_typst: true,
+            prefer_typst_markup: false,
+            ..Default::default()
+        };
+        let markdown =
+            cx.new(|cx| Markdown::new_with_options(source.into(), None, None, options, cx));
+        cx.run_until_parked();
+
+        let (rendered, _) = cx.draw(
+            Default::default(),
+            size(px(640.0), px(400.0)),
+            |_window, _cx| MarkdownElement::new(markdown.clone(), MarkdownStyle::default()),
+        );
+
+        assert_eq!(
+            rendered.text.typst_blocks.len(),
+            2,
+            "expected inline and display math formulas to render via Typst blocks"
+        );
+        assert!(
+            rendered
+                .text
+                .lines
+                .iter()
+                .any(|line| line.layout.text().contains("Markdown Heading")),
+            "expected surrounding Markdown prose to stay on standard Markdown lines"
+        );
+    }
 }

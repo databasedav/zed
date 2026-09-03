@@ -31,7 +31,8 @@ use gpui::{
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
 use language::{
-    Anchor, Buffer, BufferEditSource, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
+    Anchor, Buffer, BufferEditSource, BufferSnapshot, DiagnosticSeverity, LanguageRegistry,
+    OffsetRangeExt, Point, ToPoint, text_diff,
 };
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
@@ -48,7 +49,12 @@ use std::ops::Range;
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
+use std::{
+    fmt::Display,
+    mem,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 pub use submission::*;
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
@@ -322,6 +328,9 @@ pub struct SubagentSessionInfo {
     /// The index of the output of the message that the subagent has returned
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_end_index: Option<usize>,
+    /// Optional display name of the subagent's model reported by an ACP parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
 }
 
 /// Helper to extract subagent session id from ACP meta
@@ -1587,7 +1596,16 @@ impl ToolCall {
             if title.is_none() || kind == &acp_v2::ToolKind::Execute {
                 Markdown::new_text(text, cx)
             } else {
-                Markdown::new(text, Some(language_registry), None, cx)
+                Markdown::new_with_options(
+                    text,
+                    Some(language_registry),
+                    None,
+                    MarkdownOptions {
+                        render_typst: true,
+                        ..Default::default()
+                    },
+                    cx,
+                )
             }
         })
     }
@@ -2756,7 +2774,7 @@ impl ContentBlock {
             }
             acp_v2::ContentBlock::ResourceLink(_) => RenderBlock::ResourceLink,
             acp_v2::ContentBlock::Text(text) => RenderBlock::Markdown {
-                markdown: Self::create_markdown(text.text.clone(), language_registry, cx),
+                markdown: Self::create_tool_markdown(text.text.clone(), language_registry, cx),
             },
             acp_v2::ContentBlock::Other(_) => Self::unsupported(block, language_registry, cx),
             _ => Self::unsupported(block, language_registry, cx),
@@ -2890,6 +2908,30 @@ impl ContentBlock {
                 MarkdownOptions {
                     render_mermaid_diagrams: true,
                     render_metadata_blocks: true,
+                    render_typst: true,
+                    prefer_typst_markup: true,
+                    defer_parsing: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+    }
+
+    fn create_tool_markdown(
+        content: String,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Entity<Markdown> {
+        cx.new(|cx| {
+            Markdown::new_with_options(
+                content.into(),
+                Some(language_registry.clone()),
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    render_metadata_blocks: true,
+                    render_typst: true,
                     defer_parsing: true,
                     ..Default::default()
                 },
@@ -3602,7 +3644,21 @@ impl Plan {
             }
             (_, PlanContentUpdate::Markdown { content, path }) => {
                 self.content = PlanContent::Markdown {
-                    markdown: cx.new(|cx| Markdown::new(content.into(), None, None, cx)),
+                    markdown: cx.new(|cx| {
+                        Markdown::new_with_options(
+                            content.into(),
+                            None,
+                            None,
+                            MarkdownOptions {
+                                render_mermaid_diagrams: true,
+                                render_metadata_blocks: true,
+                                render_typst: true,
+                                prefer_typst_markup: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    }),
                     path,
                 };
                 true
@@ -3647,7 +3703,19 @@ pub struct PlanEntry {
 impl PlanEntry {
     fn new(source: acp_v2::PlanEntry, cx: &mut App) -> Self {
         Self {
-            content: cx.new(|cx| Markdown::new(source.content.clone().into(), None, None, cx)),
+            content: cx.new(|cx| {
+                Markdown::new_with_options(
+                    source.content.clone().into(),
+                    None,
+                    None,
+                    MarkdownOptions {
+                        render_typst: true,
+                        prefer_typst_markup: true,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            }),
             source,
         }
     }
@@ -3785,6 +3853,8 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    cancelling_follow_up_task: Option<(u32, futures::future::Shared<Task<()>>)>,
+    follow_up_interrupts_in_flight: usize,
     connection: Rc<dyn AgentConnection>,
     submissions: SessionSubmissions,
     activity: SessionActivity,
@@ -3814,6 +3884,9 @@ pub struct AcpThread {
     /// A cursor over retained source, rather than a second text store, lets the UI
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    end_turn_at_next_boundary: bool,
+    pending_subagent_continuation: bool,
+    separate_next_assistant_chunk: bool,
     idle_sleep_prevention: IdleSleepPrevention,
 }
 
@@ -4176,7 +4249,12 @@ impl AcpThread {
             draft_prompt_revision: 0,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            end_turn_at_next_boundary: false,
+            pending_subagent_continuation: false,
+            separate_next_assistant_chunk: false,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            cancelling_follow_up_task: None,
+            follow_up_interrupts_in_flight: 0,
         }
     }
 
@@ -4666,6 +4744,15 @@ impl AcpThread {
                             matches!(elicitation.status, ElicitationStatus::Pending { .. })
                         })
                 }
+                AgentThreadEntry::ToolCall(call) => {
+                    call.is_subagent()
+                        && matches!(
+                            call.status(),
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::InProgress
+                                | ToolCallStatus::WaitingForConfirmation
+                        )
+                }
                 _ => false,
             })
     }
@@ -4828,6 +4915,13 @@ impl AcpThread {
                 if changed {
                     cx.emit(AcpThreadEvent::SubmissionUpdated(id));
                     cx.notify();
+                }
+                if this.pending_subagent_continuation {
+                    if matches!(this.submissions.get(id).map(|r| &r.state), Some(SubmissionState::Completed)) {
+                        this.request_subagent_continuation(cx);
+                    } else {
+                        this.pending_subagent_continuation = false;
+                    }
                 }
             });
             if let Err(error) = update {
@@ -5777,6 +5871,22 @@ impl AcpThread {
         self.push_assistant_content_block_with_indent(chunk, is_thought, false, cx)
     }
 
+    pub fn push_keyed_assistant_content_block(
+        &mut self,
+        message_id: SharedString,
+        chunk: acp_v2::ContentBlock,
+        is_thought: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_assistant_content_block_with_message_id(
+            Some(acp_v1::MessageId::new(message_id.to_string())),
+            chunk,
+            is_thought,
+            false,
+            cx,
+        )
+    }
+
     pub fn push_assistant_content_block_with_indent(
         &mut self,
         chunk: acp_v2::ContentBlock,
@@ -5844,7 +5954,9 @@ impl AcpThread {
                         ..
                     }),
                     true,
-                ) if can_merge_message_chunks(existing_id.as_ref(), message_id.as_ref()) => {
+                ) if !self.separate_next_assistant_chunk
+                    && can_merge_message_chunks(existing_id.as_ref(), message_id.as_ref()) =>
+                {
                     if existing_id.is_none() {
                         *existing_id = message_id;
                     }
@@ -5867,6 +5979,7 @@ impl AcpThread {
                     }
                 }
             }
+            self.separate_next_assistant_chunk = false;
         } else {
             let block = MessageContent::new(chunk, &language_registry, path_style, cx);
             let chunk = if is_thought {
@@ -5900,6 +6013,9 @@ impl AcpThread {
         is_thought: bool,
         indented: bool,
     ) -> Option<(&mut MessageContent, StreamingTextTarget)> {
+        if self.separate_next_assistant_chunk {
+            return None;
+        }
         let (entry_index, last_entry) = self.entries.iter_mut().enumerate().next_back()?;
         if let AgentThreadEntry::AssistantMessage(AssistantMessage {
             chunks,
@@ -6038,11 +6154,13 @@ impl AcpThread {
 
     fn push_entry(&mut self, entry: AgentThreadEntry, cx: &mut Context<Self>) {
         self.flush_streaming_text(cx);
+        self.separate_next_assistant_chunk = false;
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
     }
 
     fn truncate_entries(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.separate_next_assistant_chunk = false;
         let removed_requests = self
             .entries
             .iter()
@@ -6251,6 +6369,12 @@ impl AcpThread {
         if self.subagents.contains_key(&session_id) {
             return;
         }
+        let parent_session_id = self.session_id().clone();
+        subagent.update(cx, |subagent, _| {
+            if subagent.parent_session_id.is_none() && subagent.session_id() != &parent_session_id {
+                subagent.parent_session_id = Some(parent_session_id);
+            }
+        });
         self.subagents.insert(session_id.clone(), subagent);
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
@@ -6303,6 +6427,55 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::Retry(status));
     }
 
+    pub fn has_tool_call(&self, id: &acp_v2::ToolCallId) -> bool {
+        self.index_for_tool_call(id).is_some()
+    }
+
+    pub fn has_running_subagents(&self, cx: &App) -> bool {
+        self.subagents
+            .values()
+            .any(|subagent| subagent.read(cx).status() == ThreadStatus::Generating)
+            || self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    AgentThreadEntry::ToolCall(call)
+                        if call.is_subagent()
+                            && matches!(
+                                call.status(),
+                                ToolCallStatus::Pending
+                                    | ToolCallStatus::WaitingForConfirmation
+                                    | ToolCallStatus::InProgress
+                                    | ToolCallStatus::Paused
+                            )
+                )
+            })
+    }
+
+    pub fn supports_subagent_messaging(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.connection
+            .supports_subagent_messaging(subagent_session_id, cx)
+    }
+
+    pub fn message_subagent(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        cx: &mut App,
+    ) -> Result<()> {
+        self.connection.message_subagent(
+            self.session_id(),
+            subagent_session_id,
+            message,
+            interrupt,
+            cx,
+        )
+    }
+
     pub fn update_tool_call(
         &mut self,
         update: impl Into<ToolCallUpdate>,
@@ -6318,6 +6491,12 @@ impl AcpThread {
                 let Some(AgentThreadEntry::ToolCall(call)) = self.entries.get_mut(index) else {
                     anyhow::bail!("Tool call entry disappeared while updating");
                 };
+                let was_active = matches!(
+                    call.status(),
+                    ToolCallStatus::Pending
+                        | ToolCallStatus::WaitingForConfirmation
+                        | ToolCallStatus::InProgress
+                );
                 let patch = ToolCallPatch::legacy(update.fields, update.meta);
                 let location_updated = !patch.locations.is_undefined();
                 let authorization_id = call.authorization_id();
@@ -6327,6 +6506,11 @@ impl AcpThread {
                     ToolTerminalResolver::registered(&self.terminals),
                     cx,
                 );
+                let settled_at_boundary = was_active
+                    && matches!(
+                        call.status(),
+                        ToolCallStatus::Completed | ToolCallStatus::Failed
+                    );
                 let detached_id =
                     authorization_id.filter(|id| call.authorization_id() != Some(*id));
                 if let Some(id) = detached_id {
@@ -6340,6 +6524,12 @@ impl AcpThread {
                     self.resolve_locations(id, cx);
                 }
                 cx.emit(AcpThreadEvent::EntryUpdated(index));
+                if settled_at_boundary
+                    && self.end_turn_at_next_boundary
+                    && !self.has_active_tool_calls()
+                {
+                    self.schedule_boundary_steer_fallback(cx);
+                }
                 Ok(())
             }
             ToolCallUpdate::V2(update) => self.upsert_local_tool_call(update, cx),
@@ -7437,6 +7627,27 @@ impl AcpThread {
         self.submit(message, false, cx)
     }
 
+    pub fn has_follow_up_interrupt_in_flight(&self) -> bool {
+        self.follow_up_interrupts_in_flight > 0 || self.cancelling_follow_up_task.is_some()
+    }
+
+    pub fn request_subagent_continuation(&mut self, cx: &mut Context<Self>) {
+        if self.status() == ThreadStatus::Idle
+            && !self.has_unsettled_submissions()
+            && !self.has_follow_up_interrupt_in_flight()
+        {
+            self.pending_subagent_continuation = false;
+            let _ = self.send_command(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    ZED_SUBAGENT_CONTINUATION_PROMPT,
+                ))],
+                cx,
+            );
+        } else {
+            self.pending_subagent_continuation = true;
+        }
+    }
+
     fn submit(
         &mut self,
         message: Vec<acp_v2::ContentBlock>,
@@ -7529,6 +7740,7 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> Submission {
+        self.pending_subagent_continuation = false;
         let request = acp_v2::PromptRequest::new(self.session_id().clone(), message);
         if let Err(error) = self.validate_prompt_content(&request.prompt) {
             return self.track_submission(id, None, cx, async move |_, _| Err(error));
@@ -7544,24 +7756,16 @@ impl AcpThread {
             .as_ref()
             .map(|client_user_message_ids| client_user_message_ids.new_id());
 
-        self.run_turn(id, cx, async move |this, cx| {
-            if push_user_message {
-                this.update(cx, |this, cx| {
-                    this.push_entry(
-                        AgentThreadEntry::UserMessage(UserMessage {
-                            identity: MessageIdentity::Legacy(None),
-                            meta: None,
-                            client_id: client_id.clone(),
-                            is_optimistic: true,
-                            content: block,
-                            indented: false,
-                        }),
-                        cx,
-                    );
-                })
-                .ok();
-            }
+        let initial_user_message = push_user_message.then(|| UserMessage {
+            identity: MessageIdentity::Legacy(None),
+            meta: None,
+            client_id: client_id.clone(),
+            is_optimistic: true,
+            content: block,
+            indented: false,
+        });
 
+        self.run_turn_with_user_message(id, initial_user_message, cx, async move |this, cx| {
             this.update(cx, |this, cx| {
                 if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
                     prompt.prompt(client_id, request, cx)
@@ -7627,29 +7831,80 @@ impl AcpThread {
         cx: &mut Context<Self>,
         f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp_v1::PromptResponse>,
     ) -> Submission {
-        let cancel_task = match self
-            .request_cancellation(RequestPermissionOutcome::InterruptedByFollowUp, cx)
-        {
+        self.run_turn_with_user_message(id, None, cx, f)
+    }
+
+    fn run_turn_with_user_message(
+        &mut self,
+        id: SubmissionId,
+        mut initial_user_message: Option<UserMessage>,
+        cx: &mut Context<Self>,
+        f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp_v1::PromptResponse>,
+    ) -> Submission {
+        let cancel_task = match self.request_cancellation_inner(
+            RequestPermissionOutcome::InterruptedByFollowUp,
+            false,
+            cx,
+        ) {
             Ok(task) => task,
             Err(error) => return self.track_submission(id, None, cx, async move |_, _| Err(error)),
         };
+        self.cancelling_follow_up_task = None;
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
         self.local_execution_error = None;
+        if self.end_turn_at_next_boundary {
+            self.connection
+                .set_end_turn_at_next_boundary(self.session_id(), true, cx)
+                .log_err();
+        }
 
         let (tx, rx) = oneshot::channel();
 
         self.turn_id += 1;
         let turn_id = self.turn_id;
-        // A continuation can extend the trailing entry rather than create a new one.
+        // A continuation can extend the trailing entry rather than create a new one,
+        // while keeping unkeyed ACP v1 chunks from gluing onto the prior turn's text.
+        self.separate_next_assistant_chunk = matches!(
+            self.entries.last(),
+            Some(AgentThreadEntry::AssistantMessage(_))
+        );
         let first_entry_index = self.entries.len().saturating_sub(1);
+        if cancel_task.is_none()
+            && !self.uses_reported_activity()
+            && let Some(user_message) = initial_user_message.take()
+        {
+            self.push_entry(AgentThreadEntry::UserMessage(user_message), cx);
+        }
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             first_entry_index,
             send_task: cx.spawn(async move |this, cx| {
-                let response = match cancel_task.await {
-                    Ok(()) => f(this, cx).await,
-                    Err(error) => Err(error),
+                let response = match cancel_task {
+                    Some(cancel_task) => match cancel_task.await {
+                        Ok(()) => {
+                            if let Some(user_message) = initial_user_message.take() {
+                                this.update(cx, |this, cx| {
+                                    this.push_entry(
+                                        AgentThreadEntry::UserMessage(user_message),
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            }
+                            f(this, cx).await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    None => {
+                        if let Some(user_message) = initial_user_message.take() {
+                            this.update(cx, |this, cx| {
+                                this.push_entry(AgentThreadEntry::UserMessage(user_message), cx);
+                            })
+                            .ok();
+                        }
+                        f(this, cx).await
+                    }
                 };
                 if let Err(Err(error)) = tx.send(response) {
                     log::debug!("Legacy submission observer was released: {error:#}");
@@ -7683,6 +7938,9 @@ impl AcpThread {
                 // state even when the send_task is cancelled before tx.send().
                 if is_same_turn {
                     this.running_turn.take();
+                    if this.end_turn_at_next_boundary {
+                        this.set_end_turn_at_next_boundary(false, cx);
+                    }
                     this.set_foreground_state(
                         acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
                         cx,
@@ -7802,10 +8060,51 @@ impl AcpThread {
 
     /// Receipt sessions wait for reported Idle without withdrawing pending prompt RPCs.
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.pending_subagent_continuation = false;
         match self.request_cancellation(RequestPermissionOutcome::Cancelled, cx) {
             Ok(task) => task,
             Err(error) => Task::ready(Err(error)),
         }
+    }
+
+    pub fn interrupt_for_follow_up(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        match self.interrupt_for_follow_up_or_ready(cx) {
+            Ok(Some(task)) => task,
+            Ok(None) => Task::ready(Ok(())),
+            Err(error) => Task::ready(Err(error)),
+        }
+    }
+
+    pub fn interrupt_for_follow_up_or_ready(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Task<Result<()>>>> {
+        self.pending_subagent_continuation = false;
+        let Some(task) = self.request_cancellation_inner(
+            RequestPermissionOutcome::InterruptedByFollowUp,
+            true,
+            cx,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.follow_up_interrupts_in_flight += 1;
+        Ok(Some(cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                this.follow_up_interrupts_in_flight =
+                    this.follow_up_interrupts_in_flight.saturating_sub(1);
+                if this.follow_up_interrupts_in_flight == 0
+                    && this.pending_subagent_continuation
+                    && this.status() == ThreadStatus::Idle
+                    && !this.has_unsettled_submissions()
+                {
+                    this.request_subagent_continuation(cx);
+                }
+            })
+            .ok();
+            res
+        })))
     }
 
     /// Asks the agent to stop one tool call, without cancelling the rest of the session's work.
@@ -7843,24 +8142,99 @@ impl AcpThread {
             .cancel_terminal(self.session_id(), terminal_id, cx)
     }
 
+    pub fn supports_steer_at_boundary(&self) -> bool {
+        self.connection.supports_steer_at_boundary()
+    }
+
+    pub fn end_turn_at_next_boundary(&self) -> bool {
+        self.end_turn_at_next_boundary
+    }
+
+    pub fn set_end_turn_at_next_boundary(&mut self, end_at_boundary: bool, cx: &mut Context<Self>) {
+        if self.end_turn_at_next_boundary == end_at_boundary {
+            return;
+        }
+        self.end_turn_at_next_boundary = end_at_boundary;
+        self.connection
+            .set_end_turn_at_next_boundary(self.session_id(), end_at_boundary, cx)
+            .log_err();
+    }
+
+    fn has_active_tool_calls(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(call)
+                    if !call.is_subagent()
+                        && matches!(
+                            call.status(),
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::WaitingForConfirmation
+                                | ToolCallStatus::InProgress
+                        )
+            )
+        })
+    }
+
+    fn schedule_boundary_steer_fallback(&mut self, cx: &mut Context<Self>) {
+        let turn_id = self.turn_id;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.turn_id == turn_id
+                    && this.end_turn_at_next_boundary
+                    && this.foreground_activity() == ForegroundActivity::Running
+                    && !this.has_active_tool_calls()
+                {
+                    this.end_turn_at_next_boundary = false;
+                    this.connection
+                        .interrupt_for_follow_up(this.session_id(), cx)
+                        .log_err();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn request_cancellation(
         &mut self,
         permission_outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) -> Result<Task<Result<()>>> {
+        self.request_cancellation_inner(permission_outcome, true, cx)
+            .map(|task| task.unwrap_or_else(|| Task::ready(Ok(()))))
+    }
+
+    fn request_cancellation_inner(
+        &mut self,
+        permission_outcome: RequestPermissionOutcome,
+        reuse_follow_up_task: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Task<Result<()>>>> {
         anyhow::ensure!(
             self.subagent_association
                 .as_ref()
                 .is_none_or(|association| association.can_cancel),
             "This subagent's parent does not allow cancelling it"
         );
+        let cancel_subagents = matches!(permission_outcome, RequestPermissionOutcome::Cancelled);
         self.flush_streaming_text(cx);
         if self.uses_reported_activity() {
             self.activity.ensure_observable()?;
+            let has_running_subagents = cancel_subagents && self.has_running_subagents(cx);
             if self.foreground_activity() != ForegroundActivity::Idle
                 || self.has_unsettled_submissions()
+                || has_running_subagents
             {
-                self.connection.cancel(self.session_id(), cx)?;
+                if cancel_subagents {
+                    self.connection.cancel(self.session_id(), cx)?;
+                } else {
+                    self.connection
+                        .interrupt_for_follow_up(self.session_id(), cx)?;
+                }
             }
             if self.connection.answers_permission_requests_on_cancel() {
                 if self.subagent_association.is_some() {
@@ -7875,29 +8249,72 @@ impl AcpThread {
                 }
             }
             let receiver = self.activity.wait_for_idle()?;
-            let Some(receiver) = receiver else {
-                return Ok(Task::ready(Ok(())));
-            };
-            return Ok(cx.spawn(async move |_, _| {
-                receiver
-                    .await
-                    .context("Agent connection lost before cancellation was confirmed")
-            }));
+            let mut subagent_receivers = Vec::new();
+            if cancel_subagents {
+                for subagent in self.subagents.values() {
+                    if let Ok(Some(rx)) = subagent.update(cx, |subagent, _| {
+                        if subagent.uses_reported_activity() {
+                            subagent.activity.wait_for_idle()
+                        } else {
+                            Ok(None)
+                        }
+                    }) {
+                        subagent_receivers.push(rx);
+                    }
+                }
+            }
+            if receiver.is_none() && subagent_receivers.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(cx.spawn(async move |_, _| {
+                if let Some(receiver) = receiver {
+                    receiver
+                        .await
+                        .context("Agent connection lost before cancellation was confirmed")?;
+                }
+                for subagent_rx in subagent_receivers {
+                    subagent_rx.await.ok();
+                }
+                Ok(())
+            })));
+        }
+        if cancel_subagents {
+            self.cancelling_follow_up_task = None;
         }
         if self.running_turn.is_some() {
-            self.connection.cancel(self.session_id(), cx)?;
+            if cancel_subagents {
+                self.connection.cancel(self.session_id(), cx)?;
+            } else {
+                self.connection
+                    .interrupt_for_follow_up(self.session_id(), cx)?;
+            }
         }
         self.cancel_outstanding_elicitations(cx);
 
         let Some(turn) = self.running_turn.take() else {
+            if self.parent_session_id.is_some()
+                && matches!(permission_outcome, RequestPermissionOutcome::Cancelled)
+            {
+                self.connection.cancel(self.session_id(), cx)?;
+            }
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);
             }
-            return Ok(Task::ready(Ok(())));
+            if reuse_follow_up_task
+                && !cancel_subagents
+                && let Some((turn_id, shared)) = self.cancelling_follow_up_task.clone()
+                && turn_id == self.turn_id
+            {
+                return Ok(Some(cx.background_spawn(async move {
+                    shared.await;
+                    Ok(())
+                })));
+            }
+            return Ok(None);
         };
         self.shrink_message_source_capacity(turn.first_entry_index);
-        self.mark_pending_entries_as_canceled(permission_outcome, cx);
+        self.mark_pending_entries_as_canceled(permission_outcome, cancel_subagents, cx);
         self.set_foreground_state(
             acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
             cx,
@@ -7905,10 +8322,35 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::StatusChanged);
 
         // Wait for the send task to complete
-        Ok(cx.background_spawn(async move {
-            turn.send_task.await;
-            Ok(())
-        }))
+        if !cancel_subagents {
+            let turn_id = turn.id;
+            let shared = turn.send_task.shared();
+            self.cancelling_follow_up_task = Some((turn_id, shared.clone()));
+            let cleanup_shared = shared.clone();
+            cx.spawn(async move |this, cx| {
+                cleanup_shared.await;
+                this.update(cx, |this, _| {
+                    if this
+                        .cancelling_follow_up_task
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == turn_id)
+                    {
+                        this.cancelling_follow_up_task = None;
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            Ok(Some(cx.background_spawn(async move {
+                shared.await;
+                Ok(())
+            })))
+        } else {
+            Ok(Some(cx.background_spawn(async move {
+                turn.send_task.await;
+                Ok(())
+            })))
+        }
     }
 
     fn update_idle_sleep_prevention(&mut self, cx: &mut Context<Self>) {
@@ -7982,7 +8424,7 @@ impl AcpThread {
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
-        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, cx);
+        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, false, cx);
         self.cancel_outstanding_elicitations(cx);
     }
 
@@ -7991,7 +8433,8 @@ impl AcpThread {
         outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
-        self.mark_pending_entries_as_canceled(outcome.clone(), cx);
+        let cancel_subagents = matches!(outcome, RequestPermissionOutcome::Cancelled);
+        self.mark_pending_entries_as_canceled(outcome.clone(), cancel_subagents, cx);
         let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
         for id in request_ids {
             self.cancel_permission_request_with_outcome(id, outcome.clone(), cx);
@@ -8002,12 +8445,18 @@ impl AcpThread {
     fn mark_pending_entries_as_canceled(
         &mut self,
         permission_outcome: RequestPermissionOutcome,
+        cancel_subagents: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let mut canceled_any = false;
         let mut canceled_requests = Vec::new();
+        let mut canceled_terminals = Vec::new();
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
+                    if !cancel_subagents && call.is_subagent() {
+                        continue;
+                    }
                     let cancel = matches!(
                         call.status(),
                         ToolCallStatus::Pending
@@ -8015,7 +8464,9 @@ impl AcpThread {
                             | ToolCallStatus::InProgress
                     );
                     if cancel {
+                        canceled_any = true;
                         call.set_local_status(ToolCallStatus::Canceled);
+                        canceled_terminals.extend(call.terminals().cloned());
                         if let Some(id) = call.authorization.take() {
                             canceled_requests.push(id);
                         }
@@ -8024,6 +8475,7 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ContextCompaction(compaction) => {
                     if compaction.status == ContextCompactionStatus::InProgress {
+                        canceled_any = true;
                         compaction.status = ContextCompactionStatus::Canceled;
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
                     }
@@ -8031,10 +8483,19 @@ impl AcpThread {
                 _ => {}
             }
         }
+        for terminal in canceled_terminals {
+            terminal.update(cx, |terminal, cx| {
+                terminal.finish_display(
+                    acp_v1::TerminalExitStatus::new().signal("SIGINT".to_owned()),
+                    cx,
+                );
+            });
+        }
         for id in canceled_requests {
             self.resolve_permission_request(id, permission_outcome.clone(), cx);
         }
         self.cancel_generic_permission_requests(cx);
+        canceled_any
     }
 
     pub fn cancel_outstanding_elicitations(&mut self, cx: &mut Context<Self>) {
@@ -8122,6 +8583,137 @@ impl AcpThread {
                 }
             } else {
                 None
+            }
+        })
+    }
+
+    pub fn read_diagnostics(
+        &self,
+        path: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<String, acp_v1::Error>> {
+        let project = self.project.clone();
+        cx.spawn(async move |_this, cx| {
+            let freshness_message = |refreshed: bool| {
+                if refreshed {
+                    "Diagnostics successfully refreshed."
+                } else {
+                    "Failed to refresh diagnostics. Diagnostics may be stale."
+                }
+            };
+
+            match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(path_str) => {
+                    let path_buf = PathBuf::from(path_str);
+                    let open_buffer_task = project.update(cx, |project, cx| {
+                        let project_path = if path_buf.is_absolute() {
+                            project.project_path_for_absolute_path(&path_buf, cx)
+                        } else {
+                            project
+                                .find_project_path(Path::new(path_str), cx)
+                                .or_else(|| {
+                                    let worktrees: Vec<_> = project.visible_worktrees(cx).collect();
+                                    if worktrees.len() == 1 {
+                                        let abs = worktrees[0].read(cx).abs_path().join(path_str);
+                                        project.project_path_for_absolute_path(&abs, cx)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        };
+                        let project_path = project_path.ok_or_else(|| {
+                            acp_v1::Error::resource_not_found(Some(path_str.to_string()))
+                        })?;
+                        Ok::<_, acp_v1::Error>(project.open_buffer(project_path, cx))
+                    })?;
+
+                    let buffer = open_buffer_task
+                        .await
+                        .map_err(|e| acp_v1::Error::internal_error().data(e.to_string()))?;
+
+                    let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
+                    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+                        lsp_store.pull_diagnostics_for_buffer(buffer.clone(), cx)
+                    });
+                    let pull_result = pull_task.await;
+                    if let Err(error) = &pull_result {
+                        log::warn!("Failed to pull diagnostics, using cached: {error:#}");
+                    }
+                    let refreshed = pull_result.is_ok();
+
+                    let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+
+                    let mut output = String::new();
+                    for (_, group) in snapshot.diagnostic_groups(None) {
+                        let entry = &group.entries[group.primary_ix];
+                        let range = entry.range.to_point(&snapshot);
+                        let severity = match entry.diagnostic.severity {
+                            DiagnosticSeverity::ERROR => "error",
+                            DiagnosticSeverity::WARNING => "warning",
+                            _ => continue,
+                        };
+                        writeln!(
+                            output,
+                            "{} at line {}: {}",
+                            severity,
+                            range.start.row + 1,
+                            entry.diagnostic.message
+                        )
+                        .ok();
+                    }
+
+                    let freshness = freshness_message(refreshed);
+                    if output.is_empty() {
+                        Ok(format!(
+                            "{freshness}\n\nFile doesn't have errors or warnings!"
+                        ))
+                    } else {
+                        Ok(format!("{freshness}\n\n{output}"))
+                    }
+                }
+                None => {
+                    let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
+                    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+                        lsp_store.pull_workspace_diagnostics_once(cx)
+                    });
+                    let refreshed = pull_task.await;
+                    if !refreshed {
+                        log::warn!("Failed to pull workspace diagnostics, using cached");
+                    }
+
+                    let (output, has_diagnostics) = project.read_with(cx, |project, cx| {
+                        let mut output = String::new();
+                        let mut has_diagnostics = false;
+
+                        for (project_path, _, summary) in project.diagnostic_summaries(true, cx) {
+                            if summary.error_count > 0 || summary.warning_count > 0 {
+                                let Some(worktree) =
+                                    project.worktree_for_id(project_path.worktree_id, cx)
+                                else {
+                                    continue;
+                                };
+                                has_diagnostics = true;
+                                output.push_str(&format!(
+                                    "{}: {} error(s), {} warning(s)\n",
+                                    worktree.read(cx).absolutize(&project_path.path).display(),
+                                    summary.error_count,
+                                    summary.warning_count
+                                ));
+                            }
+                        }
+
+                        (output, has_diagnostics)
+                    });
+
+                    let freshness = freshness_message(refreshed);
+                    if has_diagnostics {
+                        Ok(format!("{freshness}\n\n{output}"))
+                    } else {
+                        Ok(format!(
+                            "{freshness}\n\nNo errors or warnings found in the project."
+                        ))
+                    }
+                }
             }
         })
     }
@@ -8301,6 +8893,23 @@ impl AcpThread {
         })
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn build_terminal_command(
+        shell: String,
+        is_windows: bool,
+        command: String,
+        args: &[String],
+    ) -> (String, Vec<String>) {
+        // The terminal task still allocates a PTY, so commands that need a terminal can use
+        // `/dev/tty`. The shell itself is non-interactive to avoid enabling job control for a
+        // one-shot command; interactive dash can fail to restore the TTY process group when the
+        // command runs in the Linux sandbox's PID namespace.
+        ShellBuilder::new(&Shell::Program(shell), is_windows)
+            .non_interactive()
+            .redirect_stdin_to_dev_null()
+            .build(Some(command), args)
+    }
+
     pub fn create_terminal(
         &self,
         command: String,
@@ -8336,6 +8945,7 @@ impl AcpThread {
         // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
         // setup fails with `ENOTTY`. Run the command non-interactively and
         // without a PTY in that case.
+        #[cfg(target_os = "windows")]
         let headless = HeadlessTerminal::is_enabled(cx);
 
         let terminal_id = acp_v2::TerminalId::new(Uuid::new_v4().to_string());
@@ -8400,13 +9010,12 @@ impl AcpThread {
 
                 #[cfg(not(target_os = "windows"))]
                 let (task_command, task_args, task_env, sandbox, spawn_cwd) = {
-                    let mut builder = ShellBuilder::new(&Shell::Program(shell), is_windows);
-                    if headless || (cfg!(target_os = "linux") && sandbox_wrap.is_some()) {
-                        builder = builder.non_interactive();
-                    }
-                    let (task_command, task_args) = builder
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                    let (task_command, task_args) = Self::build_terminal_command(
+                        shell,
+                        is_windows,
+                        command.clone(),
+                        &args,
+                    );
                     let (task_command, task_args, task_env, sandbox) = cx
                         .background_spawn(prepare_sandbox_wrap(
                             task_command,
@@ -8757,6 +9366,7 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use anyhow::anyhow;
     use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
@@ -8776,6 +9386,26 @@ mod tests {
         time::Duration,
     };
     use util::{path, path_list::PathList};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_agent_terminal_shell_is_non_interactive() {
+        let (program, args) = AcpThread::build_terminal_command(
+            "/bin/sh".to_string(),
+            false,
+            "printf 'works\\n'".to_string(),
+            &[],
+        );
+
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "exec </dev/null\nprintf 'works\\n'".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn test_text_cursor_reads_source_on_utf8_boundaries() {
@@ -26336,5 +26966,282 @@ mod tests {
             .expect("backend should still be running");
         request.await.expect("turn should complete");
         assert_eq!(cx.active_idle_sleep_preventions(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_request_subagent_continuation_immediate_and_deferred(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let prompts_seen: Rc<RefCell<Vec<String>>> = Default::default();
+        let (hold_tx, hold_rx) = oneshot::channel::<()>();
+        let hold_rx = Rc::new(RefCell::new(Some(hold_rx)));
+
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let prompts_seen = prompts_seen.clone();
+            let hold_rx = hold_rx.clone();
+            move |request, thread, mut cx| {
+                let text = request
+                    .prompt
+                    .iter()
+                    .filter_map(|block| match block {
+                        acp_v2::ContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                prompts_seen.borrow_mut().push(text.clone());
+                let maybe_rx = if text == "First turn" {
+                    hold_rx.borrow_mut().take()
+                } else {
+                    None
+                };
+                async move {
+                    if let Some(rx) = maybe_rx {
+                        let _ = rx.await;
+                    }
+                    if text == crate::ZED_SUBAGENT_CONTINUATION_PROMPT {
+                        thread.update(&mut cx, |thread, cx| {
+                            thread.push_assistant_content_block("Synthesized ".into(), false, cx);
+                            thread.push_assistant_content_block(
+                                "subagent result".into(),
+                                false,
+                                cx,
+                            );
+                        })?;
+                    } else {
+                        thread.update(&mut cx, |thread, cx| {
+                            thread.push_assistant_content_block(
+                                "Initial foreground reply".into(),
+                                false,
+                                cx,
+                            );
+                        })?;
+                    }
+                    Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("test thread");
+
+        // 1. Immediate continuation while `Idle` sends `ZED_SUBAGENT_CONTINUATION_PROMPT`
+        //    via `send_command` (no visible UserMessage entry!).
+        thread.update(cx, |thread, cx| {
+            thread.request_subagent_continuation(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec![crate::ZED_SUBAGENT_CONTINUATION_PROMPT.to_string()]
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert_eq!(thread.entries().len(), 1);
+            assert_eq!(
+                thread.to_markdown(cx),
+                "## Assistant\n\nSynthesized subagent result\n\n"
+            );
+        });
+
+        // 2. Continuation requested while `Generating` is deferred until the active
+        //    submission settles, then automatically triggers without adding a user bubble.
+        let first_send = thread.update(cx, |thread, cx| thread.send(vec!["First turn".into()], cx));
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            thread.request_subagent_continuation(cx);
+        });
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec![
+                crate::ZED_SUBAGENT_CONTINUATION_PROMPT.to_string(),
+                "First turn".to_string(),
+            ]
+        );
+
+        hold_tx.send(()).expect("first turn still waiting");
+        first_send.await.expect("first turn succeeds");
+        cx.run_until_parked();
+
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec![
+                crate::ZED_SUBAGENT_CONTINUATION_PROMPT.to_string(),
+                "First turn".to_string(),
+                crate::ZED_SUBAGENT_CONTINUATION_PROMPT.to_string(),
+            ]
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert_eq!(
+                thread.to_markdown(cx),
+                concat!(
+                    "## Assistant\n\nSynthesized subagent result\n\n",
+                    "## User\n\nFirst turn\n\n",
+                    "## Assistant\n\nInitial foreground reply\n\nSynthesized subagent result\n\n",
+                )
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_local_actions_finishes_display_terminals(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let id = acp_v2::ToolCallId::new("exec-tool");
+        let terminal_id = acp_v1::TerminalId::new("exec-terminal");
+        let lower = cx.new(|cx| {
+            ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "sleep 30".into(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower,
+                },
+                cx,
+            );
+            thread
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id.0.clone()), "sleep 30")
+                        .kind(acp_v1::ToolKind::Execute)
+                        .status(acp_v1::ToolCallStatus::InProgress)
+                        .content(vec![acp_v1::ToolCallContent::Terminal(
+                            acp_v1::Terminal::new(terminal_id.clone()),
+                        )]),
+                    cx,
+                )
+                .expect("upsert display terminal tool call");
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b"Step 1 running...\r\n".to_vec(),
+                },
+                cx,
+            );
+
+            let terminal = thread
+                .terminal(acp_v2::TerminalId::new(terminal_id.0.clone()))
+                .expect("display terminal registered");
+            assert!(terminal.read(cx).output().is_none());
+
+            thread.cancel_local_actions(RequestPermissionOutcome::Cancelled, cx);
+
+            let (_, call) = thread.tool_call(&id).expect("tool call");
+            assert_eq!(call.status(), ToolCallStatus::Canceled);
+            let output = terminal
+                .read(cx)
+                .output()
+                .expect("display terminal finished");
+            assert_eq!(output.exit_status.signal.as_deref(), Some("SIGINT"));
+            assert!(output.content.contains("Step 1 running..."));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_assistant_output_renders_native_typst_while_tool_output_stays_markdown(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::ParentElement as _;
+
+        init_test(cx);
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let language_registry = Arc::new(LanguageRegistry::test(cx.background_executor.clone()));
+
+        let (assistant_markdown, tool_markdown) = cx.update(|cx| {
+            let assistant_block = ContentBlock::new_output(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "= Agent Summary\n\nFlow: $ -> \"Mind LLM\" -> $",
+                )),
+                &language_registry,
+                cx,
+            );
+            let tool_block = ContentBlock::new_tool_content(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "raw_tool_identifier_with_underscores and $a \\rightarrow b$",
+                )),
+                &language_registry,
+                cx,
+            );
+            (
+                assistant_block
+                    .markdown()
+                    .expect("assistant markdown")
+                    .clone(),
+                tool_block.markdown().expect("tool markdown").clone(),
+            )
+        });
+
+        let window_cx = cx.add_empty_window();
+        window_cx.draw(
+            gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            gpui::size(gpui::px(640.0), gpui::px(400.0)),
+            |_, _| {
+                gpui::div()
+                    .child(markdown::MarkdownElement::new(
+                        assistant_markdown.clone(),
+                        markdown::MarkdownStyle::default(),
+                    ))
+                    .child(markdown::MarkdownElement::new(
+                        tool_markdown.clone(),
+                        markdown::MarkdownStyle::default(),
+                    ))
+            },
+        );
+        cx.run_until_parked();
+
+        assistant_markdown.read_with(cx, |markdown, _| {
+            assert!(
+                markdown
+                    .parsed_markdown()
+                    .events
+                    .iter()
+                    .any(|(_, event)| matches!(
+                        event,
+                        markdown::parser::MarkdownEvent::TypstSegment(_)
+                    )),
+                "assistant output should parse through native Typst segment pipeline"
+            );
+        });
+
+        tool_markdown.read_with(cx, |markdown, _| {
+            let events = &markdown.parsed_markdown().events;
+            assert!(
+                !events.iter().any(|(_, event)| matches!(
+                    event,
+                    markdown::parser::MarkdownEvent::TypstSegment(_)
+                )),
+                "raw tool text should not interpret prose as Typst markup"
+            );
+            assert!(
+                events.iter().any(|(_, event)| matches!(
+                    event,
+                    markdown::parser::MarkdownEvent::TypstMath { .. }
+                )),
+                "tool markdown should still render inline math formulas via Typst"
+            );
+        });
     }
 }

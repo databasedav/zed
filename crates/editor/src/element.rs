@@ -11469,8 +11469,8 @@ mod tests {
     };
     use buffer_diff::BufferDiff;
     use gpui::{
-        EntityInputHandler, ListAlignment, ListOffset, ListState, Render, TestAppContext, Underline,
-        UpdateGlobal, VisualTestContext, WindowHandle, font, list,
+        EntityInputHandler, ListAlignment, ListOffset, ListState, Render, TestAppContext,
+        Underline, UpdateGlobal, VisualTestContext, WindowHandle, font, list,
     };
     use language::{
         Buffer, Capability, Diagnostic, DiagnosticEntry, DiagnosticSet, SelectionGoal,

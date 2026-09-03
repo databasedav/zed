@@ -14,6 +14,13 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
+/// `spawn_agent` starts the sub-agent asynchronously in the background and returns immediately
+/// (`status: "running"`) so the main thread is never blocked. After calling `spawn_agent`,
+/// proceed immediately with any independent work you can do on the main thread. If you have no
+/// further independent work until a running sub-agent finishes, end your turn normally without
+/// sleeping or polling—your thread will automatically resume with a `<subagent_result>` message
+/// as soon as the sub-agent completes.
+///
 /// ### Designing delegated subtasks
 /// - An agent does not see your conversation history. Include all relevant context (file paths, requirements, constraints) in the message.
 /// - Subtasks must be concrete, well-defined, and self-contained.
@@ -25,6 +32,8 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - Narrow the delegated ask to the concrete output you need next.
 /// - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
 /// - When sending a follow-up using an existing agent session_id, the agent already has the context from the previous turn. Send only a short, direct message. Do NOT repeat the original task or context.
+///   - If that sub-agent is **already running**, calling `spawn_agent` with its `session_id` **steers** it mid-run: by default (`interrupt: false`) the message is injected cleanly at the sub-agent's next tool-call/reasoning boundary without losing in-flight tool work; pass `interrupt: true` to stop its current step immediately and pivot it to the new instructions. You can inspect a sub-agent's live actions, diffs, and terminal output first with `query_subagent`.
+///   - If that sub-agent has **completed**, calling `spawn_agent` with its `session_id` resumes it with a new background turn.
 ///
 /// ### Parallel delegation patterns
 /// - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
@@ -39,17 +48,18 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
 ///
 /// ### Output
-/// - You will receive only the agent's final message as output.
-/// - Successful calls return a session_id that you can use for follow-up messages.
-/// - Error results may also include a session_id if a session was already created.
+/// - Launching or resuming an idle sub-agent returns `session_id` and `status: "running"` immediately.
+/// - Steering a running sub-agent returns `session_id`, `status: "steered"`, `interrupt`, and `pending_steers`; the sub-agent's final `<subagent_result>` will be delivered once the steered run finishes.
+/// - When the sub-agent finishes, you will receive only its final message in `<subagent_result>` along with its `session_id` for any follow-up messages.
+/// - Error results may also include a `session_id` if a session was already created.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
     /// Short label displayed in the UI while the agent runs (e.g., "Researching alternatives")
     pub label: String,
-    /// The prompt for the agent. For new sessions, include full context needed for the task. For follow-ups (with session_id), you can rely on the agent already having the previous message.
+    /// The prompt for the agent. For new sessions, include full context needed for the task. For follow-ups or mid-run steering (with session_id), you can rely on the agent already having the previous message.
     pub message: String,
-    /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
+    /// Session ID of an existing agent session to steer (if running) or continue (if completed), instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp_v2::SessionId>,
     /// Optional model override. Pass the exact `models[].id` returned for the
@@ -57,6 +67,11 @@ pub struct SpawnAgentToolInput {
     /// Omit to preserve default behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Only used when `session_id` refers to a currently running sub-agent:
+    /// - `false` (default): steer cleanly at the sub-agent's next tool-call/reasoning boundary.
+    /// - `true`: immediately interrupt the sub-agent's current turn/tool call and pivot to `message`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
@@ -95,11 +110,51 @@ pub enum SpawnAgentToolOutput {
         error: String,
         session_info: Option<SubagentSessionInfo>,
     },
+    Canceled {
+        session_id: acp_v2::SessionId,
+        canceled: bool,
+        session_info: SubagentSessionInfo,
+    },
+    Steered {
+        session_id: acp_v2::SessionId,
+        steered: bool,
+        interrupt: bool,
+        pending_steers: usize,
+        message: String,
+        session_info: SubagentSessionInfo,
+    },
+    Running {
+        session_id: acp_v2::SessionId,
+        session_info: SubagentSessionInfo,
+    },
 }
 
 impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
     fn from(output: SpawnAgentToolOutput) -> Self {
         match output {
+            SpawnAgentToolOutput::Running {
+                session_id,
+                session_info: _,
+            } => serde_json::to_string(
+                &serde_json::json!({ "session_id": session_id, "status": "running" }),
+            )
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
+            SpawnAgentToolOutput::Steered {
+                session_id,
+                steered: _,
+                interrupt,
+                pending_steers,
+                message: _,
+                session_info: _,
+            } => serde_json::to_string(&serde_json::json!({
+                "session_id": session_id,
+                "status": "steered",
+                "interrupt": interrupt,
+                "pending_steers": pending_steers,
+            }))
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
             SpawnAgentToolOutput::Success {
                 session_id,
                 output,
@@ -115,6 +170,15 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                 session_info: _, // Don't show this to the model
             } => serde_json::to_string(
                 &serde_json::json!({ "session_id": session_id, "error": error }),
+            )
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
+            SpawnAgentToolOutput::Canceled {
+                session_id,
+                canceled: _,
+                session_info: _,
+            } => serde_json::to_string(
+                &serde_json::json!({ "session_id": session_id, "error": "User canceled" }),
             )
             .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
             .into(),
@@ -179,90 +243,166 @@ impl AgentTool for SpawnAgentTool {
                 message,
                 session_id,
                 model,
+                interrupt,
             } = input;
-            let (subagent, mut session_info) = cx.update(|cx| {
-                let subagent = match (session_id, model) {
+            let subagent_label: SharedString = label.clone().into();
+            let tool_use_id = event_stream.tool_use_id().clone();
+            let tool_call_id = event_stream.tool_call_id().clone();
+
+            enum LaunchOutcome {
+                Spawned(Rc<dyn crate::SubagentHandle>, SubagentSessionInfo),
+                Steered {
+                    session_info: SubagentSessionInfo,
+                    pending_steers: usize,
+                },
+            }
+
+            let launch_outcome = cx.update(|cx| {
+                let outcome = match (session_id, model) {
                     (Some(_), Some(_)) => Err(anyhow::anyhow!(
                         "model cannot be changed when resuming a subagent session"
                     )),
-                    (Some(session_id), None) => self.environment.resume_subagent(session_id, cx),
-                    (None, model) => {
-                        self.environment
-                            .create_subagent(label, model.map(AgentModelId::from), cx)
-                    }
+                    (Some(session_id), None) => self
+                        .environment
+                        .follow_up_subagent(session_id, message.clone(), interrupt, cx)
+                        .map(|follow_up| match follow_up {
+                            crate::SubagentFollowUp::Resumed(subagent) => {
+                                subagent.mark_started(cx);
+                                let session_info = SubagentSessionInfo {
+                                    session_id: subagent.id(),
+                                    message_start_index: subagent.num_entries(cx),
+                                    message_end_index: None,
+                                    model_name: None,
+                                };
+                                LaunchOutcome::Spawned(subagent, session_info)
+                            }
+                            crate::SubagentFollowUp::Steered {
+                                session_info,
+                                pending_steers,
+                            } => LaunchOutcome::Steered {
+                                session_info,
+                                pending_steers,
+                            },
+                        }),
+                    (None, model) => self
+                        .environment
+                        .create_subagent(label, model.map(AgentModelId::from), cx)
+                        .map(|subagent| {
+                            subagent.mark_started(cx);
+                            let session_info = SubagentSessionInfo {
+                                session_id: subagent.id(),
+                                message_start_index: subagent.num_entries(cx),
+                                message_end_index: None,
+                                model_name: None,
+                            };
+                            LaunchOutcome::Spawned(subagent, session_info)
+                        }),
                 };
-                let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
+                outcome.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
                     error: err.to_string(),
                     session_info: None,
-                })?;
-                let session_info = SubagentSessionInfo {
-                    session_id: subagent.id(),
-                    message_start_index: subagent.num_entries(cx),
-                    message_end_index: None,
-                };
-
-                event_stream.update_fields(|update| {
-                    update.meta(acp_v2::Meta::from_iter([(
-                        SUBAGENT_SESSION_INFO_META_KEY.into(),
-                        serde_json::json!(&session_info),
-                    )]))
-                });
-
-                Ok((subagent, session_info))
+                })
             })?;
 
-            let send_result = subagent.send(message, cx).await;
-
-            let status = if send_result.is_ok() {
-                "completed"
-            } else {
-                "error"
-            };
-            telemetry::event!(
-                "Subagent Completed",
-                subagent_session = session_info.session_id.to_string(),
-                status,
-            );
-
-            session_info.message_end_index =
-                cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
-
-            let meta = Some(acp_v2::Meta::from_iter([(
-                SUBAGENT_SESSION_INFO_META_KEY.into(),
-                serde_json::json!(&session_info),
-            )]));
-
-            let (output, result) = match send_result {
-                Ok(output) => (
-                    output.clone(),
-                    Ok(SpawnAgentToolOutput::Success {
+            let (subagent, session_info) = match launch_outcome {
+                LaunchOutcome::Steered {
+                    session_info,
+                    pending_steers,
+                } => {
+                    let steer_summary = if interrupt {
+                        format!("Interrupted and steered subagent:\n\n{message}")
+                    } else {
+                        format!("Steered subagent at next boundary:\n\n{message}")
+                    };
+                    event_stream.update_fields(|update| {
+                        update
+                            .content(vec![steer_summary.into()])
+                            .meta(acp_v2::Meta::from_iter([(
+                                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                serde_json::json!(&session_info),
+                            )]))
+                    });
+                    return Ok(SpawnAgentToolOutput::Steered {
                         session_id: session_info.session_id.clone(),
+                        steered: true,
+                        interrupt,
+                        pending_steers,
+                        message,
                         session_info,
-                        output,
-                    }),
-                ),
-                Err(e) => {
-                    let error = e.to_string();
-                    (
-                        error.clone(),
-                        Err(SpawnAgentToolOutput::Error {
-                            session_id: Some(session_info.session_id.clone()),
-                            error,
-                            session_info: Some(session_info),
-                        }),
-                    )
+                    });
+                }
+                LaunchOutcome::Spawned(subagent, session_info) => {
+                    event_stream.update_fields(|update| {
+                        update.meta(acp_v2::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            serde_json::json!(&session_info),
+                        )]))
+                    });
+                    (subagent, session_info)
                 }
             };
-            event_stream.update_fields(|update| {
-                let update = update.content(vec![output.into()]);
-                match meta {
-                    Some(meta) => update.meta(meta),
-                    None => update,
+
+            cx.spawn({
+                let mut session_info = session_info.clone();
+                async move |cx| {
+                    let send_result = subagent.send(message, cx).await;
+
+                    let status = match &send_result {
+                        crate::SubagentSendResult::Completed(_) => "completed",
+                        crate::SubagentSendResult::Canceled => "canceled",
+                        crate::SubagentSendResult::Error(_) => "error",
+                    };
+                    telemetry::event!(
+                        "Subagent Completed",
+                        subagent_session = session_info.session_id.to_string(),
+                        status,
+                    );
+
+                    cx.update(|cx| {
+                        session_info.message_end_index =
+                            Some(subagent.num_entries(cx).saturating_sub(1));
+                        subagent.complete(
+                            subagent_label,
+                            tool_use_id,
+                            tool_call_id,
+                            session_info,
+                            send_result,
+                            cx,
+                        );
+                    });
                 }
-            });
-            result
+            })
+            .detach();
+
+            Ok(SpawnAgentToolOutput::Running {
+                session_id: session_info.session_id.clone(),
+                session_info,
+            })
         })
+    }
+
+    fn status_for_output(output: &Self::Output) -> Option<acp_v2::ToolCallStatus> {
+        match output {
+            SpawnAgentToolOutput::Running { .. } => Some(acp_v2::ToolCallStatus::InProgress),
+            SpawnAgentToolOutput::Success { .. } | SpawnAgentToolOutput::Steered { .. } => {
+                Some(acp_v2::ToolCallStatus::Completed)
+            }
+            SpawnAgentToolOutput::Error { .. } => Some(acp_v2::ToolCallStatus::Failed),
+            SpawnAgentToolOutput::Canceled { .. } => Some(acp_v2::ToolCallStatus::Cancelled),
+        }
+    }
+
+    fn replay_status(output: &Self::Output) -> Option<acp_v2::ToolCallStatus> {
+        match output {
+            SpawnAgentToolOutput::Success { .. } | SpawnAgentToolOutput::Steered { .. } => {
+                Some(acp_v2::ToolCallStatus::Completed)
+            }
+            SpawnAgentToolOutput::Error { .. } => Some(acp_v2::ToolCallStatus::Failed),
+            SpawnAgentToolOutput::Running { .. } | SpawnAgentToolOutput::Canceled { .. } => {
+                Some(acp_v2::ToolCallStatus::Cancelled)
+            }
+        }
     }
 
     fn replay(
@@ -277,12 +417,27 @@ impl AgentTool for SpawnAgentTool {
                 output,
                 session_info,
                 ..
-            } => (output.into(), Some(session_info)),
+            } => (Some(output.into()), Some(session_info)),
+            SpawnAgentToolOutput::Steered {
+                interrupt,
+                message,
+                session_info,
+                ..
+            } => {
+                let steer_summary = if interrupt {
+                    format!("Interrupted and steered subagent:\n\n{message}")
+                } else {
+                    format!("Steered subagent at next boundary:\n\n{message}")
+                };
+                (Some(steer_summary.into()), Some(session_info))
+            }
             SpawnAgentToolOutput::Error {
                 error,
                 session_info,
                 ..
-            } => (error.into(), session_info),
+            } => (Some(error.into()), session_info),
+            SpawnAgentToolOutput::Running { session_info, .. }
+            | SpawnAgentToolOutput::Canceled { session_info, .. } => (None, Some(session_info)),
         };
 
         let meta = session_info.map(|session_info| {
@@ -292,7 +447,11 @@ impl AgentTool for SpawnAgentTool {
             )])
         });
         event_stream.update_fields(|update| {
-            let update = update.content(vec![content]);
+            let update = if let Some(content) = content {
+                update.content(vec![content])
+            } else {
+                update
+            };
             match meta {
                 Some(meta) => update.meta(meta),
                 None => update,
@@ -330,6 +489,30 @@ mod tests {
         });
         let output: SpawnAgentToolOutput = serde_json::from_value(output_json.clone())?;
         assert_eq!(serde_json::to_value(output)?, output_json);
+
+        let running_json = json!({
+            "session_id": session_id,
+            "session_info": {
+                "session_id": session_id,
+                "message_start_index": 0,
+            },
+        });
+        let running: SpawnAgentToolOutput = serde_json::from_value(running_json.clone())?;
+        assert!(matches!(running, SpawnAgentToolOutput::Running { .. }));
+        assert_eq!(serde_json::to_value(&running)?, running_json);
+
+        let canceled_json = json!({
+            "session_id": session_id,
+            "canceled": true,
+            "session_info": {
+                "session_id": session_id,
+                "message_start_index": 0,
+                "message_end_index": 1,
+            },
+        });
+        let canceled: SpawnAgentToolOutput = serde_json::from_value(canceled_json.clone())?;
+        assert!(matches!(canceled, SpawnAgentToolOutput::Canceled { .. }));
+        assert_eq!(serde_json::to_value(&canceled)?, canceled_json);
         Ok(())
     }
 

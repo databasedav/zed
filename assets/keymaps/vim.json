@@ -995,7 +995,7 @@
     },
   },
   {
-    "context": "!Editor && !Terminal",
+    "context": "!Editor && !Terminal && !Elicitation",
     "bindings": {
       ":": "command_palette::Toggle",
       "g /": "pane::DeploySearch",
@@ -1211,6 +1211,18 @@
     },
   },
   {
+    "context": "TitleEditor > Editor && VimControl && !menu",
+    "bindings": {
+      "enter": "menu::Confirm",
+    },
+  },
+  {
+    "context": "TitleEditor > Editor && (vim_mode == normal || vim_mode == helix_normal) && !menu",
+    "bindings": {
+      "escape": "editor::Cancel",
+    },
+  },
+  {
     "context": "MessageEditor > Editor && VimControl",
     "bindings": {
       "enter": "agent::Chat",
@@ -1323,6 +1335,14 @@
     "bindings": {
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "Elicitation > Editor && VimControl && !menu",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "tab": "menu::SelectNext",
+      "shift-tab": "menu::SelectPrevious",
     },
   },
 ]

@@ -1590,6 +1590,17 @@ pub trait PlatformDispatcher: Send + Sync {
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
+    /// Registers a specific font face (by collection `face_index`) from raw font bytes and returns
+    /// its exact [`FontId`], even for symbol or math fonts that cannot serve as primary editor fonts.
+    fn register_font_face(
+        &self,
+        font_data: Cow<'static, [u8]>,
+        _face_index: u32,
+        fallback_descriptor: &Font,
+    ) -> Result<FontId> {
+        self.add_fonts(vec![font_data])?;
+        self.font_id(fallback_descriptor)
+    }
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
     /// Get all available font names.

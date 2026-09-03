@@ -2,11 +2,16 @@ use acp_thread::{Elicitation, ElicitationEntryId, ElicitationStatus};
 use agent_client_protocol::v2::schema as acp;
 use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
-use editor::Editor;
+use editor::{Editor, EditorElement, EditorStyle};
 use futures::channel::oneshot;
-use gpui::{AnyElement, App, Div, Empty, Entity, Focusable, Role, SharedString, Window, div};
+use gpui::{
+    AnyElement, App, Div, Empty, Entity, Focusable, Role, SharedString, TextStyle, Window, div,
+    relative,
+};
+use settings::Settings;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use theme_settings::ThemeSettings;
 use ui::{
     Button, Checkbox, ChoiceCard, Color, Icon, IconName, IconSize, Label, LabelSize, ToggleState,
     prelude::*,
@@ -62,17 +67,14 @@ impl ElicitationFormState {
                 acp::ElicitationPropertySchema::String(schema) => {
                     let options = single_select_options(schema);
                     if options.is_empty() {
-                        let default = schema.default.as_ref().filter(|default| {
-                            validate_string_value(title.clone(), schema, default).is_ok()
-                        });
-                        let editor = cx.new(|cx| {
-                            let mut editor = Editor::single_line(window, cx);
-                            if let Some(default) = default {
-                                editor.set_text(default.clone(), window, cx);
-                            }
-                            editor
-                        });
-                        ElicitationFieldState::Text(editor)
+                        let default = schema
+                            .default
+                            .as_ref()
+                            .filter(|default| {
+                                validate_string_value(title.clone(), schema, default).is_ok()
+                            })
+                            .cloned();
+                        ElicitationFieldState::Text(new_text_field_editor(default, window, cx))
                     } else {
                         let value = single_select_default_value(schema, &options).or_else(|| {
                             is_required
@@ -90,14 +92,7 @@ impl ElicitationFormState {
                             .filter(|default| {
                                 validate_number_value(title.clone(), schema, default).is_ok()
                             });
-                    let editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
-                        if let Some(default) = default {
-                            editor.set_text(default, window, cx);
-                        }
-                        editor
-                    });
-                    ElicitationFieldState::Text(editor)
+                    ElicitationFieldState::Text(new_text_field_editor(default, window, cx))
                 }
                 acp::ElicitationPropertySchema::Integer(schema) => {
                     let default =
@@ -107,14 +102,7 @@ impl ElicitationFormState {
                             .filter(|default| {
                                 validate_integer_value(title.clone(), schema, default).is_ok()
                             });
-                    let editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
-                        if let Some(default) = default {
-                            editor.set_text(default, window, cx);
-                        }
-                        editor
-                    });
-                    ElicitationFieldState::Text(editor)
+                    ElicitationFieldState::Text(new_text_field_editor(default, window, cx))
                 }
                 acp::ElicitationPropertySchema::Boolean(schema) => {
                     ElicitationFieldState::Boolean(schema.default.unwrap_or(false))
@@ -138,7 +126,51 @@ impl ElicitationFormState {
             is_submitting: false,
         }
     }
+}
 
+fn new_text_field_editor(
+    default: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_use_modal_editing(true);
+        if let Some(default) = default {
+            editor.set_text(default, window, cx);
+        }
+        editor
+    })
+}
+
+fn text_editor_style(cx: &App) -> EditorStyle {
+    let settings = ThemeSettings::get_global(cx);
+    let text_style = TextStyle {
+        color: cx.theme().colors().text,
+        font_family: settings.agent_buffer_font_family().clone(),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+        font_features: settings.buffer_font.features.clone(),
+        font_size: settings.agent_buffer_font_size(cx).into(),
+        font_weight: settings.buffer_font.weight,
+        line_height: relative(settings.buffer_line_height.value()),
+        ..Default::default()
+    };
+
+    EditorStyle {
+        background: cx.theme().colors().editor_background,
+        local_player: cx.theme().players().local(),
+        text: text_style,
+        syntax: cx.theme().syntax().clone(),
+        inlay_hints_style: editor::make_inlay_hints_style(cx),
+        ..Default::default()
+    }
+}
+
+fn render_text_editor_element(editor: &Entity<Editor>, cx: &App) -> EditorElement {
+    EditorElement::new(editor, text_editor_style(cx))
+}
+
+impl ElicitationFormState {
     fn snapshot(&self, cx: &App) -> ElicitationFormSubmission {
         ElicitationFormSubmission {
             fields: self
@@ -384,7 +416,9 @@ impl ElicitationFormSubmission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{KeyUpEvent, Keystroke, PlatformInput, TestAppContext, VisualTestContext};
+    use gpui::{
+        KeyUpEvent, Keystroke, PlatformInput, TestAppContext, UpdateGlobal, VisualTestContext,
+    };
     use std::cell::RefCell;
 
     struct TestElicitationView {
@@ -486,12 +520,22 @@ mod tests {
     fn init_keyboard_test(cx: &mut TestAppContext) {
         crate::conversation_view::tests::init_test(cx);
         cx.update(|cx| {
-            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
-                "keymaps/default-linux.json",
-                cx,
-            )
-            .expect("default keymap should load");
-            cx.bind_keys(bindings);
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
         });
     }
 
@@ -546,6 +590,154 @@ mod tests {
         });
         press_keys(cx, "enter");
         assert_eq!(events.borrow().len(), 3);
+    }
+
+    #[gpui::test]
+    fn form_text_fields_support_modal_editing(cx: &mut TestAppContext) {
+        init_keyboard_test(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            TestElicitationView::new(
+                acp::ElicitationSchema::new()
+                    .string("first", false)
+                    .string("other", false)
+                    .property("count", acp::IntegerPropertySchema::new(), false)
+                    .property("amount", acp::NumberPropertySchema::new(), false),
+                window,
+                cx,
+            )
+        });
+        let (first, other, count, amount, events) = view.read_with(cx, |view, _| {
+            (
+                view.editor("first"),
+                view.editor("other"),
+                view.editor("count"),
+                view.editor("amount"),
+                view.events.clone(),
+            )
+        });
+
+        for editor in [&first, &other, &count, &amount] {
+            editor.read_with(cx, |editor, _| assert!(editor.use_modal_editing()));
+        }
+
+        let assert_editor_mode =
+            |editor: &Entity<Editor>, expected_mode: Option<&str>, cx: &mut VisualTestContext| {
+                editor.update_in(cx, |editor, window, cx| {
+                    assert!(editor.is_focused(window));
+                    assert_eq!(
+                        editor
+                            .key_context(window, cx)
+                            .get("vim_mode")
+                            .map(|mode| mode.as_ref()),
+                        expected_mode,
+                    );
+                });
+            };
+
+        for normal_mode in [None, Some("helix_normal"), Some("normal")] {
+            events.borrow_mut().clear();
+            first.update_in(cx, |editor, window, cx| {
+                editor.set_text("initial draft", window, cx);
+            });
+            other.update_in(cx, |editor, window, cx| {
+                editor.set_text("", window, cx);
+            });
+
+            cx.update(|_, cx| {
+                settings::SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.vim_mode = Some(normal_mode == Some("normal"));
+                        settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                    });
+                });
+            });
+            cx.run_until_parked();
+
+            cx.update(|window, cx| window.focus(&first.focus_handle(cx), cx));
+            assert_editor_mode(&first, normal_mode, cx);
+
+            match normal_mode {
+                Some("helix_normal") => cx.simulate_keystrokes("% c"),
+                Some(_) => cx.simulate_keystrokes("shift-s"),
+                None => cx.simulate_keystrokes("ctrl-a"),
+            }
+            assert_editor_mode(&first, normal_mode.map(|_| "insert"), cx);
+            cx.simulate_input("custom write-in");
+            cx.run_until_parked();
+            assert_eq!(
+                first.read_with(cx, |editor, cx| editor.text(cx)),
+                "custom write-in"
+            );
+
+            if let Some(normal_mode) = normal_mode {
+                cx.simulate_keystrokes("escape");
+                assert_editor_mode(&first, Some(normal_mode), cx);
+
+                cx.simulate_keystrokes("v h");
+                assert_editor_mode(
+                    &first,
+                    Some(if normal_mode == "helix_normal" {
+                        "helix_select"
+                    } else {
+                        "visual"
+                    }),
+                    cx,
+                );
+                cx.simulate_keystrokes("escape");
+                assert_editor_mode(&first, Some(normal_mode), cx);
+
+                cx.simulate_keystrokes("f");
+                assert_editor_mode(&first, Some("waiting"), cx);
+                cx.simulate_keystrokes("escape");
+                assert_editor_mode(&first, Some(normal_mode), cx);
+            }
+
+            press_keys(cx, "tab");
+            assert_editor_mode(&other, normal_mode, cx);
+            press_keys(cx, "shift-tab");
+            assert_editor_mode(&first, normal_mode, cx);
+
+            press_keys(cx, "enter");
+            assert_eq!(*events.borrow(), ["submit"]);
+
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("i");
+                assert_editor_mode(&first, Some("insert"), cx);
+                press_keys(cx, "enter");
+                assert_eq!(*events.borrow(), ["submit", "submit"]);
+
+                cx.simulate_keystrokes("i");
+                assert_editor_mode(&first, Some("insert"), cx);
+                press_keys(cx, "tab");
+                assert_editor_mode(&other, normal_mode, cx);
+            }
+
+            cx.update(|window, cx| window.focus(&other.focus_handle(cx), cx));
+            press_keys(cx, "tab space");
+            let expected_submits = if normal_mode.is_some() { 3 } else { 2 };
+            assert_eq!(events.borrow().len(), expected_submits);
+        }
+    }
+
+    #[gpui::test]
+    fn form_text_fields_use_agent_buffer_font_settings(cx: &mut TestAppContext) {
+        crate::conversation_view::tests::init_test(cx);
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.agent_buffer_font_size = Some(18.0.into());
+                    settings.theme.agent_buffer_font_family =
+                        Some(settings::FontFamilyName("Custom Agent Mono".into()));
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let style = text_editor_style(cx);
+            assert_eq!(style.text.font_size, gpui::AbsoluteLength::Pixels(px(18.0)));
+            assert_eq!(style.text.font_family.as_ref(), "Custom Agent Mono");
+        });
     }
 
     #[gpui::test]
@@ -2002,9 +2194,9 @@ impl<'a> ElicitationCard<'a> {
         };
 
         let body = v_flex()
-            .gap_2()
+            .gap_3()
             .p_3()
-            .child(Label::new(self.elicitation.request.message.clone()).size(LabelSize::Small));
+            .child(Label::new(self.elicitation.request.message.clone()));
         let body = match &self.elicitation.request.mode {
             acp::ElicitationMode::Form(mode) if is_pending => {
                 body.child(self.render_form(mode, cx))
@@ -2067,9 +2259,9 @@ impl<'a> ElicitationCard<'a> {
         };
 
         v_flex()
-            .gap_2()
+            .gap_3()
             .when_some(mode.requested_schema.title.clone(), |this, title| {
-                this.child(Label::new(title).size(LabelSize::Small))
+                this.child(Label::new(title))
             })
             .when_some(
                 mode.requested_schema.description.clone(),
@@ -2152,11 +2344,18 @@ impl<'a> ElicitationCard<'a> {
                                 cx,
                             );
                         })
-                        .child(div().child(Checkbox::new(checkbox_id, checkbox_state)))
+                        .child(
+                            h_flex()
+                                .w(rems_from_px(20_f32))
+                                .min_h(rems(0.875 * 1.3))
+                                .flex_none()
+                                .justify_center()
+                                .child(Checkbox::new(checkbox_id, checkbox_state)),
+                        )
                         .child(
                             v_flex()
                                 .gap_0p5()
-                                .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                                .child(Label::new(label).color(label_color))
                                 .when_some(description, |this, description| {
                                     this.child(
                                         Label::new(description)
@@ -2174,9 +2373,9 @@ impl<'a> ElicitationCard<'a> {
 
         let group_label = label.clone();
         let label = if error.is_some() {
-            Label::new(label).size(LabelSize::Small).color(Color::Error)
+            Label::new(label).color(Color::Error)
         } else {
-            Label::new(label).size(LabelSize::Small)
+            Label::new(label)
         };
 
         v_flex()
@@ -2195,22 +2394,28 @@ impl<'a> ElicitationCard<'a> {
                     let elicitation_id = self.elicitation.id.clone();
                     let is_submitting = self.form_state.is_some_and(|state| state.is_submitting);
 
-                    div()
+                    h_flex()
                         .track_focus(&editor.focus_handle(cx).tab_stop(true))
                         .on_action(move |_: &menu::Confirm, window, cx| {
                             if !is_submitting {
                                 on_submit(elicitation_id.clone(), window, cx);
                             }
                         })
+                        .w_full()
+                        .min_h(rems_from_px(28_f32))
                         .rounded_sm()
                         .border_1()
                         .border_color(field_border_color)
                         .focus_visible(|this| this.border_color(focused_border_color))
                         .bg(editor_background)
-                        .px_1()
-                        .py_0p5()
-                        .text_xs()
-                        .child(editor.clone().into_any_element())
+                        .px_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(render_text_editor_element(editor, cx)),
+                        )
                         .into_any_element()
                 }
                 ElicitationFieldState::Boolean(_) => Empty.into_any_element(),
@@ -2333,12 +2538,8 @@ impl<'a> ElicitationCard<'a> {
                         .child(
                             h_flex()
                                 .gap_1()
-                                .child(
-                                    Label::new("Destination")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .child(Label::new(presentation.host).size(LabelSize::Small)),
+                                .child(Label::new("Destination").color(Color::Muted))
+                                .child(Label::new(presentation.host)),
                         )
                         .when_some(
                             presentation.suspicious_decoded_host,

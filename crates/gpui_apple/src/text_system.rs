@@ -105,6 +105,15 @@ impl PlatformTextSystem for AppleTextSystem {
         self.0.write().add_fonts(fonts)
     }
 
+    fn register_font_face(
+        &self,
+        font_data: Cow<'static, [u8]>,
+        face_index: u32,
+        _fallback_descriptor: &Font,
+    ) -> Result<FontId> {
+        self.0.write().register_font_face(font_data, face_index)
+    }
+
     fn all_font_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         let collection = core_text::font_collection::create_for_all_families();
@@ -279,6 +288,24 @@ impl AppleTextSystemState {
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
         Ok(())
+    }
+
+    fn register_font_face(
+        &mut self,
+        font_data: Cow<'static, [u8]>,
+        face_index: u32,
+    ) -> Result<FontId> {
+        let handle = Handle::from_memory(Arc::new(font_data.into_owned()), face_index);
+        let font = handle.load()?;
+        let font_id = FontId(self.fonts.len());
+        if let Some(postscript_name) = font.postscript_name() {
+            self.font_ids_by_postscript_name
+                .insert(postscript_name.clone(), font_id);
+            self.postscript_names_by_font_id
+                .insert(font_id, postscript_name);
+        }
+        self.fonts.push(font);
+        Ok(font_id)
     }
 
     fn load_family(

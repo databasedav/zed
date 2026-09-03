@@ -44,6 +44,17 @@ pub(crate) struct ParsedMarkdownData {
     /// consumed by the parser and never appear in any event range.
     pub link_definition_spans: Vec<Range<usize>>,
     pub has_untagged_code_block: bool,
+    pub typst_sources: Vec<ParsedTypstSource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ParsedTypstSource {
+    Markup(Range<usize>),
+    Math {
+        full_range: Range<usize>,
+        math_content: String,
+        display: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,7 +91,7 @@ impl ParseState {
                     }
                 }
             }
-            MarkdownEvent::Rule => {
+            MarkdownEvent::Rule | MarkdownEvent::TypstSegment(_) => {
                 if self.depth == 0 && !range.is_empty() {
                     self.root_block_starts.push(range.start);
                     let root_block_index = self.root_block_starts.len() - 1;
@@ -273,11 +284,28 @@ fn yaml_frontmatter_candidate(text: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_markdown_with_options(
     text: &str,
     parse_html: bool,
     parse_heading_slugs: bool,
     parse_metadata_blocks: bool,
+) -> ParsedMarkdownData {
+    parse_markdown_with_full_options(
+        text,
+        parse_html,
+        parse_heading_slugs,
+        parse_metadata_blocks,
+        false,
+    )
+}
+
+pub(crate) fn parse_markdown_with_full_options(
+    text: &str,
+    parse_html: bool,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+    enable_math: bool,
 ) -> ParsedMarkdownData {
     let mut state = ParseState::default();
     let mut language_names = HashSet::default();
@@ -285,6 +313,7 @@ pub(crate) fn parse_markdown_with_options(
     let mut has_untagged_code_block = false;
     let mut html_blocks = BTreeMap::default();
     let mut metadata_blocks = BTreeMap::default();
+    let mut typst_sources = Vec::new();
     let mut within_link = false;
     let mut within_code_block = false;
     let mut within_metadata = false;
@@ -311,7 +340,12 @@ pub(crate) fn parse_markdown_with_options(
         }
     }
     let body_start = frontmatter.last().map_or(0, |(_, range)| range.end);
-    let parser = Parser::new_ext(&text[body_start..], PARSE_OPTIONS);
+    let parse_options = if enable_math {
+        PARSE_OPTIONS.union(Options::ENABLE_MATH)
+    } else {
+        PARSE_OPTIONS
+    };
+    let parser = Parser::new_ext(&text[body_start..], parse_options);
     let mut link_definition_spans = parser
         .reference_definitions()
         .iter()
@@ -728,7 +762,40 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(math) => {
+                if enable_math {
+                    let segment_index = typst_sources.len();
+                    typst_sources.push(ParsedTypstSource::Math {
+                        full_range: range.clone(),
+                        math_content: math.to_string(),
+                        display: false,
+                    });
+                    state.push_event(
+                        range,
+                        MarkdownEvent::TypstMath {
+                            segment_index,
+                            display: false,
+                        },
+                    );
+                }
+            }
+            pulldown_cmark::Event::DisplayMath(math) => {
+                if enable_math {
+                    let segment_index = typst_sources.len();
+                    typst_sources.push(ParsedTypstSource::Math {
+                        full_range: range.clone(),
+                        math_content: math.to_string(),
+                        display: true,
+                    });
+                    state.push_event(
+                        range,
+                        MarkdownEvent::TypstMath {
+                            segment_index,
+                            display: true,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -750,6 +817,200 @@ pub(crate) fn parse_markdown_with_options(
         footnote_definitions,
         link_definition_spans,
         has_untagged_code_block,
+        typst_sources,
+    }
+}
+
+pub(crate) fn parse_typst_document_with_options(
+    text: &str,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+) -> ParsedMarkdownData {
+    let mut state = ParseState::default();
+    let mut language_names = HashSet::default();
+    let mut language_paths = HashSet::default();
+    let mut has_untagged_code_block = false;
+    let mut metadata_blocks = BTreeMap::default();
+    let mut typst_sources = Vec::new();
+    let mut heading_slugs = HashMap::default();
+    let mut slug_counts: HashMap<String, usize> = HashMap::default();
+
+    let mut body_start = 0;
+    if parse_metadata_blocks && let Some(candidate) = yaml_frontmatter_candidate(text) {
+        let mut parser = Parser::new_ext(
+            candidate,
+            PARSE_OPTIONS.union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS),
+        )
+        .into_offset_iter()
+        .peekable();
+        if let Some((
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::MetadataBlock(
+                MetadataBlockKind::YamlStyle,
+            )),
+            frontmatter_range,
+        )) = parser.peek()
+        {
+            let frontmatter_range = frontmatter_range.clone();
+            let mut content_range: Option<Range<usize>> = None;
+            state.push_event(
+                frontmatter_range.clone(),
+                MarkdownEvent::Start(MarkdownTag::MetadataBlock(MetadataBlockKind::YamlStyle)),
+            );
+            for (event, event_range) in parser.take_while(|(_, r)| r.start < frontmatter_range.end)
+            {
+                if let pulldown_cmark::Event::Text(_) = event {
+                    match &mut content_range {
+                        Some(existing) => {
+                            existing.start = existing.start.min(event_range.start);
+                            existing.end = existing.end.max(event_range.end);
+                        }
+                        None => content_range = Some(event_range.clone()),
+                    }
+                    state.push_event(event_range, MarkdownEvent::Text);
+                }
+            }
+            if let Some(content_range) = content_range {
+                metadata_blocks.insert(
+                    frontmatter_range.start,
+                    ParsedMetadataBlock {
+                        rows: parse_metadata_table_rows(text, content_range.clone()),
+                        content_range,
+                    },
+                );
+            }
+            state.push_event(
+                frontmatter_range.clone(),
+                MarkdownEvent::End(MarkdownTagEnd::MetadataBlock(MetadataBlockKind::YamlStyle)),
+            );
+            body_start = frontmatter_range.end;
+        }
+    }
+
+    for segment in typst_render::segment_typst_document(&text[body_start..]) {
+        match segment {
+            typst_render::TypstDocumentSegment::TypstMarkup { source_range } => {
+                let adjusted_range =
+                    (source_range.start + body_start)..(source_range.end + body_start);
+                if parse_heading_slugs {
+                    collect_typst_heading_slugs(
+                        &text[adjusted_range.clone()],
+                        adjusted_range.start,
+                        &mut heading_slugs,
+                        &mut slug_counts,
+                    );
+                }
+                let segment_index = typst_sources.len();
+                typst_sources.push(ParsedTypstSource::Markup(adjusted_range.clone()));
+                state.push_event(adjusted_range, MarkdownEvent::TypstSegment(segment_index));
+            }
+            typst_render::TypstDocumentSegment::FencedCodeBlock(code_block) => {
+                let full_range = (code_block.full_range.start + body_start)
+                    ..(code_block.full_range.end + body_start);
+                let content_range = (code_block.content_range.start + body_start)
+                    ..(code_block.content_range.end + body_start);
+                let line_count = text[content_range.clone()]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                let metadata = CodeBlockMetadata {
+                    content_range: content_range.clone(),
+                    line_count,
+                    is_fenced_closed: !code_block.is_unclosed,
+                };
+                let info = code_block
+                    .info_string
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                let kind = if info.is_empty() {
+                    has_untagged_code_block = true;
+                    CodeBlockKind::Fenced
+                } else if info.contains('/') {
+                    let path_range = PathWithRange::new(info);
+                    language_paths.insert(path_range.path.clone());
+                    CodeBlockKind::FencedSrc(path_range)
+                } else {
+                    let language = SharedString::from(info.to_string());
+                    language_names.insert(language.clone());
+                    CodeBlockKind::FencedLang(language)
+                };
+
+                state.push_event(
+                    full_range.clone(),
+                    MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, metadata }),
+                );
+                if !content_range.is_empty() {
+                    state.push_event(content_range, MarkdownEvent::Text);
+                }
+                state.push_event(full_range, MarkdownEvent::End(MarkdownTagEnd::CodeBlock));
+            }
+        }
+    }
+
+    ParsedMarkdownData {
+        events: state.events,
+        language_names,
+        language_paths,
+        root_block_starts: state.root_block_starts,
+        html_blocks: BTreeMap::default(),
+        metadata_blocks,
+        heading_slugs,
+        footnote_definitions: HashMap::default(),
+        link_definition_spans: Vec::new(),
+        has_untagged_code_block,
+        typst_sources,
+    }
+}
+
+fn collect_typst_heading_slugs(
+    segment_text: &str,
+    base_offset: usize,
+    slugs: &mut HashMap<SharedString, usize>,
+    slug_counts: &mut HashMap<String, usize>,
+) {
+    let mut line_offset = 0;
+    for line in segment_text.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker_char = trimmed.as_bytes().first().copied();
+        if let Some(marker) = marker_char.filter(|byte| *byte == b'=' || *byte == b'#') {
+            let level = trimmed.bytes().take_while(|byte| *byte == marker).count();
+            if (1..=6).contains(&level)
+                && trimmed
+                    .as_bytes()
+                    .get(level)
+                    .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+            {
+                let title = trimmed[level..].trim();
+                if !title.is_empty() {
+                    let base_slug = generate_heading_slug(title);
+                    if !base_slug.is_empty() {
+                        let count = slug_counts.entry(base_slug.clone()).or_insert(0);
+                        let mut slug = if *count == 0 {
+                            base_slug.clone()
+                        } else {
+                            format!("{base_slug}-{count}")
+                        };
+                        *count += 1;
+                        while slugs.contains_key(slug.as_str()) {
+                            let Some(count) = slug_counts.get_mut(&base_slug) else {
+                                slug.clear();
+                                break;
+                            };
+                            if *count >= MAX_DUPLICATE_HEADING_SLUGS {
+                                slug.clear();
+                                break;
+                            }
+                            slug = format!("{base_slug}-{count}");
+                            *count += 1;
+                        }
+                        if !slug.is_empty() {
+                            slugs.insert(SharedString::from(slug), base_offset + line_offset);
+                        }
+                    }
+                }
+            }
+        }
+        line_offset += line.len();
     }
 }
 
@@ -855,6 +1116,10 @@ pub enum MarkdownEvent {
     RootStart,
     /// End of a root-level block. Contains the root block index.
     RootEnd(usize),
+    /// A Typst markup block segment, indexed into `ParsedMarkdown::typst_segments`.
+    TypstSegment(usize),
+    /// An inline or display math span rendered via Typst, indexed into `ParsedMarkdown::typst_segments`.
+    TypstMath { segment_index: usize, display: bool },
 }
 
 /// Tags for elements that can contain other elements.
@@ -1041,10 +1306,10 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+    const CONDITIONAL_OPTIONS: Options =
+        Options::ENABLE_YAML_STYLE_METADATA_BLOCKS.union(Options::ENABLE_MATH);
+    const UNWANTED_OPTIONS: Options =
+        Options::ENABLE_DEFINITION_LIST.union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {

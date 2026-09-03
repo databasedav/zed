@@ -127,6 +127,21 @@ impl ConfigOptionsView {
         true
     }
 
+    pub fn selected_category_value_name(
+        &self,
+        category: acp::SessionConfigOptionCategory,
+    ) -> Option<SharedString> {
+        let config_id = self.first_config_option_id_matching(category, |option| {
+            matches!(&option.kind, acp::SessionConfigKind::Select(_))
+        })?;
+        let current_value = get_current_select_value(&self.config_options, &config_id)?;
+        extract_options(&self.config_options, &config_id)
+            .into_iter()
+            .find(|option| option.value == current_value)
+            .map(|option| SharedString::from(option.name))
+            .or_else(|| Some(SharedString::from(current_value.0)))
+    }
+
     fn first_config_option_id_matching(
         &self,
         category: acp::SessionConfigOptionCategory,

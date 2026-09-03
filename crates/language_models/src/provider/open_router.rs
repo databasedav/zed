@@ -868,6 +868,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             thread_id: None,
             prompt_cache_key: None,
@@ -1012,6 +1013,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             thread_id: None,
             prompt_cache_key: None,
@@ -1080,6 +1082,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             thread_id: None,
             prompt_cache_key: None,
@@ -1215,6 +1218,7 @@ mod tests {
             }],
             thinking_allowed: true,
             thinking_effort: Some("xhigh".to_string()),
+            reasoning_summary: None,
             ..Default::default()
         };
 
@@ -1255,6 +1259,7 @@ mod tests {
             }],
             thinking_allowed: false,
             thinking_effort: Some("high".to_string()),
+            reasoning_summary: None,
             ..Default::default()
         };
 

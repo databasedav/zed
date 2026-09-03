@@ -4886,6 +4886,7 @@ impl GitPanel {
                     temperature,
                     thinking_allowed: false,
                     thinking_effort: None,
+                    reasoning_summary: None,
                     speed: None,
                     compact_at_tokens: None,
                     max_output_tokens: None,
@@ -7073,18 +7074,24 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.commit_editor_expanded = !self.commit_editor_expanded;
-        self.commit_editor.update(cx, |editor, _cx| {
+        self.commit_editor.update(cx, |editor, cx| {
             if self.commit_editor_expanded {
-                editor.set_mode(EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: false,
-                    show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                })
+                editor.set_mode(
+                    EditorMode::Full {
+                        scale_ui_elements_with_buffer_font_size: false,
+                        show_active_line_background: false,
+                        sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                    },
+                    cx,
+                )
             } else {
-                editor.set_mode(EditorMode::AutoHeight {
-                    min_lines: MAX_PANEL_EDITOR_LINES,
-                    max_lines: Some(MAX_PANEL_EDITOR_LINES),
-                })
+                editor.set_mode(
+                    EditorMode::AutoHeight {
+                        min_lines: MAX_PANEL_EDITOR_LINES,
+                        max_lines: Some(MAX_PANEL_EDITOR_LINES),
+                    },
+                    cx,
+                )
             }
         });
 

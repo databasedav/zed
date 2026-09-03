@@ -1216,6 +1216,9 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
+    // Maximum number of lines for thread titles: 1 for a single line, a larger
+    // positive integer to wrap up to that many lines, or "unlimited" for no limit.
+    "thread_title_max_lines": "unlimited",
     // The default model to use when creating new threads.
     "default_model": {
       // The provider to use.
@@ -1331,6 +1334,7 @@
           "list_agents_and_models": true,
           "list_directory": true,
           "move_path": true,
+          "query_subagent": true,
           "read_file": true,
           "rename_symbol": true,
           "search_web": true,
@@ -1356,6 +1360,7 @@
           "grep": true,
           "list_agents_and_models": true,
           "list_directory": true,
+          "query_subagent": true,
           "read_file": true,
           "search_web": true,
           "skill": true,
@@ -1406,6 +1411,12 @@
     //
     // Default: auto
     "thinking_display": "auto",
+    // How much detail providers should include in reasoning summaries.
+    // Supported values are "provider_default", "auto", "concise", and "detailed".
+    // This only affects providers and models that support reasoning summaries.
+    //
+    // Default: provider_default
+    "reasoning_summary": "provider_default",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

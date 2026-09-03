@@ -92,6 +92,8 @@ pub fn build_terminal_auth_task(
     }
 }
 
+pub const ZED_SUBAGENT_CONTINUATION_PROMPT: &str = "__zed_subagent_continuation__";
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
@@ -260,6 +262,12 @@ pub trait AgentConnection {
     /// Requests cancellation; success does not establish that execution stopped.
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()>;
 
+    /// Interrupts the active foreground turn for a follow-up prompt without
+    /// canceling background work such as subagents.
+    fn interrupt_for_follow_up(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
+        self.cancel(session_id, cx)
+    }
+
     /// Asks the agent to stop one tool call. Success means the agent accepted the request;
     /// the tool call's own updates report when it stops.
     fn cancel_tool_call(
@@ -286,6 +294,39 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Whether this connection supports ending a running turn at the next tool/step boundary
+    /// so queued steering messages can be sent without tearing down in-progress tool work.
+    fn supports_steer_at_boundary(&self) -> bool {
+        false
+    }
+
+    /// Updates whether the session should end its current turn at the next tool/step boundary.
+    fn set_end_turn_at_next_boundary(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _end_at_boundary: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether this connection supports sending steering or follow-up messages directly to a subagent.
+    fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        false
+    }
+
+    /// Sends a steering or follow-up message directly to a subagent owned by `parent_session_id`.
+    fn message_subagent(
+        &self,
+        _parent_session_id: &acp_v2::SessionId,
+        _subagent_session_id: &acp_v2::SessionId,
+        _message: String,
+        _interrupt: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        anyhow::bail!("Messaging subagents is not supported by this agent")
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.
@@ -298,6 +339,12 @@ pub trait AgentConnection {
         _session_id: &acp_v2::SessionId,
         _cx: &App,
     ) -> Option<Rc<dyn AgentSessionTruncate>> {
+        None
+    }
+
+    /// Returns a capability for creating a new session that shares the given
+    /// session's conversation history, if this agent supports forking.
+    fn fork(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {
         None
     }
 
@@ -355,6 +402,17 @@ impl dyn AgentConnection {
 
 pub trait AgentSessionTruncate {
     fn run(&self, client_user_message_id: ClientUserMessageId, cx: &mut App) -> Task<Result<()>>;
+}
+
+pub trait AgentSessionFork {
+    /// Creates a new session sharing the source session's conversation history
+    /// and returns its id. The forked session is not opened as a thread.
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {
@@ -1038,6 +1096,11 @@ mod test_support {
         supports_session_additional_directories: bool,
         supports_set_title: bool,
         supports_truncate: bool,
+        supports_steer_at_boundary: bool,
+        steer_at_boundary_calls: Arc<Mutex<Vec<(acp_v2::SessionId, bool)>>>,
+        supports_subagent_messaging: bool,
+        subagent_message_calls:
+            Arc<Mutex<Vec<(acp_v2::SessionId, acp_v2::SessionId, String, bool)>>>,
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
@@ -1089,6 +1152,10 @@ mod test_support {
                 supports_session_additional_directories: false,
                 supports_set_title: true,
                 supports_truncate: true,
+                supports_steer_at_boundary: false,
+                steer_at_boundary_calls: Default::default(),
+                supports_subagent_messaging: false,
+                subagent_message_calls: Default::default(),
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
                 prompt_capabilities_rx: watch::Receiver::constant(
@@ -1237,6 +1304,26 @@ mod test_support {
         pub fn with_receipt_submissions(mut self, enabled: bool) -> Self {
             self.supports_receipt_submissions = enabled;
             self
+        }
+
+        pub fn with_steer_at_boundary(mut self, enabled: bool) -> Self {
+            self.supports_steer_at_boundary = enabled;
+            self
+        }
+
+        pub fn take_steer_at_boundary_calls(&self) -> Vec<(acp_v2::SessionId, bool)> {
+            std::mem::take(&mut *self.steer_at_boundary_calls.lock())
+        }
+
+        pub fn with_subagent_messaging(mut self, enabled: bool) -> Self {
+            self.supports_subagent_messaging = enabled;
+            self
+        }
+
+        pub fn take_subagent_message_calls(
+            &self,
+        ) -> Vec<(acp_v2::SessionId, acp_v2::SessionId, String, bool)> {
+            std::mem::take(&mut *self.subagent_message_calls.lock())
         }
 
         pub fn with_retry(mut self) -> Self {
@@ -1598,6 +1685,46 @@ mod test_support {
                     next_truncate: self.next_truncate.clone(),
                 }) as Rc<dyn AgentSessionTruncate>
             })
+        }
+
+        fn supports_steer_at_boundary(&self) -> bool {
+            self.supports_steer_at_boundary
+        }
+
+        fn set_end_turn_at_next_boundary(
+            &self,
+            session_id: &acp_v2::SessionId,
+            end_at_boundary: bool,
+            _cx: &mut App,
+        ) -> Result<()> {
+            self.steer_at_boundary_calls
+                .lock()
+                .push((session_id.clone(), end_at_boundary));
+            Ok(())
+        }
+
+        fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+            self.supports_subagent_messaging
+        }
+
+        fn message_subagent(
+            &self,
+            parent_session_id: &acp_v2::SessionId,
+            subagent_session_id: &acp_v2::SessionId,
+            message: String,
+            interrupt: bool,
+            _cx: &mut App,
+        ) -> Result<()> {
+            if !self.supports_subagent_messaging {
+                anyhow::bail!("Messaging subagents is not supported by this stub connection");
+            }
+            self.subagent_message_calls.lock().push((
+                parent_session_id.clone(),
+                subagent_session_id.clone(),
+                message,
+                interrupt,
+            ));
+            Ok(())
         }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

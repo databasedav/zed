@@ -308,6 +308,7 @@ impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
         let thread_state = thread.read(cx);
         let session_id = thread_state.session_id().clone();
+        let is_subagent = thread_state.parent_session_id().is_some();
         for request in thread_state.pending_permission_requests() {
             self.add_permission_request(&session_id, &request.id);
         }
@@ -348,16 +349,26 @@ impl Conversation {
                     AcpThreadEvent::NewEntry
                     | AcpThreadEvent::ActivityConfirmedIdle
                     | AcpThreadEvent::StatusChanged
-                    | AcpThreadEvent::SubmissionUpdated(_)
                     | AcpThreadEvent::TitleUpdated
-                    | AcpThreadEvent::TokenUsageUpdated(_)
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
-                    | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::SubagentAssociationUpdated
                     | AcpThreadEvent::Stopped { .. }
-                    | AcpThreadEvent::Error
+                    | AcpThreadEvent::Error => {
+                        if is_subagent
+                            || matches!(
+                                event,
+                                AcpThreadEvent::SubagentSpawned(_)
+                                    | AcpThreadEvent::SubagentAssociationUpdated
+                            )
+                        {
+                            cx.notify();
+                        }
+                    }
+                    AcpThreadEvent::SubmissionUpdated(_)
+                    | AcpThreadEvent::TokenUsageUpdated(_)
+                    | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::ConnectionLost
                     | AcpThreadEvent::LoadError(_)
                     | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -970,6 +981,7 @@ pub struct ConnectedServerState {
     auth_state: AuthState,
     active_id: Option<acp_v2::SessionId>,
     pub(crate) threads: HashMap<acp_v2::SessionId, Entity<ThreadView>>,
+    loading_subagent_sessions: HashSet<acp_v2::SessionId>,
     connection: Rc<dyn AgentConnection>,
     conversation: Entity<Conversation>,
     _connection_entry_subscription: Subscription,
@@ -1474,6 +1486,13 @@ impl ConversationView {
                                 thread.set_draft_prompt(Some(recovery.draft.clone()), cx);
                             });
                         }
+                        // A load that replayed no history leaves the user in
+                        // the same place as a resume (e.g. a freshly forked
+                        // session whose transcript the agent hasn't written
+                        // yet), so show the same notice.
+                        if resume_session_id.is_some() && thread.read(cx).entries().is_empty() {
+                            resumed_without_history = true;
+                        }
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
                         let root_session_id = thread.read(cx).session_id().clone();
 
@@ -1525,6 +1544,7 @@ impl ConversationView {
                                 auth_state: AuthState::Ok,
                                 active_id: Some(root_session_id.clone()),
                                 threads: HashMap::from_iter([(root_session_id, current)]),
+                                loading_subagent_sessions: HashSet::default(),
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                                 _request_elicitation_subscription: request_elicitation_subscription,
@@ -1805,6 +1825,7 @@ impl ConversationView {
                         auth_state,
                         active_id: None,
                         threads: HashMap::default(),
+                        loading_subagent_sessions: HashSet::default(),
                         connection,
                         conversation: cx.new(|_cx| Conversation::default()),
                         _connection_entry_subscription: Subscription::new(|| {}),
@@ -1958,7 +1979,13 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
-        if !is_subagent && affects_thread_metadata(event) {
+        if (!is_subagent && affects_thread_metadata(event))
+            || (is_subagent
+                && matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged | AcpThreadEvent::Stopped { .. }
+                ))
+        {
             cx.emit(RootThreadUpdated);
         }
         match event {
@@ -2008,27 +2035,30 @@ impl ConversationView {
                         active.sync_generating_indicator(cx);
                     });
                 }
+                self.load_subagent_session_for_entry(thread, index, cx);
             }
             AcpThreadEvent::EntryUpdated(index) => {
+                let index = *index;
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
-                        view_state.sync_entry(*index, thread, window, cx);
+                        view_state.sync_entry(index, thread, window, cx);
                     });
-                    list_state.remeasure_items(*index..*index + 1);
+                    list_state.remeasure_items(index..index + 1);
                     active.update(cx, |active, cx| {
-                        if active.editing_message == Some(*index)
-                            && !active.can_edit_user_message(*index, cx)
+                        if active.editing_message == Some(index)
+                            && !active.can_edit_user_message(index, cx)
                         {
                             active.editing_message = None;
                             cx.notify();
                         }
-                        active.sync_elicitation_state_for_entry(*index, window, cx);
+                        active.sync_elicitation_state_for_entry(index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
                     });
                 }
+                self.load_subagent_session_for_entry(thread, index, cx);
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2599,6 +2629,30 @@ impl ConversationView {
     /// the parent already owns are never loaded: ACP forbids loading subagent sessions.
     /// Neither is any session where the subagents RFD applies, since a child referenced
     /// there may still be announced, and loading it first would reject the announcement.
+    fn load_subagent_session_for_entry(
+        &mut self,
+        parent_thread: &Entity<AcpThread>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subagent_id) = parent_thread
+            .read(cx)
+            .entries()
+            .get(index)
+            .and_then(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|info| info.session_id.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let parent_session_id = parent_thread.read(cx).session_id().clone();
+        self.load_subagent_session(subagent_id, parent_session_id, cx);
+    }
+
     fn load_subagent_session(
         &mut self,
         subagent_id: acp_v2::SessionId,
@@ -2609,6 +2663,7 @@ impl ConversationView {
             return;
         };
         if connected.threads.contains_key(&subagent_id)
+            || connected.loading_subagent_sessions.contains(&subagent_id)
             || !connected.connection.supports_load_session()
             || connected.connection.announces_subagents()
         {
@@ -2624,28 +2679,73 @@ impl ConversationView {
         if parent_thread.read(cx).subagent(&subagent_id).is_some() {
             return;
         }
+        let (running_tool_call_id, provisional_title) = {
+            let parent_ref = parent_thread.read(cx);
+            let tool_call = parent_ref.tool_call_for_subagent(&subagent_id);
+            let running_id = tool_call
+                .filter(|call| {
+                    matches!(
+                        call.status(),
+                        acp_thread::ToolCallStatus::Pending
+                            | acp_thread::ToolCallStatus::InProgress
+                    )
+                })
+                .map(|call| call.id.clone());
+            let title = tool_call
+                .map(|call| call.label.read(cx).source().to_string())
+                .filter(|label| !label.is_empty())
+                .map(SharedString::from);
+            (running_id, title)
+        };
         let work_dirs = parent_thread
             .read(cx)
             .work_dirs()
             .cloned()
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let connection = connected.connection.clone();
+        if let Some(connected) = self.as_connected_mut() {
+            connected
+                .loading_subagent_sessions
+                .insert(subagent_id.clone());
+        }
 
-        let subagent_thread_task = connected.connection.clone().load_session(
-            subagent_id,
+        let subagent_thread_task = connection.load_session(
+            subagent_id.clone(),
             self.project.clone(),
             work_dirs,
-            None,
+            provisional_title,
             cx,
         );
 
         let parent_thread = parent_thread.downgrade();
-        cx.spawn(async move |_, cx| {
-            let subagent_thread = subagent_thread_task.await?;
+        cx.spawn(async move |this, cx| {
+            let result = subagent_thread_task.await;
+            this.update(cx, |this, _| {
+                if let Some(connected) = this.as_connected_mut() {
+                    connected.loading_subagent_sessions.remove(&subagent_id);
+                }
+            })
+            .ok();
+            let subagent_thread = result?;
             let registered = parent_thread.update(cx, |parent_thread, cx| {
                 parent_thread.register_subagent(subagent_thread, cx);
             });
             if registered.is_err() {
                 log::debug!("Subagent parent was released while its session loaded");
+                return anyhow::Ok(());
+            }
+            if let Some(tool_call_id) = running_tool_call_id {
+                this.update(cx, |this, cx| {
+                    if let Some(parent_view) = this.thread_view(&parent_session_id) {
+                        parent_view.update(cx, |view, cx| {
+                            view.entry_view_state.update(cx, |state, _| {
+                                state.expand_tool_call(tool_call_id);
+                            });
+                            cx.notify();
+                        });
+                    }
+                })
+                .ok();
             }
             anyhow::Ok(())
         })
@@ -4318,7 +4418,9 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::FeatureFlagAppExt as _;
     use fs::FakeFs;
-    use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
+    use gpui::{
+        ClipboardItem, EventEmitter, TestAppContext, UpdateGlobal, VisualTestContext, point, size,
+    };
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
@@ -5149,6 +5251,59 @@ pub(crate) mod tests {
             assert!(view.message_queue.front_wants_steer());
         });
         assert!(!native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+    }
+
+    #[gpui::test]
+    async fn test_acp_queued_message_steer_syncs_to_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_steer_at_boundary(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let acp_thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.supports_steer(cx));
+        });
+
+        let id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "steer me".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+            view.message_queue.first_id().unwrap()
+        });
+        cx.run_until_parked();
+
+        assert!(!acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert!(connection.take_steer_at_boundary_calls().is_empty());
+
+        thread_view.update(cx, |view, cx| {
+            view.message_queue.toggle_steer(id);
+            view.sync_queue_flag_to_native_thread(cx);
+        });
+        assert!(acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert_eq!(
+            connection.take_steer_at_boundary_calls(),
+            vec![(session_id.clone(), true)]
+        );
+
+        thread_view.update(cx, |view, cx| {
+            view.message_queue.toggle_steer(id);
+            view.sync_queue_flag_to_native_thread(cx);
+        });
+        assert!(!acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert_eq!(
+            connection.take_steer_at_boundary_calls(),
+            vec![(session_id, false)]
+        );
     }
 
     #[gpui::test]
@@ -6884,6 +7039,7 @@ pub(crate) mod tests {
                 session_id: acp_v2::SessionId::new("child"),
                 message_start_index: 2,
                 message_end_index: Some(5),
+                model_name: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -7034,6 +7190,7 @@ pub(crate) mod tests {
                     session_id: acp_v2::SessionId::new("child"),
                     message_start_index: 0,
                     message_end_index: end,
+                    model_name: None,
                 })
                 .expect("subagent session info should serialize"),
             )]);
@@ -9966,13 +10123,14 @@ pub(crate) mod tests {
 
     impl Render for ThreadViewItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            // Render the title editor in the element tree too. In the real app
-            // it is part of the agent panel
+            // Root titles live in the agent panel; subagent titles are already
+            // rendered by the thread view's own header.
             let title_editor = self
                 .conversation_view
                 .read(cx)
                 .active_thread()
-                .map(|t| t.read(cx).title_editor.clone());
+                .filter(|thread| thread.read(cx).parent_session_id.is_none())
+                .map(|thread| thread.read(cx).title_editor.clone());
 
             v_flex()
                 .when(self.fill_space, |this| this.size_full())
@@ -17305,6 +17463,109 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_thread_title_subagent_bindings(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let subagent_view = conversation_view.update_in(cx, |view, window, cx| {
+            let parent_session_id = view
+                .root_thread(cx)
+                .expect("root thread should exist")
+                .read(cx)
+                .session_id()
+                .clone();
+            let connected = view.as_connected().expect("agent should be connected");
+            let conversation = connected.conversation.clone();
+            let thread = create_test_acp_thread(
+                Some(parent_session_id),
+                "subagent",
+                connected.connection.clone(),
+                view.project.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            let subagent_view = view.new_thread_view(thread, conversation, false, None, window, cx);
+            let session_id = acp_v2::SessionId::new("subagent");
+            view.as_connected_mut()
+                .expect("agent should be connected")
+                .threads
+                .insert(session_id.clone(), subagent_view.clone());
+            view.navigate_to_thread(session_id, window, cx);
+            subagent_view
+        });
+        add_to_workspace(conversation_view, cx);
+        let title_editor = subagent_view.update_in(cx, |view, window, cx| {
+            view.rename("Subagent title".into(), window, cx);
+            view.title_editor.clone()
+        });
+
+        for normal_mode in [None, Some("helix_normal"), Some("normal")] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.vim_mode = Some(normal_mode == Some("normal"));
+                        settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                    });
+                });
+            });
+            cx.run_until_parked();
+            cx.focus(&title_editor);
+
+            let assert_title_mode = |mode: Option<&str>, cx: &mut VisualTestContext| {
+                title_editor.update_in(cx, |editor, window, cx| {
+                    assert!(editor.is_focused(window));
+                    assert_eq!(
+                        editor
+                            .key_context(window, cx)
+                            .get("vim_mode")
+                            .map(|mode| mode.as_ref()),
+                        mode,
+                    );
+                    assert_eq!(editor.text(cx), "Subagent title");
+                });
+            };
+            assert_title_mode(normal_mode, cx);
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("i");
+                assert_title_mode(Some("insert"), cx);
+                cx.simulate_keystrokes("escape");
+                assert_title_mode(normal_mode, cx);
+            }
+
+            for keystroke in ["enter", "escape"] {
+                cx.focus(&title_editor);
+                cx.simulate_keystrokes(keystroke);
+                subagent_view.update_in(cx, |view, window, cx| {
+                    assert!(view.focus_handle(cx).is_focused(window));
+                    assert!(!view.title_editor.read(cx).is_focused(window));
+                    assert_eq!(view.title_editor.read(cx).text(cx), "Subagent title");
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn test_manually_editing_title_updates_acp_thread_title(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::MaybeUndefined;
 
@@ -17664,6 +17925,7 @@ pub(crate) mod tests {
                     session_id: child_session_id.clone(),
                     message_start_index: 0,
                     message_end_index: None,
+                    model_name: None,
                 })
                 .expect("subagent session info should serialize"),
             )]));
@@ -19341,6 +19603,7 @@ pub(crate) mod tests {
                         session_id: child_session_id.clone(),
                         message_start_index: 0,
                         message_end_index: None,
+                        model_name: None,
                     })
                     .expect("subagent session context"),
                 )]));
@@ -20051,6 +20314,111 @@ pub(crate) mod tests {
             text, "existing content\n\nqueued message",
             "Main editor should have existing content and queued message separated by two newlines"
         );
+    }
+
+    #[gpui::test]
+    async fn test_message_editor_arrow_keys_do_not_scroll_output(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default keymap should load");
+            cx.bind_keys(bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Response paragraph.\n\n".repeat(100).into()),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Hello", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let editor = message_editor.read_with(cx, |editor, _| editor.editor().clone());
+        cx.focus(&message_editor);
+
+        let output_scroll_position = |cx: &TestAppContext| {
+            thread_view.read_with(cx, |view, _| {
+                let offset = view.list_state.logical_scroll_top();
+                (offset.item_ix, offset.offset_in_item)
+            })
+        };
+
+        for (text, end) in [
+            ("", text::Point::new(0, 0)),
+            ("line", text::Point::new(0, 4)),
+            ("first\nsecond\nthird", text::Point::new(2, 5)),
+        ] {
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.set_cursor_offset(0, window, cx);
+            });
+            cx.run_until_parked();
+            thread_view.update(cx, |view, cx| {
+                view.scroll_to_top(cx);
+                view.list_state.scroll_by(px(400.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let scroll_top = output_scroll_position(cx);
+            assert_ne!(scroll_top, (0, px(0.)));
+
+            for keystrokes in ["up up", "down down down down", "up up up up"] {
+                cx.simulate_keystrokes(keystrokes);
+                cx.run_until_parked();
+                assert_eq!(
+                    output_scroll_position(cx),
+                    scroll_top,
+                    "{keystrokes:?} must not scroll output with input {text:?}",
+                );
+                editor.update_in(cx, |editor, window, cx| {
+                    let cursor = editor
+                        .selections
+                        .newest::<text::Point>(&editor.snapshot(window, cx))
+                        .head();
+                    assert_eq!(
+                        cursor,
+                        if keystrokes.starts_with("down") {
+                            end
+                        } else {
+                            text::Point::new(0, 0)
+                        }
+                    );
+                });
+            }
+
+            cx.simulate_keystrokes("ctrl-alt-up");
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "explicit output-scroll shortcuts should still work from the input",
+            );
+        }
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        for keystroke in ["up", "down"] {
+            let scroll_top = output_scroll_position(cx);
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "{keystroke} should still scroll when output is focused",
+            );
+        }
     }
 
     #[gpui::test]
@@ -21368,5 +21736,631 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[gpui::test]
+    async fn test_queued_steer_beats_subagent_continuation_without_loading_spinner(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let message_editor = message_editor(&conversation_view, cx);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // While Turn 1 is active, a background subagent finishes (requesting a silent
+        // continuation) AND the user queues a steering follow-up message.
+        thread.update(cx, |thread, cx| {
+            thread.request_subagent_continuation(cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["steer message".into()], vec![], window, cx);
+        });
+        cx.run_until_parked();
+
+        let finish_steer = connection.defer_next_prompt_response();
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(
+                !view.is_loading_contents,
+                "queued dispatch must never lock composer behind Loading Added Context"
+            );
+            assert!(view.message_queue.is_empty());
+            assert!(view.pending_queued_dispatch.is_none());
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "steer message"
+                ),
+                "user's queued message must beat background subagent continuation"
+            );
+            assert!(
+                view.thread
+                    .read(cx)
+                    .to_markdown(cx)
+                    .contains("steer message"),
+                "queued message should appear in thread entries immediately on dispatch"
+            );
+        });
+
+        finish_steer
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("steer prompt still pending");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_interrupt_and_send_supersedes_in_flight_queued_send_now(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Queue a steering message and click "Send Now" while Turn 1 is still unwinding.
+        let queued_id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["queued steer".into()], vec![], window, cx);
+            view.message_queue.first_id().expect("queued entry")
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(queued_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        // While Turn 1's prompt RPC is still unwinding:
+        // - Composer must NOT show "Loading Added Context…" (`is_loading_contents == false`).
+        // - The queued item must remain visible in `pending_queued_dispatch` instead of vanishing.
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(!view.is_loading_contents);
+            assert!(view.pending_queued_dispatch.is_some());
+            assert!(view.has_queued_messages());
+        });
+
+        // Now user types a new message in the composer and hits Send Immediately (`interrupt_and_send`).
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("send this instead", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.interrupt_and_send(window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.pending_queued_dispatch.is_none());
+            assert_eq!(
+                view.message_queue.len(),
+                1,
+                "superseded Send Now entry should be restored to the queue"
+            );
+        });
+
+        // Finish unwinding Turn 1: "send this instead" must be sent, NOT "queued steer"!
+        let finish_second = connection.defer_next_prompt_response();
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("first turn unwind still pending");
+        cx.run_until_parked();
+
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            ""
+        );
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "send this instead"
+                ),
+                "composer interrupt_and_send must send composer text, not the superseded queued message"
+            );
+            assert_eq!(view.message_queue.len(), 1);
+        });
+
+        // Once "send this instead" finishes, the restored "queued steer" auto-dispatches next.
+        let finish_queued = connection.defer_next_prompt_response();
+        finish_second
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("second turn still pending");
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            assert!(matches!(
+                view.in_flight_prompt(cx).as_deref(),
+                Some([acp_v2::ContentBlock::Text(text)]) if text.text == "queued steer"
+            ));
+        });
+
+        finish_queued
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("queued turn still pending");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_acp_subagent_card_populates_model_name_from_session_info(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("child-with-model");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id,
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Gemini 3 Flash".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("invoke-model", "Audit overlay")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta);
+            connection.send_update(root_session_id, acp_v1::SessionUpdate::ToolCall(call), cx);
+        });
+        cx.run_until_parked();
+
+        root_thread.read_with(cx, |thread, cx| {
+            let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) = thread.entries().first()
+            else {
+                panic!("expected subagent tool call entry");
+            };
+            let card = subagent_card::SubagentCardState::from_tool_call(tool_call, cx);
+            assert_eq!(card.model_name.as_deref(), Some("Gemini 3 Flash"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_live_acp_subagent_tool_call_loads_and_streams_child_session(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("live-acp-subagent");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: None,
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("invoke-1", "Workspace Tour (research)")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+            let mut progress = acp_v1::ToolCallUpdate::new(
+                "invoke-1",
+                acp_v1::ToolCallUpdateFields::new()
+                    .title("Workspace Tour (research)")
+                    .status(acp_v1::ToolCallStatus::InProgress),
+            );
+            progress.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCallUpdate(progress),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let child_view = conversation_view
+            .read_with(cx, |view, _| view.thread_view(&child_session_id))
+            .expect("live subagent tool call should load and register child ThreadView");
+        let child_thread = child_view.read_with(cx, |view, _| view.thread.clone());
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.parent_session_id().cloned()),
+            Some(root_session_id.clone()),
+        );
+        assert!(
+            root_view.read_with(cx, |view, cx| {
+                view.entry_view_state
+                    .read(cx)
+                    .is_tool_call_expanded(&acp_v2::ToolCallId::new("invoke-1"))
+            }),
+            "live running subagent card should auto-expand",
+        );
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                child_session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Inspecting Cargo.toml".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.entries().len()),
+            1,
+        );
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let stop_bounds = cx
+            .debug_bounds("subagent-titlebar-stop")
+            .expect("running external subagent should show stop button in fullscreen titlebar");
+        cx.simulate_click(stop_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(connection.take_cancel_calls(), vec![child_session_id]);
+    }
+
+    #[gpui::test]
+    async fn test_running_subagents_activity_bar_drawer_and_controls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let first_child_id = acp_v2::SessionId::new("subagent-alpha");
+        let second_child_id = acp_v2::SessionId::new("subagent-beta");
+
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_none(),
+            "running subagents drawer should be hidden when no subagents are running",
+        );
+        assert!(!root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+
+        let first_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: first_child_id,
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Gemini 3.1 Pro".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-alpha", "Audit activity bar")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(first_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)),
+            "has_running_subagents should report true for an active subagent tool call",
+        );
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_some(),
+            "running subagents summary drawer should appear above chat input",
+        );
+        assert!(cx.debug_bounds("running-subagent-summary-steer").is_some());
+        assert!(cx.debug_bounds("running-subagent-summary-stop").is_some());
+
+        // Emit a completed steer tool call targeting the same running subagent:
+        // the original running subagent must remain visible in the drawer!
+        cx.update(|_, cx| {
+            let mut steer_call =
+                acp_v1::ToolCall::new("steer-alpha-1", "Audit activity bar (steer)")
+                    .kind(acp_v1::ToolKind::Other)
+                    .status(acp_v1::ToolCallStatus::Completed);
+            steer_call.meta = Some(first_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(steer_call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_some(),
+            "a completed steer call must not hide a still-running subagent",
+        );
+
+        // Start a second concurrent subagent and expand the drawer
+        let second_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: second_child_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Claude Sonnet 4.6".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-beta", "Verify keybindings")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(second_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let summary_bounds = cx
+            .debug_bounds("running-subagents-summary")
+            .expect("summary bar should be visible");
+        cx.simulate_click(summary_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("running-subagent-row-subagent-alpha")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("running-subagent-row-subagent-beta")
+                .is_some()
+        );
+
+        // Stop `subagent-beta` directly from its drawer row
+        let stop_beta = cx
+            .debug_bounds("drawer-stop-subagent-subagent-beta")
+            .expect("drawer row should show stop button");
+        cx.simulate_click(stop_beta.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(connection.take_cancel_calls(), vec![second_child_id]);
+
+        // Finish both subagent tool calls -> drawer auto-hides!
+        cx.update(|_, cx| {
+            for (call_id, meta) in [("spawn-alpha", first_meta), ("spawn-beta", second_meta)] {
+                let mut done = acp_v1::ToolCallUpdate::new(
+                    call_id,
+                    acp_v1::ToolCallUpdateFields::new().status(acp_v1::ToolCallStatus::Completed),
+                );
+                done.meta = Some(meta);
+                connection.send_update(
+                    root_session_id.clone(),
+                    acp_v1::SessionUpdate::ToolCallUpdate(done),
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_none(),
+            "running subagents drawer should auto-hide once all subagents finish",
+        );
+        assert!(!root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+    }
+
+    #[gpui::test]
+    async fn test_subagent_tile_messaging_steer_interrupt_and_fullscreen(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("subagent-steer");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: None,
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-steer", "Investigate parser")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // 1. Click quick "Steer" button in the collapsed Running Subagents summary bar,
+        // type a message, and send with default `interrupt = false` (boundary steer).
+        let summary_steer = cx
+            .debug_bounds("running-subagent-summary-steer")
+            .expect("collapsed single-subagent drawer should show quick Steer button");
+        cx.simulate_click(summary_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("drawer-subagent-composer-subagent-steer")
+                .is_some(),
+            "clicking quick Steer should expand drawer and open composer",
+        );
+
+        cx.simulate_input("Check edge cases first");
+        cx.run_until_parked();
+
+        let drawer_send = cx
+            .debug_bounds("drawer-subagent-composer-send-subagent-steer")
+            .expect("drawer composer send button");
+        cx.simulate_click(drawer_send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Check edge cases first".to_string(),
+                false,
+            )],
+        );
+        assert!(
+            cx.debug_bounds("drawer-subagent-composer-subagent-steer")
+                .is_none(),
+            "drawer composer should close after sending",
+        );
+
+        // 2. Open inline subagent card composer (`steer-subagent-0`), toggle `Interrupt` on,
+        // and click Send -> `interrupt = true`.
+        let card_steer = cx
+            .debug_bounds("steer-subagent-0")
+            .expect("inline subagent card should show steer button");
+        cx.simulate_click(card_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("card-subagent-composer-0-subagent-steer")
+                .is_some(),
+        );
+        cx.simulate_input("Abort current grep and read lib.rs");
+        cx.run_until_parked();
+
+        let card_interrupt_toggle = cx
+            .debug_bounds("card-subagent-composer-0-interrupt-subagent-steer")
+            .expect("running inline composer should show Interrupt toggle");
+        cx.simulate_click(card_interrupt_toggle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let card_send = cx
+            .debug_bounds("card-subagent-composer-0-send-subagent-steer")
+            .expect("inline composer send button");
+        cx.simulate_click(card_send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Abort current grep and read lib.rs".to_string(),
+                true,
+            )],
+        );
+
+        // 3. Reopen inline composer and dispatch `SendImmediately` without toggling `Interrupt`:
+        // `SendImmediately` forces `interrupt = true`.
+        let card_steer = cx
+            .debug_bounds("steer-subagent-0")
+            .expect("inline subagent card steer button");
+        cx.simulate_click(card_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.simulate_input("Immediate redirect via action");
+        cx.dispatch_action(crate::SendImmediately);
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Immediate redirect via action".to_string(),
+                true,
+            )],
+        );
+
+        // 4. Navigate to fullscreen subagent view and send a message from the fullscreen composer!
+        conversation_view.update(cx, |view, cx| {
+            view.load_subagent_session(child_session_id.clone(), root_session_id.clone(), cx);
+        });
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("fullscreen-subagent-composer-subagent-steer")
+                .is_some(),
+            "fullscreen subagent view should render bottom message composer",
+        );
+        let child_view = active_thread(&conversation_view, cx);
+        child_view.update_in(cx, |view, window, cx| {
+            view.activation_focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("Follow up from fullscreen");
+        cx.dispatch_action(Chat);
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id,
+                child_session_id,
+                "Follow up from fullscreen".to_string(),
+                false,
+            )],
+        );
     }
 }
