@@ -11,15 +11,16 @@ use collections::{HashSet, IndexMap};
 use fs::Fs;
 use futures::channel::oneshot;
 use gpui::{App, Pixels, SharedString};
-use language_model::LanguageModel;
+use language_model::{LanguageModel, LanguageModelReasoningSummary};
 use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, ReasoningSummarySetting, RegisterSetting,
+    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
+    update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -211,6 +212,7 @@ pub struct AgentSettings {
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
+    pub thread_title_max_lines: Option<usize>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
@@ -235,6 +237,7 @@ pub struct AgentSettings {
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
+    pub reasoning_summary: Option<LanguageModelReasoningSummary>,
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
@@ -766,6 +769,7 @@ impl Settings for AgentSettings {
             } else {
                 None
             },
+            thread_title_max_lines: agent.thread_title_max_lines.unwrap_or_default().max_lines(),
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
@@ -811,6 +815,12 @@ impl Settings for AgentSettings {
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),
             thinking_display: agent.thinking_display.unwrap(),
+            reasoning_summary: match agent.reasoning_summary.unwrap() {
+                ReasoningSummarySetting::ProviderDefault => None,
+                ReasoningSummarySetting::Auto => Some(LanguageModelReasoningSummary::Auto),
+                ReasoningSummarySetting::Concise => Some(LanguageModelReasoningSummary::Concise),
+                ReasoningSummarySetting::Detailed => Some(LanguageModelReasoningSummary::Detailed),
+            },
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
@@ -1060,6 +1070,37 @@ mod tests {
     fn test_invalid_regex_returns_none() {
         let result = CompiledRegex::new("[invalid(regex", false);
         assert!(result.is_none());
+    }
+
+    #[gpui::test]
+    fn test_thread_title_max_lines(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        assert_eq!(AgentSettings::get_global(cx).thread_title_max_lines, None);
+
+        for (user_settings, expected) in [
+            (r#"{ "agent": { "thread_title_max_lines": 1 } }"#, Some(1)),
+            (r#"{ "agent": { "thread_title_max_lines": 6 } }"#, Some(6)),
+            (
+                r#"{ "agent": { "thread_title_max_lines": "unlimited" } }"#,
+                None,
+            ),
+            (r#"{ "agent": { "thread_title_max_lines": 2 } }"#, Some(2)),
+            ("{}", None),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(user_settings, cx)
+                    .expect("thread title line limit setting should load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).thread_title_max_lines,
+                expected
+            );
+        }
     }
 
     #[gpui::test]

@@ -1,6 +1,6 @@
 use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
-    resolve_global_skill_path, resolve_project_path,
+    resolve_global_skill_path, resolve_project_path_for_read,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
@@ -253,20 +253,25 @@ impl AgentTool for ListDirectoryTool {
             }
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
 
-            let (project_path, symlink_canonical_target) =
-                project.read_with(cx, |project, cx| -> anyhow::Result<_> {
-                    let resolved = resolve_project_path(project, &input.path, &canonical_roots, cx)?;
-                    Ok(match resolved {
-                        ResolvedProjectPath::Safe(path) => (path, None),
-                        ResolvedProjectPath::SymlinkEscape {
-                            project_path,
-                            canonical_target,
-                        } => (project_path, Some(canonical_target)),
-                    })
-                }).map_err(|e| e.to_string())?;
+            let resolved = resolve_project_path_for_read(
+                &project,
+                &input.path,
+                &canonical_roots,
+                &fs,
+                cx,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let (project_path, symlink_canonical_target) = match resolved {
+                ResolvedProjectPath::Safe(path) => (path, None),
+                ResolvedProjectPath::SymlinkEscape {
+                    project_path,
+                    canonical_target,
+                } => (project_path, Some(canonical_target)),
+            };
 
             // Check settings exclusions synchronously
-            project.read_with(cx, |project, cx| {
+            let worktree = project.read_with(cx, |project, cx| {
                 let worktree = project
                     .worktree_for_id(project_path.worktree_id, cx)
                     .with_context(|| {
@@ -304,14 +309,15 @@ impl AgentTool for ListDirectoryTool {
                 }
 
                 let worktree_snapshot = worktree.read(cx).snapshot();
-                let Some(entry) = worktree_snapshot.entry_for_path(&project_path.path) else {
+                if let Some(entry) = worktree_snapshot.entry_for_path(&project_path.path) {
+                    if !entry.is_dir() {
+                        anyhow::bail!("{} is not a directory.", input.path);
+                    }
+                } else if !worktree.read(cx).is_local() {
                     anyhow::bail!("Path not found: {}", input.path);
-                };
-                if !entry.is_dir() {
-                    anyhow::bail!("{} is not a directory.", input.path);
                 }
 
-                anyhow::Ok(())
+                anyhow::Ok(worktree)
             }).map_err(|e| e.to_string())?;
 
             if let Some(canonical_target) = &symlink_canonical_target {
@@ -327,6 +333,44 @@ impl AgentTool for ListDirectoryTool {
                 authorize.await.map_err(|e| e.to_string())?;
             }
 
+            let local_path = worktree.read_with(cx, |worktree, _| {
+                worktree.is_local().then(|| {
+                    worktree.abs_path().join(project_path.path.as_std_path())
+                })
+            });
+            if let Some(local_path) = local_path {
+                let metadata = fs
+                    .metadata(&local_path)
+                    .await
+                    .map_err(|error| format!("Failed to read metadata for {}: {error}", input.path))?
+                    .ok_or_else(|| format!("Path not found: {}", input.path))?;
+                if !metadata.is_dir {
+                    return Err(format!("{} is not a directory.", input.path));
+                }
+            }
+
+            // Refresh by path because a local directory can be below the indexed scan depth.
+            // Only do this after authorization: refreshing may follow symlinks and load entries.
+            let refresh = worktree.update(cx, |worktree, cx| {
+                worktree.as_local().map(|worktree| {
+                    worktree.refresh_entry(project_path.path.clone(), None, cx)
+                })
+            });
+            if let Some(refresh) = refresh {
+                refresh.await.map_err(|e| e.to_string())?;
+            } else {
+                let expand = worktree.update(cx, |worktree, cx| {
+                    let entry_id = worktree
+                        .entry_for_path(&project_path.path)
+                        .with_context(|| format!("Path not found: {}", input.path))?
+                        .id;
+                    anyhow::Ok(worktree.expand_entry(entry_id, cx))
+                }).map_err(|e| e.to_string())?;
+                if let Some(expand) = expand {
+                    expand.await.map_err(|e| e.to_string())?;
+                }
+            }
+
             let list_path = input.path;
             cx.update(|cx| {
                 Self::build_directory_output(&project, &project_path, &list_path, cx)
@@ -340,11 +384,11 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, UpdateGlobal};
     use indoc::indoc;
-    use project::{FakeFs, Project};
+    use project::{EntryKind, FakeFs, Project};
     use serde_json::json;
     use settings::{SettingsStore, SplicingVec};
     use std::path::PathBuf;
-    use util::path;
+    use util::{path, rel_path::RelPath};
 
     fn platform_paths(path_str: &str) -> String {
         if cfg!(target_os = "windows") {
@@ -465,6 +509,282 @@ mod tests {
         assert!(output.contains(&platform_paths("project/tests/integration_test.rs")));
     }
 
+    async fn assert_lazy_directory_listing(
+        directory: &str,
+        child_directory: &str,
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "deferred": {
+                    "file.txt": "content",
+                    "nested": {
+                        "deeper": {
+                            "file.txt": "deep content",
+                            "child": { "hidden.txt": "not requested" }
+                        }
+                    }
+                },
+                "unrelated": { "hidden.txt": "not requested" }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+        worktree.read_with(cx, |worktree, _| {
+            assert_eq!(
+                worktree
+                    .entry_for_path(RelPath::from_unix_str("deferred").unwrap())
+                    .unwrap()
+                    .kind,
+                EntryKind::UnloadedDir
+            );
+            assert!(
+                worktree
+                    .entry_for_path(RelPath::from_unix_str("deferred/nested").unwrap())
+                    .is_none()
+            );
+        });
+
+        let tool = Arc::new(ListDirectoryTool::new(project));
+        let output = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ListDirectoryToolInput {
+                        path: format!("project/{directory}"),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            platform_paths(&format!(
+                "# Folders:\nproject/{child_directory}\n\n# Files:\nproject/{directory}/file.txt\n"
+            ))
+        );
+        worktree.read_with(cx, |worktree, _| {
+            assert_eq!(
+                worktree
+                    .entry_for_path(RelPath::from_unix_str(directory).unwrap())
+                    .unwrap()
+                    .kind,
+                EntryKind::Dir
+            );
+            for path in [child_directory, "unrelated"] {
+                assert_eq!(
+                    worktree
+                        .entry_for_path(RelPath::from_unix_str(path).unwrap())
+                        .unwrap()
+                        .kind,
+                    EntryKind::UnloadedDir,
+                    "unrequested subtree {path} should remain unloaded"
+                );
+                assert!(
+                    worktree
+                        .child_entries(RelPath::from_unix_str(path).unwrap())
+                        .next()
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_loads_only_requested_directory(cx: &mut TestAppContext) {
+        assert_lazy_directory_listing("deferred", "deferred/nested", cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_loads_path_beyond_scan_depth(cx: &mut TestAppContext) {
+        assert_lazy_directory_listing("deferred/nested/deeper", "deferred/nested/deeper/child", cx)
+            .await;
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_duplicate_root_names_with_unique_unloaded_path(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/one/project"),
+            json!({ "deferred": { "unique": { "file.txt": "content" } } }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/two/project"),
+            json!({ "deferred": { "other": { "hidden.txt": "not requested" } } }),
+        )
+        .await;
+        let project = Project::test(
+            fs.clone(),
+            [
+                path!("/one/project").as_ref(),
+                path!("/two/project").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+        cx.executor().run_until_parked();
+        let worktrees =
+            project.read_with(cx, |project, cx| project.worktrees(cx).collect::<Vec<_>>());
+        for worktree in &worktrees {
+            worktree.read_with(cx, |worktree, _| {
+                assert_eq!(
+                    worktree
+                        .entry_for_path(RelPath::from_unix_str("deferred").unwrap())
+                        .unwrap()
+                        .kind,
+                    EntryKind::UnloadedDir
+                );
+                assert!(
+                    worktree
+                        .entry_for_path(RelPath::from_unix_str("deferred/unique").unwrap())
+                        .is_none()
+                );
+            });
+        }
+        let tool = Arc::new(ListDirectoryTool::new(project));
+        let output = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ListDirectoryToolInput {
+                        path: "project/deferred/unique".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            platform_paths("\n# Files:\nproject/deferred/unique/file.txt\n")
+        );
+        for worktree in worktrees {
+            worktree.read_with(cx, |worktree, _| {
+                if worktree.abs_path().as_ref() == Path::new(path!("/two/project")) {
+                    assert_eq!(
+                        worktree
+                            .entry_for_path(RelPath::from_unix_str("deferred").unwrap())
+                            .unwrap()
+                            .kind,
+                        EntryKind::UnloadedDir
+                    );
+                    assert!(
+                        worktree
+                            .entry_for_path(RelPath::from_unix_str("deferred/other").unwrap())
+                            .is_none()
+                    );
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_excluded_and_private_paths_do_not_scan(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                    settings.project.worktree.file_scan_exclusions =
+                        Some(vec!["**/global_excluded".to_string()].into());
+                    settings.project.worktree.private_files =
+                        Some(vec!["**/global_private".to_string()].into());
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".zed": {
+                    "settings.json": r#"{
+                        "file_scan_exclusions": ["**/local_excluded"],
+                        "private_files": ["**/local_private"]
+                    }"#
+                },
+                "deferred": {
+                    "global_excluded": { "secret.txt": "secret" },
+                    "global_private": { "secret.txt": "secret" },
+                    "local_excluded": { "secret.txt": "secret" },
+                    "local_private": { "secret.txt": "secret" }
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+        let tool = Arc::new(ListDirectoryTool::new(project));
+        let read_dir_call_count = fs.read_dir_call_count();
+        for (directory, setting) in [
+            ("global_excluded", "global `file_scan_exclusions`"),
+            ("global_private", "global `private_files`"),
+            ("local_excluded", "worktree `file_scan_exclusions`"),
+            ("local_private", "worktree `private_paths`"),
+        ] {
+            let (event_stream, mut event_rx) = ToolCallEventStream::test();
+            let error = cx
+                .update(|cx| {
+                    tool.clone().run(
+                        ToolInput::resolved(ListDirectoryToolInput {
+                            path: format!("project/deferred/{directory}"),
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap_err();
+            assert!(error.contains(setting), "unexpected error: {error}");
+            cx.executor().run_until_parked();
+            assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
+            assert!(!matches!(
+                event_rx.try_recv(),
+                Ok(Ok(crate::thread::ThreadEvent::ToolCallAuthorization(_)))
+            ));
+            worktree.read_with(cx, |worktree, _| {
+                assert_eq!(
+                    worktree
+                        .entry_for_path(RelPath::from_unix_str("deferred").unwrap())
+                        .unwrap()
+                        .kind,
+                    EntryKind::UnloadedDir
+                );
+                assert!(
+                    worktree
+                        .child_entries(RelPath::from_unix_str("deferred").unwrap())
+                        .next()
+                        .is_none()
+                );
+            });
+        }
+    }
+
     #[gpui::test]
     async fn test_list_directory_empty_directory(cx: &mut TestAppContext) {
         init_test(cx);
@@ -500,48 +820,53 @@ mod tests {
     #[gpui::test]
     async fn test_list_directory_error_cases(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                });
+            });
+        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/project"),
             json!({
-                "file.txt": "content"
+                "file.txt": "content",
+                "deferred": { "file.txt": "content" }
             }),
         )
         .await;
 
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let read_dir_call_count = fs.read_dir_call_count();
         let tool = Arc::new(ListDirectoryTool::new(project));
 
-        // Test non-existent path
-        let input = ListDirectoryToolInput {
-            path: "project/nonexistent".into(),
-        };
-        let output = cx
-            .update(|cx| {
-                tool.clone().run(
-                    ToolInput::resolved(input),
-                    ToolCallEventStream::test().0,
-                    cx,
-                )
-            })
-            .await;
-        assert!(output.unwrap_err().contains("Path not found"));
-
-        // Test trying to list a file instead of directory
-        let input = ListDirectoryToolInput {
-            path: "project/file.txt".into(),
-        };
-        let output = cx
-            .update(|cx| {
-                tool.run(
-                    ToolInput::resolved(input),
-                    ToolCallEventStream::test().0,
-                    cx,
-                )
-            })
-            .await;
-        assert!(output.unwrap_err().contains("is not a directory"));
+        for (input_path, expected_error) in [
+            ("project/nonexistent", "Path not found"),
+            ("project/deferred/nonexistent", "Path not found"),
+            ("project/file.txt", "is not a directory"),
+            ("project/deferred/file.txt", "is not a directory"),
+        ] {
+            let output = cx
+                .update(|cx| {
+                    tool.clone().run(
+                        ToolInput::resolved(ListDirectoryToolInput {
+                            path: input_path.into(),
+                        }),
+                        ToolCallEventStream::test().0,
+                        cx,
+                    )
+                })
+                .await;
+            assert!(
+                matches!(&output, Err(error) if error.contains(expected_error)),
+                "{input_path}: {output:?}"
+            );
+            cx.executor().run_until_parked();
+            assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
+        }
     }
 
     #[gpui::test]
@@ -898,13 +1223,23 @@ mod tests {
         let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
         cx.executor().run_until_parked();
 
+        project.read_with(cx, |project, cx| {
+            let worktree = project.worktrees(cx).next().unwrap();
+            assert!(
+                worktree
+                    .read(cx)
+                    .entry_for_path(RelPath::from_unix_str("link_to_external/secrets").unwrap())
+                    .is_none()
+            );
+        });
+        let read_dir_call_count = fs.read_dir_call_count();
         let tool = Arc::new(ListDirectoryTool::new(project));
 
         let (event_stream, mut event_rx) = ToolCallEventStream::test();
         let task = cx.update(|cx| {
             tool.clone().run(
                 ToolInput::resolved(ListDirectoryToolInput {
-                    path: "project/link_to_external".into(),
+                    path: "project/link_to_external/secrets".into(),
                 }),
                 event_stream,
                 cx,
@@ -912,6 +1247,8 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
+        cx.executor().run_until_parked();
+        assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
         let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
         assert!(
             title.contains("points outside the project"),
@@ -925,10 +1262,10 @@ mod tests {
             ))
             .unwrap();
 
-        let result = task.await;
-        assert!(
-            result.is_ok(),
-            "Tool should succeed after authorization: {result:?}"
+        let output = task.await.unwrap();
+        assert_eq!(
+            output,
+            platform_paths("\n# Files:\nproject/link_to_external/secrets/key.txt\n")
         );
     }
 
@@ -962,6 +1299,7 @@ mod tests {
         let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
         cx.executor().run_until_parked();
 
+        let read_dir_call_count = fs.read_dir_call_count();
         let tool = Arc::new(ListDirectoryTool::new(project));
 
         let (event_stream, mut event_rx) = ToolCallEventStream::test();
@@ -976,15 +1314,77 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
+        cx.executor().run_until_parked();
+        assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
 
         // Deny by dropping the response sender without sending
         drop(auth);
 
         let result = task.await;
+        cx.executor().run_until_parked();
+        assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
         assert!(
             result.is_err(),
             "Tool should fail when authorization is denied"
         );
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_external_ancestor_returning_to_project_denied_without_scan(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "safe": { "file.txt": "content" } }),
+        )
+        .await;
+        fs.insert_tree(path!("/external"), json!({})).await;
+        fs.create_symlink(
+            path!("/project/out").as_ref(),
+            PathBuf::from(path!("/external")),
+        )
+        .await
+        .expect("create outgoing symlink");
+        fs.create_symlink(
+            path!("/external/back").as_ref(),
+            PathBuf::from(path!("/project/safe")),
+        )
+        .await
+        .expect("create returning symlink");
+        assert_eq!(
+            fs.canonicalize(path!("/project/out/back").as_ref())
+                .await
+                .expect("resolve returning symlink"),
+            PathBuf::from(path!("/project/safe"))
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let read_dir_call_count = fs.read_dir_call_count();
+        let tool = Arc::new(ListDirectoryTool::new(project));
+        let (event_stream, mut event_rx) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(ListDirectoryToolInput {
+                    path: "project/out/back".into(),
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        let authorization = event_rx.expect_authorization().await;
+        cx.executor().run_until_parked();
+        assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
+        drop(authorization);
+
+        let result = task.await;
+        assert!(result.is_err(), "denied listing should fail: {result:?}");
+        cx.executor().run_until_parked();
+        assert_eq!(fs.read_dir_call_count(), read_dir_call_count);
     }
 
     #[gpui::test]

@@ -23,7 +23,7 @@ use project::{AgentId, Project};
 use remote::remote_client::Interactive;
 use serde::Deserialize;
 use settings::{AgentConfigOptionValue, SettingsStore};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -491,7 +491,6 @@ impl AcpConnectionDefaults {
 
 struct PendingAcpSession {
     task: Shared<Task<Result<Entity<AcpThread>, Arc<anyhow::Error>>>>,
-    ref_count: usize,
 }
 
 struct SessionConfigResponse {
@@ -522,7 +521,7 @@ pub struct AcpSession {
     suppress_abort_err: bool,
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
-    ref_count: usize,
+    _release_subscription: Subscription,
 }
 
 pub struct AcpSessionList {
@@ -1163,6 +1162,60 @@ impl AcpConnection {
         session_directories_from_work_dirs(work_dirs, supports_additional_directories)
     }
 
+    fn register_session(
+        &self,
+        session_id: acp::SessionId,
+        thread: &Entity<AcpThread>,
+        session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
+        config_options: Option<ConfigOptions>,
+        cx: &mut App,
+    ) {
+        let release_subscription = cx.observe_release(thread, {
+            let session_id = session_id.clone();
+            let thread_id = thread.entity_id();
+            let sessions = self.sessions.clone();
+            let connection = self.connection.clone();
+            let supports_close = self.agent_supports_session_close();
+            move |_, cx| {
+                let removed = {
+                    let mut sessions = sessions.borrow_mut();
+                    match sessions.get(&session_id) {
+                        Some(session) if session.thread.entity_id() == thread_id => {
+                            sessions.remove(&session_id)
+                        }
+                        _ => None,
+                    }
+                };
+                if removed.is_none() || !supports_close {
+                    return;
+                }
+                cx.foreground_executor()
+                    .spawn(async move {
+                        connection
+                            .send_request(acp::CloseSessionRequest::new(session_id))
+                            .block_task()
+                            .await
+                            .log_err();
+                    })
+                    .detach();
+            }
+        });
+        self.sessions.borrow_mut().insert(
+            session_id,
+            AcpSession {
+                thread: thread.downgrade(),
+                suppress_abort_err: false,
+                session_modes,
+                config_options,
+                _release_subscription: release_subscription,
+            },
+        );
+    }
+
+    fn agent_supports_session_close(&self) -> bool {
+        self.agent_capabilities.session_capabilities.close.is_some()
+    }
+
     fn open_or_create_session(
         self: Rc<Self>,
         session_id: acp::SessionId,
@@ -1184,19 +1237,20 @@ impl AcpConnection {
         // Concurrent loads should still wait for the in-flight task so that
         // ref-counting happens in one place and the caller sees a fully loaded
         // session.
-        if let Some(pending) = self.pending_sessions.borrow_mut().get_mut(&session_id) {
-            pending.ref_count += 1;
+        if let Some(pending) = self.pending_sessions.borrow().get(&session_id) {
             let task = pending.task.clone();
             return cx
                 .foreground_executor()
                 .spawn(async move { task.await.map_err(|err| anyhow!(err)) });
         }
 
-        if let Some(session) = self.sessions.borrow_mut().get_mut(&session_id) {
-            session.ref_count += 1;
-            if let Some(thread) = session.thread.upgrade() {
-                return Task::ready(Ok(thread));
-            }
+        if let Some(thread) = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .and_then(|session| session.thread.upgrade())
+        {
+            return Task::ready(Ok(thread));
         }
 
         let directories = match self.session_directories_from_work_dirs(&work_dirs) {
@@ -1230,16 +1284,9 @@ impl AcpConnection {
                     // `session/update` notifications that arrive during the call
                     // (e.g. history replay during `session/load`) can find the thread.
                     // Modes/config are filled in once the response arrives.
-                    this.sessions.borrow_mut().insert(
-                        session_id.clone(),
-                        AcpSession {
-                            thread: thread.downgrade(),
-                            suppress_abort_err: false,
-                            session_modes: None,
-                            config_options: None,
-                            ref_count: 1,
-                        },
-                    );
+                    cx.update(|cx| {
+                        this.register_session(session_id.clone(), &thread, None, None, cx)
+                    });
 
                     let response =
                         match rpc_call(this.connection.clone(), session_id.clone(), directories)
@@ -1260,17 +1307,8 @@ impl AcpConnection {
                         this.apply_default_config_options(&session_id, config_opts, cx);
                     }
 
-                    let ref_count = this
-                        .pending_sessions
-                        .borrow_mut()
-                        .remove(&session_id)
-                        .map_or(1, |pending| pending.ref_count);
+                    this.pending_sessions.borrow_mut().remove(&session_id);
 
-                    // If `close_session` ran to completion while the load RPC was in
-                    // flight, it will have removed both the pending entry and the
-                    // sessions entry (and dispatched the ACP close RPC). In that case
-                    // the thread has no live session to attach to, so fail the load
-                    // instead of handing back an orphaned thread.
                     {
                         let mut sessions = this.sessions.borrow_mut();
                         let Some(session) = sessions.get_mut(&session_id) else {
@@ -1280,7 +1318,6 @@ impl AcpConnection {
                         };
                         session.session_modes = modes;
                         session.config_options = config_options.map(ConfigOptions::new);
-                        session.ref_count = ref_count;
                     }
 
                     Ok(thread)
@@ -1292,7 +1329,6 @@ impl AcpConnection {
             session_id,
             PendingAcpSession {
                 task: shared_task.clone(),
-                ref_count: 1,
             },
         );
 
@@ -1468,6 +1504,16 @@ impl SessionDirectories {
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
 }
 
 fn session_directories_from_work_dirs(
@@ -1477,10 +1523,16 @@ fn session_directories_from_work_dirs(
     let mut ordered_paths = work_dirs.ordered_paths();
     let cwd = ordered_paths
         .next()
-        .cloned()
+        .map(|path| session_directory_for_path(path))
         .ok_or_else(|| anyhow!("Working directory cannot be empty"))?;
     let additional_directories = if supports_additional_directories {
-        ordered_paths.cloned().collect()
+        // Normalizing file paths to their parents can produce duplicates
+        // (e.g. two single-file worktrees in the same directory).
+        let mut seen_directories = HashSet::from_iter([cwd.clone()]);
+        ordered_paths
+            .map(|path| session_directory_for_path(path))
+            .filter(|path| seen_directories.insert(path.clone()))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1489,6 +1541,55 @@ fn session_directories_from_work_dirs(
         cwd,
         additional_directories,
     })
+}
+
+/// Threads opened in a single-file workspace store the file's path as their
+/// worktree path, but sessions require a directory, so substitute the parent —
+/// the same normalization `Project::default_path_list` applies when creating
+/// new sessions. Only positively-identified local files are remapped: remote
+/// project paths can't be stat'ed locally and must pass through untouched.
+fn session_directory_for_path(path: &Path) -> PathBuf {
+    if path.is_file()
+        && let Some(parent) = path.parent()
+    {
+        parent.to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+    supports_additional_directories: bool,
+}
+
+impl acp_thread::AgentSessionFork for AcpSessionFork {
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        let directories = match session_directories_from_work_dirs(
+            &work_dirs,
+            self.supports_additional_directories,
+        ) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let request = directories.into_fork_session_request(self.session_id.clone(), mcp_servers);
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(response.session_id)
+        })
+    }
 }
 
 fn work_dirs_from_session_info(cwd: PathBuf, additional_directories: Vec<PathBuf>) -> PathList {
@@ -1583,6 +1684,12 @@ fn meta_terminal_auth_task(
         terminal_auth.args,
         terminal_auth.env,
     ))
+}
+
+fn supports_openable_session_fork(agent_capabilities: &acp::AgentCapabilities) -> bool {
+    agent_capabilities.session_capabilities.fork.is_some()
+        && (agent_capabilities.load_session
+            || agent_capabilities.session_capabilities.resume.is_some())
 }
 
 impl AgentConnection for AcpConnection {
@@ -1693,16 +1800,15 @@ impl AgentConnection for AcpConnection {
                 )
             });
 
-            self.sessions.borrow_mut().insert(
-                response.session_id,
-                AcpSession {
-                    thread: thread.downgrade(),
-                    suppress_abort_err: false,
-                    session_modes: modes,
-                    config_options: config_options.map(ConfigOptions::new),
-                    ref_count: 1,
-                },
-            );
+            cx.update(|cx| {
+                self.register_session(
+                    response.session_id,
+                    &thread,
+                    modes,
+                    config_options.map(ConfigOptions::new),
+                    cx,
+                )
+            });
 
             Ok(thread)
         })
@@ -1810,74 +1916,19 @@ impl AgentConnection for AcpConnection {
         )
     }
 
-    fn supports_close_session(&self) -> bool {
-        self.agent_capabilities.session_capabilities.close.is_some()
-    }
-
-    fn close_session(
-        self: Rc<Self>,
+    fn fork(
+        &self,
         session_id: &acp::SessionId,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        if !self.supports_close_session() {
-            return Task::ready(Err(anyhow!(LoadError::Other(
-                "Closing sessions is not supported by this agent.".into()
-            ))));
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        if !supports_openable_session_fork(&self.agent_capabilities) {
+            return None;
         }
-
-        // If a load is still in flight, decrement its ref count. The pending
-        // entry is the source of truth for how many handles exist during a
-        // load, so we must tick it down here as well as the `sessions` entry
-        // that was pre-registered to receive history-replay notifications.
-        // Only once the pending ref count hits zero do we actually close the
-        // session; the load task will observe the missing sessions entry and
-        // fail with "session was closed before load completed".
-        let pending_ref_count = {
-            let mut pending_sessions = self.pending_sessions.borrow_mut();
-            pending_sessions.get_mut(session_id).map(|pending| {
-                pending.ref_count = pending.ref_count.saturating_sub(1);
-                pending.ref_count
-            })
-        };
-        match pending_ref_count {
-            Some(0) => {
-                self.pending_sessions.borrow_mut().remove(session_id);
-                self.sessions.borrow_mut().remove(session_id);
-
-                let conn = self.connection.clone();
-                let session_id = session_id.clone();
-                return cx.foreground_executor().spawn(async move {
-                    conn.send_request(acp::CloseSessionRequest::new(session_id))
-                        .block_task()
-                        .await?;
-                    Ok(())
-                });
-            }
-            Some(_) => return Task::ready(Ok(())),
-            None => {}
-        }
-
-        let mut sessions = self.sessions.borrow_mut();
-        let Some(session) = sessions.get_mut(session_id) else {
-            return Task::ready(Ok(()));
-        };
-
-        session.ref_count = session.ref_count.saturating_sub(1);
-        if session.ref_count > 0 {
-            return Task::ready(Ok(()));
-        }
-
-        sessions.remove(session_id);
-        drop(sessions);
-
-        let conn = self.connection.clone();
-        let session_id = session_id.clone();
-        cx.foreground_executor().spawn(async move {
-            conn.send_request(acp::CloseSessionRequest::new(session_id.clone()))
-                .block_task()
-                .await?;
-            Ok(())
-        })
+        Some(Rc::new(AcpSessionFork {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            supports_additional_directories: self.supports_session_additional_directories(),
+        }) as _)
     }
 
     fn auth_methods(&self) -> &[acp::AuthMethod] {
@@ -2272,18 +2323,6 @@ pub mod test_support {
             self.inner
                 .clone()
                 .load_session(session_id, project, work_dirs, title, cx)
-        }
-
-        fn supports_close_session(&self) -> bool {
-            self.inner.supports_close_session()
-        }
-
-        fn close_session(
-            self: Rc<Self>,
-            session_id: &acp::SessionId,
-            cx: &mut App,
-        ) -> Task<Result<()>> {
-            self.inner.clone().close_session(session_id, cx)
         }
 
         fn supports_resume_session(&self) -> bool {
@@ -3014,6 +3053,35 @@ mod tests {
     }
 
     #[test]
+    fn session_directories_normalize_single_file_worktree_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let file_path = dir.join("file.txt");
+        std::fs::write(&file_path, "").unwrap();
+        let other_file_path = dir.join("other.txt");
+        std::fs::write(&other_file_path, "").unwrap();
+
+        // A file path as the first entry becomes its parent directory, and
+        // additional entries that normalize to the cwd are deduplicated.
+        let work_dirs = PathList::new(&[file_path.clone(), other_file_path, dir.clone()]);
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Without additional-directory support, only the cwd is normalized.
+        let work_dirs = PathList::new(&[file_path]);
+        let directories = session_directories_from_work_dirs(&work_dirs, false).unwrap();
+        assert_eq!(directories.cwd, dir);
+        assert_eq!(directories.additional_directories, Vec::<PathBuf>::new());
+
+        // Nonexistent paths (e.g. remote project paths) pass through untouched.
+        let missing = PathBuf::from("/nonexistent/remote/path");
+        let work_dirs = PathList::new(std::slice::from_ref(&missing));
+        let directories = session_directories_from_work_dirs(&work_dirs, true).unwrap();
+        assert_eq!(directories.cwd, missing);
+    }
+
+    #[test]
     fn cursor_client_capabilities_include_parameterized_model_picker_meta() {
         let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID));
         let meta = capabilities
@@ -3269,6 +3337,32 @@ mod tests {
     }
 
     #[test]
+    fn openable_session_fork_requires_fork_and_load_or_resume() {
+        let capabilities = |load_session: bool, fork: bool, resume: bool| {
+            acp::AgentCapabilities::new()
+                .load_session(load_session)
+                .session_capabilities(
+                    acp::SessionCapabilities::new()
+                        .fork(fork.then(acp::SessionForkCapabilities::new))
+                        .resume(resume.then(acp::SessionResumeCapabilities::new)),
+                )
+        };
+
+        assert!(!supports_openable_session_fork(&capabilities(
+            true, false, false
+        )));
+        assert!(!supports_openable_session_fork(&capabilities(
+            false, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            true, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            false, true, true
+        )));
+    }
+
+    #[test]
     fn session_directories_use_ordered_paths_when_supported() {
         let work_dirs = PathList::new(&[
             std::path::PathBuf::from("/workspace-b"),
@@ -3291,12 +3385,19 @@ mod tests {
         );
 
         let session_id = acp::SessionId::new("session-1");
+        let mcp_servers = vec![acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "test-server",
+            "/usr/bin/test-server",
+        ))];
         let new_session_request = directories.clone().into_new_session_request(Vec::new());
         let load_session_request = directories
             .clone()
             .into_load_session_request(session_id.clone(), Vec::new());
-        let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+        let resume_session_request = directories
+            .clone()
+            .into_resume_session_request(session_id.clone(), Vec::new());
+        let fork_session_request =
+            directories.into_fork_session_request(session_id.clone(), mcp_servers.clone());
 
         assert_eq!(
             new_session_request.cwd,
@@ -3317,6 +3418,13 @@ mod tests {
             resume_session_request.additional_directories,
             new_session_request.additional_directories
         );
+        assert_eq!(fork_session_request.session_id, session_id);
+        assert_eq!(fork_session_request.cwd, new_session_request.cwd);
+        assert_eq!(
+            fork_session_request.additional_directories,
+            new_session_request.additional_directories
+        );
+        assert_eq!(fork_session_request.mcp_servers, mcp_servers);
     }
 
     #[test]
@@ -4035,7 +4143,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_loaded_sessions_keep_state_until_last_close(cx: &mut gpui::TestAppContext) {
+    async fn test_loaded_sessions_keep_state_until_last_handle_drops(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (
             connection,
             project,
@@ -4085,36 +4195,30 @@ mod tests {
             "underlying ACP load_session should be called exactly once for concurrent loads"
         );
 
-        // The session has ref_count 2. The first close should not send the ACP
-        // close_session RPC — the session is still referenced.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .expect("first close failed");
+        drop(first_thread);
+        release_dropped_entities(cx);
 
         assert_eq!(
             close_count.load(Ordering::SeqCst),
             0,
-            "ACP close_session should not be sent while ref_count > 0"
+            "ACP close_session should not be sent while a thread handle is alive"
         );
         assert!(
             connection.sessions.borrow().contains_key(&session_id),
-            "session should still be tracked after first close"
+            "session should still be tracked while a thread handle is alive"
         );
 
-        // The second close drops ref_count to 0 — now the ACP RPC must be sent.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .expect("second close failed");
-        cx.run_until_parked();
+        drop(second_thread);
+        release_dropped_entities(cx);
 
         assert_eq!(
             close_count.load(Ordering::SeqCst),
             1,
-            "ACP close_session should be sent exactly once when ref_count reaches 0"
+            "ACP close_session should be sent exactly once when the last handle drops"
         );
         assert!(
             !connection.sessions.borrow().contains_key(&session_id),
-            "session should be removed after final close"
+            "session should be removed after the last handle drops"
         );
     }
 
@@ -4189,13 +4293,10 @@ mod tests {
         );
     }
 
-    // Regression test: if `close_session` is issued while a `load_session`
-    // RPC is still in flight, the close must take effect cleanly — the load
-    // must fail with a recognizable error (not return an orphaned thread),
-    // no entry must remain in `sessions` or `pending_sessions`, and the ACP
-    // `close_session` RPC must be dispatched.
     #[gpui::test]
-    async fn test_close_session_during_in_flight_load(cx: &mut gpui::TestAppContext) {
+    async fn test_dropping_loader_during_in_flight_load_closes_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (
             connection,
             project,
@@ -4246,24 +4347,19 @@ mod tests {
             "sessions entry should be pre-registered to receive replay notifications"
         );
 
-        // Close the session while the load is still parked. This should take
-        // the pending path and dispatch the ACP close RPC.
-        let close_task = cx.update(|cx| connection.clone().close_session(&session_id, cx));
+        drop(load_task);
+        cx.run_until_parked();
+        assert_eq!(
+            close_count.load(Ordering::SeqCst),
+            0,
+            "ACP close_session must not be sent while the load RPC is in flight"
+        );
 
         // Release the gate so the load RPC can finally respond.
         gate_tx.send(()).await.expect("gate send failed");
         drop(gate_tx);
-
-        let load_result = load_task.await;
-        close_task.await.expect("close failed");
         cx.run_until_parked();
-
-        let err = load_result.expect_err("load should fail after close-during-load");
-        assert!(
-            err.to_string()
-                .contains("session was closed before load completed"),
-            "expected close-during-load error, got: {err}"
-        );
+        release_dropped_entities(cx);
 
         assert_eq!(
             close_count.load(Ordering::SeqCst),
@@ -4272,26 +4368,19 @@ mod tests {
         );
         assert!(
             !connection.sessions.borrow().contains_key(&session_id),
-            "sessions entry should be removed after close-during-load"
+            "sessions entry should be removed once the loaded thread has no holders"
         );
         assert!(
             !connection
                 .pending_sessions
                 .borrow()
                 .contains_key(&session_id),
-            "pending_sessions entry should be removed after close-during-load"
+            "pending_sessions entry should be removed once the load resolves"
         );
     }
 
-    // Regression test: when two concurrent `load_session` calls share a pending
-    // task and one of them issues `close_session` before the load RPC
-    // resolves, the remaining load must still succeed and the session must
-    // stay live. If `close_session` incorrectly short-circuits via the
-    // `sessions` path (removing the entry while a load is still in flight),
-    // the pending task will fail and both concurrent loaders will lose
-    // their handle.
     #[gpui::test]
-    async fn test_close_during_load_preserves_other_concurrent_loader(
+    async fn test_dropping_one_loader_during_load_preserves_other_concurrent_loader(
         cx: &mut gpui::TestAppContext,
     ) {
         let (
@@ -4340,34 +4429,29 @@ mod tests {
             "load_session RPC should only be dispatched once for concurrent loads"
         );
 
-        // Close one of the two handles while the shared load is still parked.
-        // Because a second loader still holds a pending ref, this should be a
-        // no-op on the wire.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .expect("close during load failed");
+        drop(first_load);
+        cx.run_until_parked();
         assert_eq!(
             close_count.load(Ordering::SeqCst),
             0,
-            "close_session RPC must not be dispatched while another load handle remains"
+            "close_session RPC must not be dispatched while another loader remains"
         );
 
         // Release the gate so the load RPC can finally respond.
         gate_tx.send(()).await.expect("gate send failed");
         drop(gate_tx);
 
-        let first_thread = first_load.await.expect("first load should still succeed");
         let second_thread = second_load.await.expect("second load should still succeed");
         cx.run_until_parked();
 
         assert_eq!(
-            first_thread.entity_id(),
-            second_thread.entity_id(),
-            "concurrent loads should share one AcpThread"
+            close_count.load(Ordering::SeqCst),
+            0,
+            "close_session RPC must not be dispatched while a thread handle is alive"
         );
         assert!(
             connection.sessions.borrow().contains_key(&session_id),
-            "session must remain tracked while a load handle is still outstanding"
+            "session must remain tracked while a thread handle is alive"
         );
         assert!(
             !connection
@@ -4377,11 +4461,8 @@ mod tests {
             "pending_sessions entry should be cleared once the load resolves"
         );
 
-        // Final close drops ref_count to 0 and dispatches the ACP close RPC.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .expect("final close failed");
-        cx.run_until_parked();
+        drop(second_thread);
+        release_dropped_entities(cx);
         assert_eq!(
             close_count.load(Ordering::SeqCst),
             1,
@@ -4389,8 +4470,13 @@ mod tests {
         );
         assert!(
             !connection.sessions.borrow().contains_key(&session_id),
-            "session should be removed after final close"
+            "session should be removed after the last handle is released"
         );
+    }
+
+    fn release_dropped_entities(cx: &mut gpui::TestAppContext) {
+        cx.update(|_| ());
+        cx.run_until_parked();
     }
 }
 

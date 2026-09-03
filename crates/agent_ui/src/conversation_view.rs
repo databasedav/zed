@@ -1186,6 +1186,13 @@ impl ConversationView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
+                        // A load that replayed no history leaves the user in
+                        // the same place as a resume (e.g. a freshly forked
+                        // session whose transcript the agent hasn't written
+                        // yet), so show the same notice.
+                        if resume_session_id.is_some() && thread.read(cx).entries().is_empty() {
+                            resumed_without_history = true;
+                        }
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
                         let root_session_id = thread.read(cx).session_id().clone();
 
@@ -3700,7 +3707,9 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
-    use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
+    use gpui::{
+        ClipboardItem, EventEmitter, TestAppContext, UpdateGlobal, VisualTestContext, point, size,
+    };
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
@@ -4326,10 +4335,12 @@ pub(crate) mod tests {
                 "Conversation should transition to LoadError when an ACP thread exits"
             );
         });
+
+        release_dropped_entities(cx);
         assert_eq!(
             close_session_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "ConversationView should close the ACP session after a thread exit"
+            "dropping the thread views after a thread exit should close the ACP session"
         );
     }
 
@@ -5775,13 +5786,14 @@ pub(crate) mod tests {
 
     impl Render for ThreadViewItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            // Render the title editor in the element tree too. In the real app
-            // it is part of the agent panel
+            // Root titles live in the agent panel; subagent titles are already
+            // rendered by the thread view's own header.
             let title_editor = self
                 .0
                 .read(cx)
                 .active_thread()
-                .map(|t| t.read(cx).title_editor.clone());
+                .filter(|thread| thread.read(cx).parent_session_id.is_none())
+                .map(|thread| thread.read(cx).title_editor.clone());
 
             v_flex().children(title_editor).child(self.0.clone())
         }
@@ -6672,6 +6684,11 @@ pub(crate) mod tests {
     ) -> Entity<MessageEditor> {
         let thread = active_thread(conversation_view, cx);
         cx.read(|cx| thread.read(cx).message_editor.clone())
+    }
+
+    fn release_dropped_entities(cx: &mut VisualTestContext) {
+        cx.update(|_, _| ());
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -9948,6 +9965,109 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_thread_title_subagent_bindings(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let subagent_view = conversation_view.update_in(cx, |view, window, cx| {
+            let parent_session_id = view
+                .root_thread(cx)
+                .expect("root thread should exist")
+                .read(cx)
+                .session_id()
+                .clone();
+            let connected = view.as_connected().expect("agent should be connected");
+            let conversation = connected.conversation.clone();
+            let thread = create_test_acp_thread(
+                Some(parent_session_id),
+                "subagent",
+                connected.connection.clone(),
+                view.project.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            let subagent_view = view.new_thread_view(thread, conversation, false, None, window, cx);
+            let session_id = acp::SessionId::new("subagent");
+            view.as_connected_mut()
+                .expect("agent should be connected")
+                .threads
+                .insert(session_id.clone(), subagent_view.clone());
+            view.navigate_to_thread(session_id, window, cx);
+            subagent_view
+        });
+        add_to_workspace(conversation_view, cx);
+        let title_editor = subagent_view.update_in(cx, |view, window, cx| {
+            view.rename("Subagent title".into(), window, cx);
+            view.title_editor.clone()
+        });
+
+        for normal_mode in [None, Some("helix_normal"), Some("normal")] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.vim_mode = Some(normal_mode == Some("normal"));
+                        settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                    });
+                });
+            });
+            cx.run_until_parked();
+            cx.focus(&title_editor);
+
+            let assert_title_mode = |mode: Option<&str>, cx: &mut VisualTestContext| {
+                title_editor.update_in(cx, |editor, window, cx| {
+                    assert!(editor.is_focused(window));
+                    assert_eq!(
+                        editor
+                            .key_context(window, cx)
+                            .get("vim_mode")
+                            .map(|mode| mode.as_ref()),
+                        mode,
+                    );
+                    assert_eq!(editor.text(cx), "Subagent title");
+                });
+            };
+            assert_title_mode(normal_mode, cx);
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("i");
+                assert_title_mode(Some("insert"), cx);
+                cx.simulate_keystrokes("escape");
+                assert_title_mode(normal_mode, cx);
+            }
+
+            for keystroke in ["enter", "escape"] {
+                cx.focus(&title_editor);
+                cx.simulate_keystrokes(keystroke);
+                subagent_view.update_in(cx, |view, window, cx| {
+                    assert!(view.focus_handle(cx).is_focused(window));
+                    assert!(!view.title_editor.read(cx).is_focused(window));
+                    assert_eq!(view.title_editor.read(cx).text(cx), "Subagent title");
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn test_manually_editing_title_updates_acp_thread_title(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -10853,6 +10973,111 @@ pub(crate) mod tests {
             text, "existing content\n\nqueued message",
             "Main editor should have existing content and queued message separated by two newlines"
         );
+    }
+
+    #[gpui::test]
+    async fn test_message_editor_arrow_keys_do_not_scroll_output(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default keymap should load");
+            cx.bind_keys(bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response paragraph.\n\n".repeat(100).into()),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Hello", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let editor = message_editor.read_with(cx, |editor, _| editor.editor().clone());
+        cx.focus(&message_editor);
+
+        let output_scroll_position = |cx: &TestAppContext| {
+            thread_view.read_with(cx, |view, _| {
+                let offset = view.list_state.logical_scroll_top();
+                (offset.item_ix, offset.offset_in_item)
+            })
+        };
+
+        for (text, end) in [
+            ("", text::Point::new(0, 0)),
+            ("line", text::Point::new(0, 4)),
+            ("first\nsecond\nthird", text::Point::new(2, 5)),
+        ] {
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.set_cursor_offset(0, window, cx);
+            });
+            cx.run_until_parked();
+            thread_view.update(cx, |view, cx| {
+                view.scroll_to_top(cx);
+                view.list_state.scroll_by(px(400.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let scroll_top = output_scroll_position(cx);
+            assert_ne!(scroll_top, (0, px(0.)));
+
+            for keystrokes in ["up up", "down down down down", "up up up up"] {
+                cx.simulate_keystrokes(keystrokes);
+                cx.run_until_parked();
+                assert_eq!(
+                    output_scroll_position(cx),
+                    scroll_top,
+                    "{keystrokes:?} must not scroll output with input {text:?}",
+                );
+                editor.update_in(cx, |editor, window, cx| {
+                    let cursor = editor
+                        .selections
+                        .newest::<text::Point>(&editor.snapshot(window, cx))
+                        .head();
+                    assert_eq!(
+                        cursor,
+                        if keystrokes.starts_with("down") {
+                            end
+                        } else {
+                            text::Point::new(0, 0)
+                        }
+                    );
+                });
+            }
+
+            cx.simulate_keystrokes("ctrl-alt-up");
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "explicit output-scroll shortcuts should still work from the input",
+            );
+        }
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        for keystroke in ["up", "down"] {
+            let scroll_top = output_scroll_position(cx);
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "{keystroke} should still scroll when output is focused",
+            );
+        }
     }
 
     #[gpui::test]

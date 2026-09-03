@@ -899,12 +899,19 @@ impl ThreadView {
             .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
+                Self::configure_title_editor(&mut editor, cx);
+                editor.set_use_modal_editing(true);
                 editor.set_text(initial_title, window, cx);
                 editor
             });
             subscriptions.push(cx.subscribe_in(&editor, window, Self::handle_title_editor_event));
             editor
         };
+
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            this.title_editor.update(cx, Self::configure_title_editor);
+            cx.notify();
+        }));
 
         subscriptions.push(cx.subscribe_in(
             &entry_view_state,
@@ -2408,12 +2415,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Consume boundary movement so the keystroke cannot fall back to scrolling output.
         if !self.message_editor.read(cx).is_empty(cx) {
-            cx.propagate();
             return;
         }
         let Some(last_id) = self.message_queue.last_id() else {
-            cx.propagate();
             return;
         };
         self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
@@ -2439,6 +2445,31 @@ impl ThreadView {
         self.editor_expanded = is_expanded;
         self.sync_editor_mode(cx);
         cx.notify();
+    }
+
+    fn configure_title_editor(editor: &mut Editor, cx: &mut Context<Editor>) {
+        let max_lines = AgentSettings::get_global(cx).thread_title_max_lines;
+        let expand = max_lines != Some(1);
+        let mode = if expand {
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines,
+            }
+        } else {
+            EditorMode::SingleLine
+        };
+        if editor.mode() != &mode {
+            editor.set_mode(mode, cx);
+            editor.set_soft_wrap_mode(
+                if expand {
+                    language::language_settings::SoftWrap::EditorWidth
+                } else {
+                    language::language_settings::SoftWrap::None
+                },
+                cx,
+            );
+            editor.set_offset_content(expand, cx);
+        }
     }
 
     pub fn handle_title_editor_event(
@@ -4304,12 +4335,21 @@ impl ThreadView {
         let is_done = thread.read(cx).status() == ThreadStatus::Idle;
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let settings = AgentSettings::get_global(cx);
+        let max_content_width = settings.max_content_width;
+        let title_wraps = settings.thread_title_max_lines != Some(1);
 
         Some(
             h_flex()
                 .w_full()
-                .h(Tab::container_height(cx))
+                .map(|this| {
+                    if title_wraps {
+                        this.min_h(Tab::container_height(cx))
+                    } else {
+                        this.h(Tab::container_height(cx))
+                    }
+                })
+                .flex_shrink_0()
                 .border_b_1()
                 .when(is_done && is_canceled_or_failed, |this| {
                     this.border_dashed()
@@ -4318,7 +4358,13 @@ impl ThreadView {
                 .bg(cx.theme().colors().editor_background.opacity(0.2))
                 .child(
                     h_flex()
-                        .size_full()
+                        .map(|this| {
+                            if title_wraps {
+                                this.w_full().py(DynamicSpacing::Base04.rems(cx))
+                            } else {
+                                this.size_full()
+                            }
+                        })
                         .when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto())
                         .pl_2()
                         .pr_1()
@@ -4327,14 +4373,24 @@ impl ThreadView {
                         .gap_1()
                         .child(
                             h_flex()
+                                .key_context("TitleEditor")
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    this.activation_focus_handle(cx).focus(window, cx);
+                                }))
+                                .on_action(cx.listener(
+                                    |this, _: &editor::actions::Cancel, window, cx| {
+                                        this.activation_focus_handle(cx).focus(window, cx);
+                                    },
+                                ))
                                 .flex_1()
+                                .min_w_0()
                                 .gap_2()
                                 .child(
                                     Icon::new(IconName::ForwardArrowUp)
                                         .size(IconSize::Small)
                                         .color(Color::Muted),
                                 )
-                                .child(self.title_editor.clone())
+                                .child(div().flex_1().min_w_0().child(self.title_editor.clone()))
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(Icon::new(IconName::Close).color(Color::Error))
                                 })
@@ -4405,6 +4461,7 @@ impl ThreadView {
             .bg(editor_bg_color)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .on_action(|_: &zed_actions::editor::MoveDown, _, cx| cx.stop_propagation())
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
@@ -12205,7 +12262,7 @@ impl ThreadView {
     }
 
     fn render_resume_notice(_cx: &Context<Self>) -> AnyElement {
-        let description = "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.";
+        let description = "Previous messages can't be displayed right now. However, your session will still continue from where you last left off.";
 
         Callout::new()
             .border_position(CalloutBorderPosition::Bottom)

@@ -1686,6 +1686,37 @@ impl AgentPanel {
         &self.connection_store
     }
 
+    /// Creates a new session for the given agent that shares the source
+    /// session's conversation history, connecting to the agent first if
+    /// necessary. Returns the forked session's id without opening it.
+    pub fn fork_thread(
+        &mut self,
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        work_dirs: PathList,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<acp::SessionId>> {
+        let agent = Agent::from(agent_id);
+        let agent_label = agent.label();
+        let server = agent.server(self.fs.clone(), self.thread_store.clone());
+        let connection_entry = self
+            .connection_store
+            .update(cx, |store, cx| store.request_connection(agent, server, cx));
+        let connect_task = connection_entry.read(cx).wait_for_connection();
+        let project = self.project.clone();
+        cx.spawn(async move |_this, cx| {
+            let connected = connect_task.await?;
+            let fork_task = cx.update(|cx| {
+                connected
+                    .connection
+                    .fork(&session_id, cx)
+                    .map(|fork| fork.run(project, work_dirs, cx))
+                    .ok_or_else(|| anyhow!("Forking threads is not supported by {agent_label}"))
+            })?;
+            fork_task.await
+        })
+    }
+
     pub fn selected_agent(&self, cx: &App) -> Agent {
         if self.project.read(cx).is_via_collab() {
             Agent::NativeAgent
@@ -5438,6 +5469,7 @@ impl AgentPanel {
                     } else {
                         let editable_title = div()
                             .flex_1()
+                            .min_w_0()
                             .on_action({
                                 let conversation_view = conversation_view.downgrade();
                                 move |_: &menu::Confirm, window, cx| {
@@ -5548,13 +5580,15 @@ impl AgentPanel {
             VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
         };
 
+        let title_wraps = matches!(self.visible_surface(), VisibleSurface::AgentThread(_))
+            && AgentSettings::get_global(cx).thread_title_max_lines != Some(1);
         let toolbar_bg = cx.theme().colors().tab_bar_background;
         let gradient_overlay = GradientFade::new(toolbar_bg, toolbar_bg, toolbar_bg)
             .width(px(64.0))
             .right(px(0.0))
             .gradient_stop(0.75);
         // The fade gradient renders as a visible patch on transparent windows
-        // (the title already truncates).
+        // (the terminal title already truncates).
         let opaque_window =
             cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
 
@@ -5566,22 +5600,25 @@ impl AgentPanel {
             .min_w_0()
             .max_w_full()
             .overflow_x_hidden()
+            .when(title_wraps, |this| this.pr_6())
             .child(content)
             .when(self.should_show_title_edit(window, cx), |this| {
-                this.when(opaque_window, |this| this.child(gradient_overlay))
-                    .child(
-                        h_flex()
-                            .visible_on_hover("title_editor")
-                            .absolute()
-                            .right_0()
-                            .h_full()
-                            .bg(cx.theme().colors().tab_bar_background)
-                            .child(
-                                IconButton::new("edit_tile", IconName::Pencil)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Edit Thread Title")),
-                            ),
-                    )
+                this.when(opaque_window && !title_wraps, |this| {
+                    this.child(gradient_overlay)
+                })
+                .child(
+                    h_flex()
+                        .visible_on_hover("title_editor")
+                        .absolute()
+                        .right_0()
+                        .h_full()
+                        .bg(cx.theme().colors().tab_bar_background)
+                        .child(
+                            IconButton::new("edit_tile", IconName::Pencil)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Edit Thread Title")),
+                        ),
+                )
             })
             .into_any()
     }
@@ -6158,8 +6195,16 @@ impl AgentPanel {
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
+        let title_wraps = matches!(mode, ToolbarMode::ActiveThread)
+            && AgentSettings::get_global(cx).thread_title_max_lines != Some(1);
         let base_container = h_flex()
-            .size_full()
+            .map(|this| {
+                if title_wraps {
+                    this.w_full().py(DynamicSpacing::Base04.rems(cx))
+                } else {
+                    this.size_full()
+                }
+            })
             .when(
                 matches!(mode, ToolbarMode::EmptyThread | ToolbarMode::ActiveThread),
                 |this| this.when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto()),
@@ -6205,7 +6250,7 @@ impl AgentPanel {
                 .child(
                     h_flex()
                         .relative()
-                        .h_full()
+                        .when(!title_wraps, |this| this.h_full())
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
@@ -6220,7 +6265,7 @@ impl AgentPanel {
                 .child(
                     h_flex()
                         .px_1()
-                        .h_full()
+                        .when(!title_wraps, |this| this.h_full())
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
@@ -6233,7 +6278,13 @@ impl AgentPanel {
 
         h_flex()
             .id("agent-panel-toolbar")
-            .h(Tab::container_height(cx))
+            .map(|this| {
+                if title_wraps {
+                    this.min_h(Tab::container_height(cx))
+                } else {
+                    this.h(Tab::container_height(cx))
+                }
+            })
             .flex_shrink_0()
             .max_w_full()
             .bg(cx.theme().colors().tab_bar_background)
@@ -10283,6 +10334,310 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_thread_title_wrapping_preserves_other_toolbar_heights(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        for terminal in [false, true] {
+            if terminal {
+                panel
+                    .update_in(&mut cx, |panel, window, cx| {
+                        panel.insert_test_terminal("Dev Server", true, window, cx)
+                    })
+                    .expect("test terminal should be inserted");
+                cx.run_until_parked();
+            }
+            for density in [
+                settings::UiDensity::Compact,
+                settings::UiDensity::Default,
+                settings::UiDensity::Comfortable,
+            ] {
+                cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |content| {
+                            content.theme.ui_density = Some(density);
+                        });
+                    });
+                });
+                let (_, hitbox) = cx.draw(
+                    Default::default(),
+                    size(px(400.), px(600.)),
+                    |window, cx| {
+                        v_flex()
+                            .w_full()
+                            .occlude()
+                            .child(panel.update(cx, |panel, cx| {
+                                panel.render_toolbar(window, cx).into_any_element()
+                            }))
+                    },
+                );
+                assert_eq!(
+                    hitbox
+                        .expect("toolbar should have a hitbox")
+                        .bounds
+                        .size
+                        .height,
+                    cx.read(Tab::container_height),
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_wraps_and_resizes_header(cx: &mut TestAppContext) {
+        assert_thread_title_line_limit(Some(3), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_initially_single_line(cx: &mut TestAppContext) {
+        assert_thread_title_line_limit(Some(1), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_initially_unlimited(cx: &mut TestAppContext) {
+        assert_thread_title_line_limit(None, cx).await;
+    }
+
+    async fn assert_thread_title_line_limit(
+        initial_max_lines: Option<usize>,
+        cx: &mut TestAppContext,
+    ) {
+        fn draw_toolbar(
+            panel: &Entity<AgentPanel>,
+            title_editor: &Entity<Editor>,
+            width: f32,
+            cx: &mut VisualTestContext,
+        ) -> (gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>) {
+            let (_, hitbox) = cx.draw(
+                Default::default(),
+                size(px(width), px(600.)),
+                |window, cx| {
+                    v_flex()
+                        .w_full()
+                        .occlude()
+                        .child(panel.update(cx, |panel, cx| {
+                            panel.render_toolbar(window, cx).into_any_element()
+                        }))
+                },
+            );
+            let toolbar_bounds = hitbox.expect("toolbar should have a hitbox").bounds;
+            let editor_bounds = title_editor.read_with(cx, |editor, _| {
+                *editor
+                    .last_bounds()
+                    .expect("title editor should be laid out")
+            });
+            assert!(editor_bounds.is_contained_within(&toolbar_bounds));
+            (toolbar_bounds, editor_bounds)
+        }
+
+        let (panel, mut cx) = setup_panel(cx).await;
+        let set_line_limit = |max_lines: Option<usize>, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        content.agent.get_or_insert_default().thread_title_max_lines =
+                            Some(match max_lines {
+                                Some(lines) => settings::ThreadTitleMaxLines::Limited(
+                                    std::num::NonZeroUsize::new(lines)
+                                        .expect("line limit should be positive"),
+                                ),
+                                None => settings::ThreadTitleMaxLines::Unlimited,
+                            });
+                    });
+                });
+            });
+            cx.run_until_parked();
+        };
+        set_line_limit(initial_max_lines, &mut cx);
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let (thread, title_editor) = thread_view.read_with(&cx, |view, _| {
+            (view.thread.clone(), view.title_editor.clone())
+        });
+        let update_title = |title: &str, cx: &mut VisualTestContext| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::SessionInfoUpdate(
+                            acp::SessionInfoUpdate::new().title(title),
+                        ),
+                        cx,
+                    )
+                    .expect("title update should succeed");
+            });
+            cx.run_until_parked();
+            title_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), title));
+        };
+
+        title_editor.read_with(&cx, |editor, _| {
+            let expected_mode = match initial_max_lines {
+                Some(1) => editor::EditorMode::SingleLine,
+                max_lines => editor::EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines,
+                },
+            };
+            assert_eq!(editor.mode(), &expected_mode);
+        });
+        if initial_max_lines == Some(1) {
+            update_title(
+                "A long incoming title that must remain on a single line",
+                &mut cx,
+            );
+            let (toolbar, _) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+            assert_eq!(toolbar.size.height, cx.read(Tab::container_height));
+        }
+        set_line_limit(Some(3), &mut cx);
+
+        update_title("Short title", &mut cx);
+        let (short_toolbar, short_editor) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+        let line_height = short_editor.size.height;
+
+        update_title(
+            "Investigate why agent thread titles are clipped in narrow panels",
+            &mut cx,
+        );
+        let (wrapped_toolbar, wrapped_editor) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+        assert!(wrapped_editor.size.height > line_height);
+        assert!(wrapped_toolbar.size.height > short_toolbar.size.height);
+        assert_eq!(wrapped_editor.size.width, short_editor.size.width);
+
+        let (wide_toolbar, wide_editor) = draw_toolbar(&panel, &title_editor, 1100., &mut cx);
+        assert_eq!(wide_editor.size.height, line_height);
+        assert_eq!(wide_toolbar.size.height, short_toolbar.size.height);
+
+        update_title(&"Very long thread title ".repeat(100), &mut cx);
+        let (bounded_toolbar, bounded_editor) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+        assert_eq!(bounded_editor.size.height, line_height * 3.);
+        assert!(bounded_toolbar.size.height >= bounded_editor.size.height);
+
+        update_title(&"x".repeat(200), &mut cx);
+        let (_, unbroken_editor) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+        assert_eq!(unbroken_editor.size.height, line_height * 3.);
+        assert_eq!(unbroken_editor.size.width, short_editor.size.width);
+
+        update_title("Short again", &mut cx);
+        let (shrunk_toolbar, shrunk_editor) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+        assert_eq!(shrunk_editor.size.height, line_height);
+        assert_eq!(shrunk_toolbar.size.height, short_toolbar.size.height);
+
+        let multiline_title = "First line\nSecond line\nThird line\nFourth line\nFifth line\nSixth line\nSeventh line";
+        update_title(multiline_title, &mut cx);
+        cx.focus(&title_editor);
+        for max_lines in [Some(1), Some(2), Some(6), None, Some(3), Some(1), None] {
+            set_line_limit(max_lines, &mut cx);
+            let (toolbar, editor_bounds) = draw_toolbar(&panel, &title_editor, 400., &mut cx);
+            assert_eq!(
+                editor_bounds.size.height,
+                line_height * max_lines.unwrap_or(7).min(7) as f32,
+            );
+            if max_lines == Some(1) {
+                assert_eq!(toolbar.size.height, cx.read(Tab::container_height));
+            }
+            thread_view.read_with(&cx, |view, _| {
+                assert_eq!(view.title_editor, title_editor);
+            });
+            title_editor.update_in(&mut cx, |editor, window, cx| {
+                assert_eq!(editor.mode().is_single_line(), max_lines == Some(1));
+                assert_eq!(editor.text(cx), multiline_title);
+                assert!(editor.is_focused(window));
+            });
+        }
+
+        let thread_id = active_thread_id(&panel, &cx);
+        cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let metadata = store
+                .read(cx)
+                .entry(thread_id)
+                .expect("thread metadata should exist");
+            assert!(metadata.title_override.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_editing_preserves_save_and_enter_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_, cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default keymap should load");
+            cx.bind_keys(bindings);
+        });
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        let thread_id = active_thread_id(&panel, &cx);
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be active")
+        });
+        let (thread, title_editor) = thread_view.read_with(&cx, |view, _| {
+            (view.thread.clone(), view.title_editor.clone())
+        });
+
+        for (title, paste) in [
+            (
+                "A custom thread title that should wrap without inserting any newlines",
+                false,
+            ),
+            (
+                "First line\nSecond line\nThird line\nFourth line\nFifth line\nSixth line",
+                true,
+            ),
+        ] {
+            cx.focus(&title_editor);
+            title_editor.update_in(&mut cx, |editor, window, cx| {
+                editor.select_all(&editor::actions::SelectAll, window, cx);
+                if paste {
+                    editor.paste_item(&ClipboardItem::new_string(title.to_string()), window, cx);
+                }
+            });
+            if !paste {
+                cx.simulate_input(title);
+            }
+            cx.run_until_parked();
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+
+            title_editor.update_in(&mut cx, |editor, window, cx| {
+                assert_eq!(editor.text(cx), title);
+                assert!(!editor.is_focused(window));
+            });
+            thread.read_with(&cx, |thread, _| {
+                assert_eq!(thread.title().as_deref(), Some(title));
+            });
+            cx.read(|cx| {
+                let store = ThreadMetadataStore::global(cx);
+                assert_eq!(
+                    store
+                        .read(cx)
+                        .entry(thread_id)
+                        .and_then(|entry| entry.title_override.as_deref()),
+                    Some(title),
+                );
+            });
+        }
+
+        thread_view.update_in(&mut cx, |view, window, cx| {
+            view.rename("Renamed from the sidebar".into(), window, cx);
+        });
+        cx.run_until_parked();
+        title_editor.read_with(&cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "Renamed from the sidebar");
+        });
+    }
+
+    #[gpui::test]
     async fn test_title_edit_affordance_matches_threads_and_terminals(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
 
@@ -11590,6 +11945,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            action_log: action_log::SerializedActionLog::default(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));
@@ -13598,6 +13954,149 @@ mod tests {
             );
         });
     }
+    #[gpui::test]
+    async fn test_thread_title_helix_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(Some("helix_normal"), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_vim_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(Some("normal"), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_non_modal_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(None, cx).await;
+    }
+
+    async fn assert_thread_title_editing(normal_mode: Option<&str>, cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel_with_sidebar(cx, false).await;
+        cx.update(|_, cx| {
+            vim::init(cx);
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.vim_mode = Some(normal_mode == Some("normal"));
+                    settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                });
+            });
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel.active_thread_view(cx).expect("thread should be open")
+        });
+        let (title_editor, message_editor) = thread_view.update_in(&mut cx, |view, window, cx| {
+            view.rename("Original title".into(), window, cx);
+            (
+                view.title_editor.clone(),
+                view.message_editor.read(cx).editor().clone(),
+            )
+        });
+        cx.focus(&title_editor);
+
+        let assert_title_mode = |mode: Option<&str>, cx: &mut VisualTestContext| {
+            title_editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.use_modal_editing());
+                assert!(editor.is_focused(window));
+                assert_eq!(
+                    editor
+                        .key_context(window, cx)
+                        .get("vim_mode")
+                        .map(|mode| mode.as_ref()),
+                    mode,
+                );
+            });
+        };
+        let assert_message_focused = |cx: &mut VisualTestContext| {
+            message_editor.update_in(cx, |editor, window, _| {
+                assert!(editor.is_focused(window));
+            });
+        };
+        assert_title_mode(normal_mode, &mut cx);
+
+        match normal_mode {
+            Some("helix_normal") => cx.simulate_keystrokes("% c"),
+            Some(_) => cx.simulate_keystrokes("shift-s"),
+            None => cx.simulate_keystrokes("ctrl-a"),
+        }
+        assert_title_mode(normal_mode.map(|_| "insert"), &mut cx);
+        cx.simulate_input("Renamed thread");
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |view, cx| {
+            assert_eq!(view.title_editor.read(cx).text(cx), "Renamed thread");
+            assert_eq!(view.thread.read(cx).title(), Some("Renamed thread".into()));
+        });
+
+        if let Some(normal_mode) = normal_mode {
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+
+            cx.simulate_keystrokes("v h");
+            assert_title_mode(
+                Some(if normal_mode == "helix_normal" {
+                    "helix_select"
+                } else {
+                    "visual"
+                }),
+                &mut cx,
+            );
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+
+            cx.simulate_keystrokes("f");
+            assert_title_mode(Some("waiting"), &mut cx);
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+        }
+
+        cx.simulate_keystrokes("enter");
+        assert_message_focused(&mut cx);
+
+        cx.focus(&title_editor);
+        if normal_mode.is_some() {
+            cx.simulate_keystrokes("i");
+            assert_title_mode(Some("insert"), &mut cx);
+        }
+        cx.simulate_keystrokes("enter");
+        assert_message_focused(&mut cx);
+
+        cx.focus(&title_editor);
+        if normal_mode.is_some() {
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(normal_mode, &mut cx);
+        }
+        cx.simulate_keystrokes("escape");
+        assert_message_focused(&mut cx);
+        thread_view.read_with(&cx, |view, cx| {
+            assert_eq!(view.title_editor.read(cx).text(cx), "Renamed thread");
+            assert_eq!(view.thread.read(cx).title(), Some("Renamed thread".into()));
+            assert!(
+                view.message_editor
+                    .read(cx)
+                    .editor()
+                    .read(cx)
+                    .text(cx)
+                    .is_empty()
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_vim_search_does_not_steal_focus_from_agent_panel(cx: &mut TestAppContext) {
         init_test(cx);

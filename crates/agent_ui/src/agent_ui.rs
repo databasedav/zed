@@ -233,6 +233,8 @@ actions!(
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
+        /// Forks the currently selected thread.
+        ForkSelectedThread,
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.
@@ -983,6 +985,7 @@ mod tests {
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
+            thread_title_max_lines: None,
             default_model: None,
             subagent_model: None,
             inline_assistant_model: None,
@@ -1017,6 +1020,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            reasoning_summary: None,
         };
 
         cx.update(|cx| {

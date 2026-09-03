@@ -4012,11 +4012,14 @@ async fn test_exclude_overscroll_margin_clamps_scroll_position(cx: &mut TestAppC
     let mut cx = EditorTestContext::new(cx).await;
 
     let line_height = cx.update_editor(|editor, window, cx| {
-        editor.set_mode(EditorMode::Full {
-            scale_ui_elements_with_buffer_font_size: false,
-            show_active_line_background: false,
-            sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-        });
+        editor.set_mode(
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: false,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            },
+            cx,
+        );
         editor
             .style(cx)
             .text
@@ -8281,6 +8284,16 @@ async fn test_manipulate_text(cx: &mut TestAppContext) {
     cx.update_editor(|e, window, cx| e.convert_to_snake_case(&ConvertToSnakeCase, window, cx));
     cx.assert_editor_state(indoc! {"
         «    hello_world\t\tˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «hello world
+        ˇ»goodbye
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_snake_case(&ConvertToSnakeCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «hello_world
+        ˇ»goodbye
     "});
 
     // Test selections with `line_mode() = true`.
@@ -38998,6 +39011,129 @@ async fn test_newline_replacement_in_single_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_switching_single_line_mode_preserves_text_and_folds(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| Editor::auto_height(1, 4, window, cx));
+    cx.focus(&editor);
+    let buffer = editor.read_with(cx, |editor, _| editor.buffer().clone());
+    let text = "one\n\ntwo\n";
+    let auto_height = EditorMode::AutoHeight {
+        min_lines: 1,
+        max_lines: Some(4),
+    };
+    editor.update_in(cx, |editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_string(text.to_string()), window, cx);
+    });
+
+    for mode in [
+        EditorMode::SingleLine,
+        auto_height.clone(),
+        EditorMode::SingleLine,
+        auto_height.clone(),
+    ] {
+        editor.update(cx, |editor, cx| editor.set_mode(mode.clone(), cx));
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            assert_eq!(editor.mode(), &mode);
+            assert_eq!(editor.text(cx), text);
+            assert_eq!(editor.buffer(), &buffer);
+            assert!(editor.is_focused(window));
+            assert_eq!(
+                editor.selections.ranges(&editor.display_snapshot(cx)),
+                vec![MultiBufferOffset(text.len())..MultiBufferOffset(text.len())],
+            );
+            assert_eq!(
+                editor.display_text(cx),
+                if mode.is_single_line() {
+                    "one⋯⋯two⋯"
+                } else {
+                    text
+                },
+            );
+        });
+    }
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.fold_ranges(
+            vec![MultiBufferOffset(0)..MultiBufferOffset(3)],
+            false,
+            window,
+            cx,
+        );
+        editor.set_mode(EditorMode::SingleLine, cx);
+    });
+    cx.run_until_parked();
+    editor.update(cx, |editor, cx| {
+        assert_eq!(editor.display_snapshot(cx).fold_count(), 4);
+        editor.set_mode(auto_height, cx);
+        assert_eq!(editor.display_snapshot(cx).fold_count(), 1);
+        assert_eq!(editor.display_text(cx), "⋯\n\ntwo\n");
+        assert_eq!(editor.text(cx), text);
+    });
+    editor.update_in(cx, |editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        assert_eq!(editor.text(cx), "");
+        editor.redo(&Redo, window, cx);
+        assert_eq!(editor.text(cx), text);
+        assert!(editor.is_focused(window));
+    });
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_switching_single_line_mode_cancels_pending_folds(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| Editor::auto_height(1, 4, window, cx));
+    let text = "one\n\ntwo\n";
+    let auto_height = EditorMode::AutoHeight {
+        min_lines: 1,
+        max_lines: Some(4),
+    };
+    editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+    cx.run_until_parked();
+
+    for final_mode in [auto_height.clone(), EditorMode::SingleLine] {
+        editor.update(cx, |editor, cx| {
+            // Keep every transition in one update so no folding task can finish between them.
+            for mode in [
+                EditorMode::SingleLine,
+                auto_height.clone(),
+                EditorMode::SingleLine,
+                auto_height.clone(),
+                final_mode.clone(),
+                final_mode.clone(),
+            ] {
+                editor.set_mode(mode, cx);
+            }
+        });
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.mode(), &final_mode);
+            assert_eq!(editor.text(cx), text);
+            assert_eq!(
+                editor.display_text(cx),
+                if final_mode.is_single_line() {
+                    "one⋯⋯two⋯"
+                } else {
+                    text
+                },
+            );
+        });
+    }
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_mode(auto_height, cx);
+        editor.set_mode(EditorMode::SingleLine, cx);
+        editor.set_text("plain", window, cx);
+    });
+    cx.run_until_parked();
+    editor.update(cx, |editor, cx| {
+        assert_eq!(editor.text(cx), "plain");
+        assert_eq!(editor.display_text(cx), "plain");
+        assert_eq!(editor.display_snapshot(cx).fold_count(), 0);
+    });
+}
+
+#[gpui::test]
 async fn test_non_utf_8_opens(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -40211,47 +40347,56 @@ async fn test_end_of_editor_context(cx: &mut TestAppContext) {
 
     cx.set_state("line1\nline2ˇ");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::SingleLine);
+        e.set_mode(EditorMode::SingleLine, cx);
         assert!(!e.key_context(window, cx).contains("start_of_input"));
         assert!(e.key_context(window, cx).contains("end_of_input"));
     });
     cx.set_state("ˇline1\nline2");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::SingleLine);
+        e.set_mode(EditorMode::SingleLine, cx);
         assert!(e.key_context(window, cx).contains("start_of_input"));
         assert!(!e.key_context(window, cx).contains("end_of_input"));
     });
     cx.set_state("line1ˇ\nline2");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::SingleLine);
+        e.set_mode(EditorMode::SingleLine, cx);
         assert!(!e.key_context(window, cx).contains("start_of_input"));
         assert!(!e.key_context(window, cx).contains("end_of_input"));
     });
 
     cx.set_state("line1\nline2ˇ");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::AutoHeight {
-            min_lines: 1,
-            max_lines: Some(4),
-        });
+        e.set_mode(
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: Some(4),
+            },
+            cx,
+        );
         assert!(!e.key_context(window, cx).contains("start_of_input"));
         assert!(e.key_context(window, cx).contains("end_of_input"));
     });
     cx.set_state("ˇline1\nline2");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::AutoHeight {
-            min_lines: 1,
-            max_lines: Some(4),
-        });
+        e.set_mode(
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: Some(4),
+            },
+            cx,
+        );
         assert!(e.key_context(window, cx).contains("start_of_input"));
         assert!(!e.key_context(window, cx).contains("end_of_input"));
     });
     cx.set_state("line1ˇ\nline2");
     cx.update_editor(|e, window, cx| {
-        e.set_mode(EditorMode::AutoHeight {
-            min_lines: 1,
-            max_lines: Some(4),
-        });
+        e.set_mode(
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: Some(4),
+            },
+            cx,
+        );
         assert!(!e.key_context(window, cx).contains("start_of_input"));
         assert!(!e.key_context(window, cx).contains("end_of_input"));
     });

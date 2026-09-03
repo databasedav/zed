@@ -20,10 +20,10 @@ use http_client::StatusCode;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelCostInfo, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelToolChoice, LanguageModelToolResultContent,
-    LanguageModelToolUse, MessageContent, ProviderErrorCategory, RateLimiter, Role, StopReason,
-    TokenUsage,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelReasoningSummary,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolChoice,
+    LanguageModelToolResultContent, LanguageModelToolUse, MessageContent, ProviderErrorCategory,
+    RateLimiter, Role, StopReason, TokenUsage,
 };
 use util::debug_panic;
 
@@ -1075,6 +1075,7 @@ fn into_copilot_responses(
         temperature,
         thinking_allowed,
         thinking_effort,
+        reasoning_summary,
         speed: _,
         compact_at_tokens: _,
     } = request;
@@ -1262,9 +1263,20 @@ fn into_copilot_responses(
                 .as_deref()
                 .and_then(|e| e.parse::<copilot_responses::ReasoningEffort>().ok())
                 .unwrap_or(copilot_responses::ReasoningEffort::Medium);
+            let summary = match reasoning_summary {
+                Some(LanguageModelReasoningSummary::Auto) => {
+                    copilot_responses::ReasoningSummary::Auto
+                }
+                Some(LanguageModelReasoningSummary::Concise) => {
+                    copilot_responses::ReasoningSummary::Concise
+                }
+                Some(LanguageModelReasoningSummary::Detailed) | None => {
+                    copilot_responses::ReasoningSummary::Detailed
+                }
+            };
             Some(copilot_responses::ReasoningConfig {
                 effort,
-                summary: Some(copilot_responses::ReasoningSummary::Detailed),
+                summary: Some(summary),
             })
         } else {
             None
@@ -1521,6 +1533,28 @@ mod tests {
                 ]
             })]
         );
+    }
+
+    #[test]
+    fn into_copilot_responses_uses_configured_reasoning_summary() {
+        let model = test_responses_model();
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            reasoning_summary: Some(LanguageModelReasoningSummary::Concise),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_value(into_copilot_responses(&model, request).unwrap())
+            .expect("serialized request");
+        assert_eq!(serialized["reasoning"]["summary"], "concise");
+
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(into_copilot_responses(&model, request).unwrap())
+            .expect("serialized request");
+        assert_eq!(serialized["reasoning"]["summary"], "detailed");
     }
 
     #[test]

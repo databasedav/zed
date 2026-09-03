@@ -698,6 +698,27 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
+    pub fn save_durable(
+        &mut self,
+        metadata: ThreadMetadata,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let save_task = cx.background_spawn({
+            let db = self.db.clone();
+            let metadata = metadata.clone();
+            async move { db.save(metadata).await }
+        });
+
+        cx.spawn(async move |this, cx| {
+            save_task.await?;
+            this.update(cx, |this, cx| {
+                this.update_cached_metadata(metadata);
+                cx.notify();
+            })?;
+            Ok(())
+        })
+    }
+
     /// Set or clear the user-supplied title for a thread.
     pub fn set_title_override(
         &mut self,
@@ -739,6 +760,13 @@ impl ThreadMetadataStore {
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
+        self.update_cached_metadata(metadata.clone());
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::Upsert(metadata))
+            .log_err();
+    }
+
+    fn update_cached_metadata(&mut self, metadata: ThreadMetadata) {
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
@@ -757,10 +785,7 @@ impl ThreadMetadataStore {
             }
         }
 
-        self.cache_thread_metadata(metadata.clone());
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Upsert(metadata))
-            .log_err();
+        self.cache_thread_metadata(metadata);
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
@@ -1279,8 +1304,17 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
-        let is_draft = thread_ref.is_draft_thread();
         let existing_thread = self.entry(thread_id);
+        // An empty thread re-hosting the session its row already recorded
+        // (e.g. a fork, or a session loaded without history replay) is not a
+        // draft: demoting it would drop the session id and let the row be
+        // discarded as an empty draft when deactivated. An empty thread with
+        // a *different* session id is still a draft, so an ephemeral draft
+        // session id never overwrites a recorded one.
+        let is_draft = thread_ref.is_draft_thread()
+            && existing_thread.map_or(true, |thread| {
+                thread.session_id.as_ref() != Some(thread_ref.session_id())
+            });
 
         // Draft session IDs may change on reload, so let's not save them until they're valid
         let session_id = if is_draft {
@@ -1852,6 +1886,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            action_log: Default::default(),
         }
     }
 
@@ -1971,6 +2006,40 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_save_durable_persists_and_caches_metadata(cx: &mut TestAppContext) {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{test_name}");
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+        let store = cx.new(|cx| ThreadMetadataStore::new(db.clone(), cx));
+        let metadata = make_metadata(
+            "session-1",
+            "Durable Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let thread_id = metadata.thread_id;
+
+        store
+            .update(cx, |store, cx| store.save_durable(metadata, cx))
+            .await
+            .unwrap();
+
+        let cached_title = cx.read(|cx| {
+            store
+                .read(cx)
+                .entry(thread_id)
+                .and_then(|entry| entry.title())
+        });
+        assert_eq!(cached_title.as_deref(), Some("Durable Thread"));
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thread_id, thread_id);
     }
 
     #[gpui::test]

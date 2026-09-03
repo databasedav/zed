@@ -5,6 +5,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use std::sync::Arc;
 use std::{
     borrow::Cow,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -72,6 +73,31 @@ pub enum ThinkingBlockDisplay {
     AlwaysExpanded,
     /// Thinking blocks are always collapsed by default.
     AlwaysCollapsed,
+}
+
+/// How much detail providers should include in reasoning summaries.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummarySetting {
+    /// Use the provider integration's existing summary detail.
+    #[default]
+    ProviderDefault,
+    Auto,
+    Concise,
+    Detailed,
 }
 
 /// Threshold at which agent auto-compaction runs. See
@@ -191,6 +217,124 @@ pub struct AutoCompactSettingsContent {
     pub threshold: Option<AutoCompactThreshold>,
 }
 
+/// Maximum number of lines for thread titles, or no line limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, MergeFrom)]
+pub enum ThreadTitleMaxLines {
+    Limited(NonZeroUsize),
+    #[default]
+    Unlimited,
+}
+
+impl ThreadTitleMaxLines {
+    pub fn max_lines(self) -> Option<usize> {
+        match self {
+            Self::Limited(lines) => Some(lines.get()),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadTitleMaxLines {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limited(lines) => lines.fmt(formatter),
+            Self::Unlimited => formatter.write_str("unlimited"),
+        }
+    }
+}
+
+impl std::str::FromStr for ThreadTitleMaxLines {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value == "unlimited" {
+            return Ok(Self::Unlimited);
+        }
+        if value.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(lines) = value.parse::<NonZeroUsize>() {
+                return Ok(Self::Limited(lines));
+            }
+        }
+        Err("Enter a positive integer (1 for a single line) or unlimited for no line limit.")
+    }
+}
+
+impl TryFrom<String> for ThreadTitleMaxLines {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ThreadTitleMaxLines> for String {
+    fn from(value: ThreadTitleMaxLines) -> Self {
+        value.to_string()
+    }
+}
+
+impl Serialize for ThreadTitleMaxLines {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Limited(lines) => lines.serialize(serializer),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThreadTitleMaxLines {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MaxLinesVisitor;
+
+        impl serde::de::Visitor<'_> for MaxLinesVisitor {
+            type Value = ThreadTitleMaxLines;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer line limit or the string \"unlimited\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                usize::try_from(value)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .map(ThreadTitleMaxLines::Limited)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))?;
+                self.visit_u64(value)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "unlimited" => Ok(ThreadTitleMaxLines::Unlimited),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(MaxLinesVisitor)
+    }
+}
+
+impl JsonSchema for ThreadTitleMaxLines {
+    fn schema_name() -> Cow<'static, str> {
+        "ThreadTitleMaxLines".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "oneOf": [
+                { "type": "integer", "minimum": 1, "maximum": usize::MAX },
+                { "type": "string", "enum": ["unlimited"] }
+            ]
+        })
+    }
+}
+
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
@@ -233,6 +377,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 850
     pub max_content_width: Option<crate::PixelSetting>,
+    /// Maximum number of lines for thread titles. Use 1 for a single line,
+    /// a larger positive integer to wrap up to that many lines, or "unlimited"
+    /// to wrap without a line limit.
+    ///
+    /// Default: "unlimited"
+    pub thread_title_max_lines: Option<ThreadTitleMaxLines>,
     /// The default model to use when creating new chats and for other features when a specific model is not specified.
     pub default_model: Option<LanguageModelSelection>,
     /// The model to use for subagents spawned via the `spawn_agent` tool. Defaults to the parent agent's model when not specified.
@@ -319,6 +469,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// How much detail providers should include in reasoning summaries.
+    /// Only applies to providers and models that support reasoning summaries.
+    ///
+    /// Default: provider_default
+    pub reasoning_summary: Option<ReasoningSummarySetting>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///
@@ -1049,6 +1204,126 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_title_max_lines_round_trips() {
+        for (json, expected) in [
+            (serde_json::json!(1), Some(1)),
+            (serde_json::json!(6), Some(6)),
+            (serde_json::json!(usize::MAX), Some(usize::MAX)),
+            (serde_json::json!("unlimited"), None),
+        ] {
+            let value: ThreadTitleMaxLines =
+                serde_json::from_value(json.clone()).expect("valid thread title line limit");
+            assert_eq!(value.max_lines(), expected);
+            assert_eq!(
+                serde_json::to_value(value).expect("serialize line limit"),
+                json
+            );
+            assert_eq!(
+                ThreadTitleMaxLines::try_from(String::from(value)).expect("parse UI text"),
+                value
+            );
+        }
+        assert_eq!(
+            ThreadTitleMaxLines::default(),
+            ThreadTitleMaxLines::Unlimited
+        );
+    }
+
+    #[test]
+    fn thread_title_max_lines_rejects_invalid_json() {
+        for json in [
+            "0",
+            "-1",
+            "1.5",
+            "1.0",
+            "1e2",
+            "18446744073709551616",
+            r#""0""#,
+            r#""2""#,
+            r#""unknown""#,
+            r#""Unlimited""#,
+            r#"" unlimited ""#,
+            "true",
+            "false",
+            "null",
+            "[]",
+            "{}",
+        ] {
+            assert!(
+                serde_json::from_str::<ThreadTitleMaxLines>(json).is_err(),
+                "accepted invalid line limit: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_title_max_lines_parses_ui_text() {
+        assert_eq!(
+            " 3 "
+                .parse::<ThreadTitleMaxLines>()
+                .expect("positive limit")
+                .max_lines(),
+            Some(3)
+        );
+        assert_eq!(
+            " unlimited "
+                .parse::<ThreadTitleMaxLines>()
+                .expect("unlimited"),
+            ThreadTitleMaxLines::Unlimited
+        );
+        for text in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "1.0",
+            "1e2",
+            "unknown",
+            "Unlimited",
+            "18446744073709551616",
+        ] {
+            assert!(
+                ThreadTitleMaxLines::try_from(text.to_owned()).is_err(),
+                "accepted invalid UI text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_title_max_lines_schema() {
+        let schema = ThreadTitleMaxLines::json_schema(&mut schemars::SchemaGenerator::default());
+        assert_eq!(
+            schema,
+            json_schema!({
+                "oneOf": [
+                    { "type": "integer", "minimum": 1, "maximum": usize::MAX },
+                    { "type": "string", "enum": ["unlimited"] }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn thread_title_max_lines_merge_replaces_limit() {
+        use crate::merge_from::MergeFrom as _;
+
+        let mut content: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+            "thread_title_max_lines": 2
+        }))
+        .expect("limited setting");
+        let unlimited: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+            "thread_title_max_lines": "unlimited"
+        }))
+        .expect("unlimited setting");
+        content.merge_from(&unlimited);
+        assert_eq!(
+            content.thread_title_max_lines,
+            Some(ThreadTitleMaxLines::Unlimited)
+        );
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {

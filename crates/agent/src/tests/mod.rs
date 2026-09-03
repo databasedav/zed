@@ -27,9 +27,9 @@ use indoc::indoc;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelImageExt, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolResult, LanguageModelToolUse, MessageContent, ProviderErrorCategory, Role,
-    StopReason, TokenUsage,
+    LanguageModelReasoningSummary, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
+    ProviderErrorCategory, Role, StopReason, TokenUsage,
     fake_provider::{FakeLanguageModel, FakeLanguageModelProvider},
 };
 use pretty_assertions::assert_eq;
@@ -62,6 +62,11 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
     });
+}
+
+pub(crate) fn release_dropped_entities(cx: &mut TestAppContext) {
+    cx.update(|_| ());
+    cx.run_until_parked();
 }
 
 pub(crate) struct FakeTerminalHandle {
@@ -521,6 +526,37 @@ async fn test_thinking_allowed_when_model_cannot_disable_thinking(cx: &mut TestA
             .build_completion_request(CompletionIntent::UserPrompt, cx)
             .unwrap();
         assert!(request.thinking_allowed);
+    });
+}
+
+#[gpui::test]
+async fn test_completion_request_uses_reasoning_summary_setting(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+
+    thread.read_with(cx, |thread, cx| {
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert_eq!(request.reasoning_summary, None);
+    });
+
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().reasoning_summary =
+                    Some(settings::ReasoningSummarySetting::Detailed);
+            });
+        });
+    });
+
+    thread.read_with(cx, |thread, cx| {
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert_eq!(
+            request.reasoning_summary,
+            Some(LanguageModelReasoningSummary::Detailed)
+        );
     });
 }
 
@@ -1213,6 +1249,7 @@ async fn test_replayed_tool_call_ids_scoped_across_messages(cx: &mut TestAppCont
         let project = thread.project.clone();
         let context_server_registry = thread.context_server_registry.clone();
         let templates = thread.templates.clone();
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         cx.new(|cx| {
             Thread::from_db(
                 acp::SessionId::new("restored"),
@@ -1221,6 +1258,7 @@ async fn test_replayed_tool_call_ids_scoped_across_messages(cx: &mut TestAppCont
                 project_context.clone(),
                 context_server_registry,
                 templates,
+                action_log,
                 cx,
             )
         })
@@ -3725,6 +3763,7 @@ async fn test_cumulative_token_usage(cx: &mut TestAppContext) {
         let project = thread.project.clone();
         let context_server_registry = thread.context_server_registry.clone();
         let templates = thread.templates.clone();
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         cx.new(|cx| {
             Thread::from_db(
                 acp::SessionId::new("restored"),
@@ -3733,6 +3772,7 @@ async fn test_cumulative_token_usage(cx: &mut TestAppContext) {
                 project_context.clone(),
                 context_server_registry,
                 templates,
+                action_log,
                 cx,
             )
         })
@@ -4267,10 +4307,8 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     request.await.expect("prompt should fail gracefully");
 
     // Explicitly close the session and drop the ACP thread.
-    cx.update(|cx| Rc::new(connection.clone()).close_session(&session_id, cx))
-        .await
-        .unwrap();
     drop(acp_thread);
+    release_dropped_entities(cx);
     let result = cx
         .update(|cx| {
             acp_thread::AgentSessionClientUserMessageIds::prompt(
@@ -5596,7 +5634,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
             .get(&subagent_session_id)
             .expect("subagent session should exist")
             .acp_thread
-            .clone()
+            .upgrade()
+            .expect("subagent thread should be alive")
     });
 
     model.send_last_completion_stream_text_chunk("subagent task response");
@@ -5732,7 +5771,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
             .get(&subagent_session_id)
             .expect("subagent session should exist")
             .acp_thread
-            .clone()
+            .upgrade()
+            .expect("subagent thread should be alive")
     });
 
     model.send_last_completion_stream_text_chunk("subagent task response 1");
@@ -5880,7 +5920,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
             .get(&subagent_session_id)
             .expect("subagent session should exist")
             .acp_thread
-            .clone()
+            .upgrade()
+            .expect("subagent thread should be alive")
     });
 
     // model.send_last_completion_stream_text_chunk("subagent task response");
@@ -6012,7 +6053,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
             .get(&subagent_session_id)
             .expect("subagent session should exist")
             .acp_thread
-            .clone()
+            .upgrade()
+            .expect("subagent thread should be alive")
     });
 
     // Subagent responds
