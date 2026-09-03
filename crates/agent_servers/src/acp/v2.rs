@@ -623,6 +623,15 @@ impl AcpV2Connection {
             .session
             .as_ref()
             .context("This agent does not advertise session support")?;
+        Self::session_context_for_capabilities(capabilities, configurations, work_dirs, is_absolute)
+    }
+
+    fn session_context_for_capabilities(
+        capabilities: &acp::SessionCapabilities,
+        configurations: Vec<(String, Arc<ContextServerConfiguration>)>,
+        work_dirs: &PathList,
+        is_absolute: impl Fn(&std::path::Path) -> bool,
+    ) -> Result<SessionContext> {
         let mut paths = work_dirs.ordered_paths();
         let cwd = paths
             .next()
@@ -1299,6 +1308,130 @@ impl AcpV2Connection {
     }
 }
 
+struct AcpV2SessionFork {
+    connection: V2ConnectionTo<Agent>,
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+    pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
+    capabilities: acp::SessionCapabilities,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+}
+
+impl acp_thread::AgentSessionFork for AcpV2SessionFork {
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        let path_style = project.read(cx).path_style(cx);
+        let mut seen = collections::HashSet::default();
+        let paths = work_dirs
+            .ordered_paths()
+            .map(|path| super::v1::session_directory_for_path(path))
+            .filter(|path| seen.insert(path.clone()))
+            .collect::<Vec<_>>();
+        let context = match AcpV2Connection::session_context_for_capabilities(
+            &self.capabilities,
+            mcp_configurations_for_project(&project, cx),
+            &PathList::new(&paths),
+            |path| path_style.is_absolute(path),
+        ) {
+            Ok(context) => context,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let request = self.connection.prepare_request(
+            acp::ForkSessionRequest::new(self.session_id.clone(), context.cwd)
+                .additional_directories(context.additional_directories)
+                .mcp_servers(context.mcp_servers),
+        );
+        let request_id = request.id().clone();
+        let (response, applied) = AcpV2Connection::ordered_prepared_response(
+            &self.connection,
+            &self.dispatch_tx,
+            request,
+            {
+                let dispatch_tx = self.dispatch_tx.clone();
+                let request_id = request_id.clone();
+                move || {
+                    enqueue_notification(&dispatch_tx, request_id, begin_session_creation);
+                    Ok(())
+                }
+            },
+            |response| Some(response.session_id.clone()),
+        );
+        let response = {
+            let dispatch_tx = self.dispatch_tx.clone();
+            async move {
+                let response = response.await?;
+                drain_foreground_queue(&dispatch_tx).await?;
+                Ok(response)
+            }
+            .boxed_local()
+        };
+        let pending = self.pending_session_updates.clone();
+        let sessions = self.sessions.clone();
+        let source_id = self.session_id.clone();
+        let connection = self.connection.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
+        let cleanup = util::defer({
+            let dispatch_tx = dispatch_tx.clone();
+            let request_id = request_id.clone();
+            move || enqueue_notification(&dispatch_tx, request_id, finish_session_creation)
+        });
+        let response = AcpV2Connection::apply_ordered_response(
+            response,
+            applied,
+            &self.dispatch_tx,
+            {
+                let connection = connection.clone();
+                let dispatch_tx = dispatch_tx.clone();
+                move |response, _cx| {
+                    let session_id = response.session_id;
+                    anyhow::ensure!(
+                        session_id != source_id && !sessions.borrow().contains_key(&session_id),
+                        "Agent returned an existing session as its fork"
+                    );
+                    // No thread owns this fork. Release it even if the caller cancels
+                    // while waiting for its close acknowledgement.
+                    let abandoned = util::defer({
+                        let session_id = session_id.clone();
+                        move || {
+                            enqueue_notification(
+                                &dispatch_tx,
+                                (session_id, connection),
+                                close_undelivered_session,
+                            )
+                        }
+                    });
+                    pending.borrow_mut().take(&request_id, &session_id)?;
+                    Ok((session_id, abandoned))
+                }
+            },
+            cx,
+        );
+        let async_cx = cx.to_async();
+        cx.foreground_executor().spawn(async move {
+            let _cleanup = cleanup;
+            let (session_id, abandoned) = response.await?;
+            let close = async_cx.update(|cx| {
+                AcpV2Connection::ordered_request(
+                    &connection,
+                    &dispatch_tx,
+                    acp::CloseSessionRequest::new(session_id.clone()),
+                    || Ok(()),
+                    |_| None,
+                    |_, _| Ok(()),
+                    cx,
+                )
+            });
+            close.await?;
+            abandoned.abort();
+            Ok(session_id)
+        })
+    }
+}
+
 impl AgentConnection for AcpV2Connection {
     fn shutdown(&self) {
         let runtime = self.runtime.borrow_mut().take();
@@ -1466,6 +1599,23 @@ impl AgentConnection for AcpV2Connection {
             abandoned.abort();
             Ok(thread)
         })
+    }
+
+    fn fork(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        let capabilities = self.initialize_response.capabilities.session.as_ref()?;
+        capabilities.fork.as_ref()?;
+        Some(Rc::new(AcpV2SessionFork {
+            connection: self.connection.clone(),
+            dispatch_tx: self.dispatch_tx.clone(),
+            pending_session_updates: self.pending_session_updates.clone(),
+            capabilities: capabilities.clone(),
+            sessions: self.sessions.clone(),
+            session_id: session_id.clone(),
+        }))
     }
 
     fn supports_load_session(&self) -> bool {
@@ -2071,6 +2221,8 @@ mod tests {
     }
 
     struct SessionHarness {
+        fork_requests:
+            async_channel::Receiver<(acp::ForkSessionRequest, Responder<acp::ForkSessionResponse>)>,
         client: Rc<AcpV2Connection>,
         project: Entity<Project>,
         prompts: async_channel::Receiver<(acp::PromptRequest, Responder<acp::PromptResponse>)>,
@@ -2132,6 +2284,7 @@ mod tests {
             let (new_reply_sender, new_replies) = async_channel::unbounded();
             let hold_new_responses = Arc::new(Mutex::new(false));
             let deferred_new = hold_new_responses.clone();
+            let (fork_sender, fork_requests) = async_channel::unbounded();
             let (list_sender, list_requests) = async_channel::unbounded();
             let (delete_sender, delete_requests) = async_channel::unbounded();
             let (config_sender, config_requests) = async_channel::unbounded();
@@ -2164,6 +2317,13 @@ mod tests {
                                 )
                                 .capabilities(capabilities.clone()),
                             )
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |request: acp::ForkSessionRequest, responder, _| {
+                            fork_sender.try_send((request, responder)).expect("fork receiver");
+                            Ok(())
                         },
                         agent_client_protocol::on_receive_request!(),
                     )
@@ -2312,6 +2472,7 @@ mod tests {
             .await
             .expect("connect session client");
             Self {
+                fork_requests,
                 client: Rc::new(client),
                 project,
                 prompts,
@@ -2472,6 +2633,145 @@ mod tests {
 
     fn session_capabilities() -> acp::AgentCapabilities {
         acp::AgentCapabilities::new().session(acp::SessionCapabilities::new())
+    }
+
+    #[gpui::test]
+    async fn v2_fork_requires_advertised_capability(cx: &mut TestAppContext) {
+        for capabilities in [acp::AgentCapabilities::new(), session_capabilities()] {
+            let harness = SessionHarness::new(capabilities, Vec::new(), Vec::new(), cx).await;
+            assert!(
+                cx.update(|cx| harness.client.fork(&"source".into(), cx))
+                    .is_none()
+            );
+            assert!(harness.fork_requests.is_empty());
+        }
+    }
+
+    #[gpui::test]
+    async fn v2_fork_closes_unopened_session_and_preserves_directories(cx: &mut TestAppContext) {
+        let capabilities = acp::AgentCapabilities::new().session(
+            acp::SessionCapabilities::new()
+                .fork(acp::SessionForkCapabilities::new())
+                .additional_directories(acp::SessionAdditionalDirectoriesCapabilities::new()),
+        );
+        let harness = SessionHarness::new(capabilities, Vec::new(), Vec::new(), cx).await;
+        *harness.hold_closes.lock().expect("close mode") = true;
+        let fork = cx.update(|cx| {
+            harness
+                .client
+                .fork(&"source".into(), cx)
+                .expect("fork capability")
+                .run(
+                    harness.project.clone(),
+                    PathList::new(&[session_path("a"), session_path("b"), session_path("a")]),
+                    cx,
+                )
+        });
+        let (request, responder) = bounded(harness.fork_requests.recv(), cx)
+            .await
+            .expect("fork request");
+        assert_eq!(request.session_id, acp::SessionId::new("source"));
+        assert_eq!(request.cwd.0, session_path("a"));
+        assert_eq!(
+            request.additional_directories,
+            vec![acp::AbsolutePath::from(session_path("b"))]
+        );
+        harness.send_update(
+            "fork",
+            acp::SessionUpdate::AgentMessage(
+                acp::AgentMessage::new("history").content(vec!["history".into()]),
+            ),
+        );
+        harness.drain_updates(cx).await;
+        responder
+            .respond(acp::ForkSessionResponse::new("fork"))
+            .expect("fork response");
+        let (close, responder) = bounded(harness.close_requests.recv(), cx)
+            .await
+            .expect("close request");
+        assert_eq!(close.session_id, acp::SessionId::new("fork"));
+        responder
+            .respond(acp::CloseSessionResponse::new())
+            .expect("close response");
+        assert_eq!(
+            bounded(fork, cx).await.expect("fork"),
+            acp::SessionId::new("fork")
+        );
+        cx.run_until_parked();
+        assert!(harness.client.sessions.borrow().is_empty());
+        assert!(harness.client.session_owners.borrow().is_empty());
+        assert_eq!(
+            harness.client.pending_session_updates.borrow().counts(),
+            (0, 0, 0)
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_fork_rejects_source_id_without_closing_it(cx: &mut TestAppContext) {
+        let capabilities = acp::AgentCapabilities::new()
+            .session(acp::SessionCapabilities::new().fork(acp::SessionForkCapabilities::new()));
+        let harness = SessionHarness::new(capabilities, Vec::new(), Vec::new(), cx).await;
+        let fork = cx.update(|cx| {
+            harness
+                .client
+                .fork(&"source".into(), cx)
+                .expect("fork capability")
+                .run(
+                    harness.project.clone(),
+                    PathList::new(&[session_path("a")]),
+                    cx,
+                )
+        });
+        let (_, responder) = bounded(harness.fork_requests.recv(), cx)
+            .await
+            .expect("fork request");
+        responder
+            .respond(acp::ForkSessionResponse::new("source"))
+            .expect("fork response");
+        assert!(bounded(fork, cx).await.is_err());
+        cx.run_until_parked();
+        assert!(harness.closes.is_empty());
+        assert_eq!(
+            harness.client.pending_session_updates.borrow().counts(),
+            (0, 0, 0)
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_fork_cancellation_closes_late_response(cx: &mut TestAppContext) {
+        let capabilities = acp::AgentCapabilities::new()
+            .session(acp::SessionCapabilities::new().fork(acp::SessionForkCapabilities::new()));
+        let harness = SessionHarness::new(capabilities, Vec::new(), Vec::new(), cx).await;
+        let fork = cx.update(|cx| {
+            harness
+                .client
+                .fork(&"source".into(), cx)
+                .expect("fork capability")
+                .run(
+                    harness.project.clone(),
+                    PathList::new(&[session_path("a"), session_path("b")]),
+                    cx,
+                )
+        });
+        let (request, responder) = bounded(harness.fork_requests.recv(), cx)
+            .await
+            .expect("fork request");
+        assert!(request.additional_directories.is_empty());
+        drop(fork);
+        cx.run_until_parked();
+        responder
+            .respond(acp::ForkSessionResponse::new("abandoned"))
+            .expect("late response");
+        assert_eq!(
+            bounded(harness.closes.recv(), cx).await.expect("close"),
+            acp::SessionId::new("abandoned")
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            harness.client.pending_session_updates.borrow().counts(),
+            (0, 0, 0)
+        );
+        assert!(harness.client.sessions.borrow().is_empty());
     }
 
     fn initial_response() -> acp::NewSessionResponse {

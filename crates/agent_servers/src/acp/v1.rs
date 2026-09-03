@@ -1249,6 +1249,16 @@ impl SessionDirectories {
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp_v2::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
 }
 
 fn session_directories_from_work_dirs(
@@ -1330,7 +1340,7 @@ fn meta_terminal_auth_task(
 /// the same normalization `Project::default_path_list` applies when creating
 /// new sessions. Only positively-identified local files are remapped: remote
 /// project paths can't be stat'ed locally and must pass through untouched.
-fn session_directory_for_path(path: &Path) -> PathBuf {
+pub(super) fn session_directory_for_path(path: &Path) -> PathBuf {
     if path.is_file()
         && let Some(parent) = path.parent()
     {
@@ -1344,10 +1354,16 @@ struct AcpSessionFork {
     connection: ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
     supports_additional_directories: bool,
+    supports_close: bool,
 }
 
 impl acp_thread::AgentSessionFork for AcpSessionFork {
-    fn run(&self, work_dirs: PathList, cx: &mut App) -> Task<Result<acp_v2::SessionId>> {
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>> {
         let directories = match session_directories_from_work_dirs(
             &work_dirs,
             self.supports_additional_directories,
@@ -1355,20 +1371,79 @@ impl acp_thread::AgentSessionFork for AcpSessionFork {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
-        // MCP servers are omitted: the forked session isn't opened as a
-        // thread here, and they are passed again when it is later loaded.
-        let request = acp::ForkSessionRequest::new(acp::SessionId::new(self.session_id.0.clone()), directories.cwd)
-            .additional_directories(directories.additional_directories);
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let request = directories.into_fork_session_request(self.session_id.clone(), mcp_servers);
         let connection = self.connection.clone();
+        let supports_close = self.supports_close;
+        let source_id = self.session_id.clone();
         cx.foreground_executor().spawn(async move {
-            let response = connection
-                .send_request(request)
-                .block_task()
-                .await
+            let (sender, received) = futures::channel::oneshot::channel();
+            let request = connection.prepare_request(request);
+            let cancellation = request.cancellation_handle();
+            request
+                .on_receiving_result({
+                    let connection = connection.clone();
+                    async move |result: Result<
+                        acp::ForkSessionResponse,
+                        agent_client_protocol::Error,
+                    >| {
+                        let result = result.map_err(map_acp_error).and_then(|response| {
+                            anyhow::ensure!(
+                                response.session_id.0 != source_id.0,
+                                "Agent returned the source session as its fork"
+                            );
+                            let session_id = response.session_id;
+                            let abandoned = util::defer({
+                                let session_id = session_id.clone();
+                                move || {
+                                    if supports_close {
+                                        connection
+                                            .prepare_request(acp::CloseSessionRequest::new(
+                                                session_id,
+                                            ))
+                                            .on_receiving_result(async move |result| {
+                                                result.log_err();
+                                                Ok(())
+                                            })
+                                            .log_err();
+                                    }
+                                }
+                            });
+                            Ok((session_id, abandoned))
+                        });
+                        if let Err(result) = sender.send(result) {
+                            drop(result);
+                        }
+                        Ok(())
+                    }
+                })
                 .map_err(map_acp_error)?;
-            Ok(acp_v2::SessionId::new(response.session_id.0))
+            let request_guard = util::defer(move || {
+                cancellation.cancel().log_err();
+            });
+            let (session_id, abandoned) = received
+                .await
+                .context("ACP fork response callback was cancelled")??;
+            request_guard.abort();
+            // The sidebar stores the ID, not an open thread. Release the fork
+            // before a later load/resume attaches it to a project.
+            if supports_close {
+                connection
+                    .send_request(acp::CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await
+                    .map_err(map_acp_error)?;
+            }
+            abandoned.abort();
+            Ok(acp_v2::SessionId::new(session_id.0))
         })
     }
+}
+
+fn supports_openable_session_fork(agent_capabilities: &acp::AgentCapabilities) -> bool {
+    agent_capabilities.session_capabilities.fork.is_some()
+        && (agent_capabilities.load_session
+            || agent_capabilities.session_capabilities.resume.is_some())
 }
 
 impl AgentConnection for AcpConnection {
@@ -1556,11 +1631,14 @@ impl AgentConnection for AcpConnection {
         session_id: &acp_v2::SessionId,
         _cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
-        self.agent_capabilities.session_capabilities.fork.as_ref()?;
+        if !supports_openable_session_fork(&self.agent_capabilities) {
+            return None;
+        }
         Some(Rc::new(AcpSessionFork {
             connection: self.connection.clone(),
             session_id: session_id.clone(),
             supports_additional_directories: self.supports_session_additional_directories(),
+            supports_close: self.agent_supports_session_close(),
         }) as _)
     }
 
@@ -2132,6 +2210,14 @@ pub mod test_support {
             cx: &App,
         ) -> Option<Rc<dyn AgentSessionRetry>> {
             self.inner.retry(session_id, cx)
+        }
+
+        fn fork(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+            self.inner.fork(session_id, cx)
         }
 
         fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
@@ -6161,6 +6247,32 @@ mod tests {
     }
 
     #[test]
+    fn openable_session_fork_requires_fork_and_load_or_resume() {
+        let capabilities = |load_session: bool, fork: bool, resume: bool| {
+            acp::AgentCapabilities::new()
+                .load_session(load_session)
+                .session_capabilities(
+                    acp::SessionCapabilities::new()
+                        .fork(fork.then(acp::SessionForkCapabilities::new))
+                        .resume(resume.then(acp::SessionResumeCapabilities::new)),
+                )
+        };
+
+        assert!(!supports_openable_session_fork(&capabilities(
+            true, false, false
+        )));
+        assert!(!supports_openable_session_fork(&capabilities(
+            false, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            true, true, false
+        )));
+        assert!(supports_openable_session_fork(&capabilities(
+            false, true, true
+        )));
+    }
+
+    #[test]
     fn session_directories_use_ordered_paths_when_supported() {
         let work_dirs = PathList::new(&[
             std::path::PathBuf::from("/workspace-b"),
@@ -6183,12 +6295,19 @@ mod tests {
         );
 
         let session_id = acp_v2::SessionId::new("session-1");
+        let mcp_servers = vec![acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "test-server",
+            "/usr/bin/test-server",
+        ))];
         let new_session_request = directories.clone().into_new_session_request(Vec::new());
         let load_session_request = directories
             .clone()
             .into_load_session_request(session_id.clone(), Vec::new());
-        let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+        let resume_session_request = directories
+            .clone()
+            .into_resume_session_request(session_id.clone(), Vec::new());
+        let fork_session_request =
+            directories.into_fork_session_request(session_id.clone(), mcp_servers.clone());
 
         assert_eq!(
             new_session_request.cwd,
@@ -6209,6 +6328,13 @@ mod tests {
             resume_session_request.additional_directories,
             new_session_request.additional_directories
         );
+        assert_eq!(fork_session_request.session_id.0, session_id.0);
+        assert_eq!(fork_session_request.cwd, new_session_request.cwd);
+        assert_eq!(
+            fork_session_request.additional_directories,
+            new_session_request.additional_directories
+        );
+        assert_eq!(fork_session_request.mcp_servers, mcp_servers);
     }
 
     #[test]
@@ -6223,9 +6349,10 @@ mod tests {
             let load = directories
                 .clone()
                 .into_load_session_request(session_id.clone(), Vec::new());
-            let resume = directories.into_resume_session_request(session_id, Vec::new());
+            let resume = directories.clone().into_resume_session_request(session_id.clone(), Vec::new());
+            let fork = directories.into_fork_session_request(session_id, Vec::new());
 
-            for wire_id in [&load.session_id, &resume.session_id] {
+            for wire_id in [&load.session_id, &resume.session_id, &fork.session_id] {
                 assert_eq!(wire_id.0.as_ref(), value);
                 assert!(Arc::ptr_eq(&backing, &wire_id.0));
                 assert_eq!(

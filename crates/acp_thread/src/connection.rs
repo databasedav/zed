@@ -366,7 +366,12 @@ pub trait AgentSessionTruncate {
 pub trait AgentSessionFork {
     /// Creates a new session sharing the source session's conversation history
     /// and returns its id. The forked session is not opened as a thread.
-    fn run(&self, work_dirs: PathList, cx: &mut App) -> Task<Result<acp_v2::SessionId>>;
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {
