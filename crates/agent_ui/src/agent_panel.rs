@@ -1703,13 +1703,14 @@ impl AgentPanel {
             .connection_store
             .update(cx, |store, cx| store.request_connection(agent, server, cx));
         let connect_task = connection_entry.read(cx).wait_for_connection();
+        let project = self.project.clone();
         cx.spawn(async move |_this, cx| {
             let connected = connect_task.await?;
             let fork_task = cx.update(|cx| {
                 connected
                     .connection
                     .fork(&session_id, cx)
-                    .map(|fork| fork.run(work_dirs, cx))
+                    .map(|fork| fork.run(project, work_dirs, cx))
                     .ok_or_else(|| anyhow!("Forking threads is not supported by {agent_label}"))
             })?;
             fork_task.await

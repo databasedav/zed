@@ -205,6 +205,8 @@ impl DbThread {
     /// the original thread.
     pub fn forked(mut self) -> Self {
         self.title = forked_thread_title(&self.title);
+        self.draft_prompt = None;
+        self.ui_scroll_position = None;
         // Threads with a subagent parent are hidden from history and
         // cascade-deleted with their parent, which must not apply to a fork.
         self.subagent_context = None;

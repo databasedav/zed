@@ -3911,9 +3911,14 @@ impl Sidebar {
             self.show_fork_thread_error("source thread metadata not found", cx);
             return;
         };
-        let Some(panel) = thread_workspace
-            .or_else(|| self.active_workspace(cx))
-            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+        let is_zed_thread = source.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+        let workspace = match thread_workspace {
+            Some(workspace) => Some(workspace),
+            None if is_zed_thread => self.active_workspace(cx),
+            None => None,
+        };
+        let Some(panel) =
+            workspace.and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
         else {
             self.show_fork_thread_error("no agent panel available", cx);
             return;
@@ -3928,16 +3933,17 @@ impl Sidebar {
             )
         });
 
-        cx.spawn(async move |this, cx| match fork_task.await {
-            Ok(fork_session_id) => {
-                cx.update(|cx| {
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let fork_session_id = fork_task.await?;
+                let save_task = cx.update(|cx| {
                     ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                         let title_override = agent::forked_thread_title(&source.display_title());
                         // Give the fork the source's display time so the two
                         // threads sort next to each other in the sidebar;
                         // sending a message in the fork bumps it as usual.
                         let display_time = source.interacted_at.unwrap_or(source.updated_at);
-                        store.save(
+                        store.save_durable(
                             ThreadMetadata {
                                 thread_id: ThreadId::new(),
                                 session_id: Some(fork_session_id),
@@ -3946,11 +3952,14 @@ impl Sidebar {
                                 ..source
                             },
                             cx,
-                        );
-                    });
+                        )
+                    })
                 });
+                save_task.await
             }
-            Err(error) => {
+            .await;
+
+            if let Err(error) = result {
                 this.update(cx, |this, cx| {
                     this.show_fork_thread_error(&format!("{error:#}"), cx);
                 })
@@ -5843,15 +5852,19 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_threads_list_view_active() {
+            return;
+        }
         let Some(ix) = self.selection else {
             return;
         };
         let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
             return;
         };
-        // Mirror the context menu's gating: forking needs a non-draft,
-        // non-remote thread.
-        if thread.metadata.remote_connection.is_some() {
+        let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+        if thread.workspace.is_remote(cx)
+            || (!is_zed_thread && matches!(&thread.workspace, ThreadEntryWorkspace::Closed { .. }))
+        {
             return;
         }
         let Some(session_id) = thread.metadata.session_id.clone() else {
@@ -6528,6 +6541,7 @@ impl Sidebar {
         let sidebar = cx.weak_entity();
 
         let active_workspace = self.active_workspace(cx);
+        let is_closed = matches!(&thread_workspace, ThreadEntryWorkspace::Closed { .. });
         let thread_workspace = match &thread_workspace {
             ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
             ThreadEntryWorkspace::Closed { .. } => None,
@@ -6536,10 +6550,9 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         // Forking a remote thread isn't supported: its conversation state
-        // lives on the remote host. External agents are offered the entry
-        // optimistically; ones that don't advertise the fork capability fail
-        // with a toast when invoked.
-        let can_fork = thread.metadata.remote_connection.is_none();
+        // lives on the remote host. Closed external-agent sessions also need
+        // their original workspace's panel, while native forks are global.
+        let can_fork = !is_remote && (is_zed_thread || !is_closed);
         let folder_paths = thread.metadata.folder_paths().clone();
 
         right_click_menu(context_menu_id)
