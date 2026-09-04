@@ -458,6 +458,15 @@ pub enum CompletionIntent {
     GenerateGitCommitMessage,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageModelReasoningSummary {
+    #[default]
+    Auto,
+    Concise,
+    Detailed,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelRequest {
     pub thread_id: Option<String>,
@@ -470,6 +479,8 @@ pub struct LanguageModelRequest {
     pub temperature: Option<f32>,
     pub thinking_allowed: bool,
     pub thinking_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<LanguageModelReasoningSummary>,
     pub speed: Option<Speed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_at_tokens: Option<u64>,

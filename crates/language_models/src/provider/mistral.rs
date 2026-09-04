@@ -881,6 +881,7 @@ mod tests {
             stop: vec![],
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: Default::default(),
             compact_at_tokens: None,
         };
@@ -913,6 +914,7 @@ mod tests {
             stop: vec![],
             thinking_allowed,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: Default::default(),
             compact_at_tokens: None,
         };
@@ -956,6 +958,7 @@ mod tests {
             stop: vec![],
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };

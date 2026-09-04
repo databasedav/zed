@@ -8702,6 +8702,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Reasoning Summary",
+                description: "How much detail supported providers should include in reasoning summaries. 'Provider Default' preserves each provider's existing behavior.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.reasoning_summary"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .reasoning_summary
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .reasoning_summary = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Cancel Generation On Terminal Stop",
                 description: "Whether clicking the stop button on a running terminal tool should also cancel the agent's generation. Note that this only applies to the stop button, not to ctrl+c inside the terminal.",
                 field: Box::new(SettingField {

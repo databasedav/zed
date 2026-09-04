@@ -1322,6 +1322,12 @@
     //
     // Default: auto
     "thinking_display": "auto",
+    // How much detail providers should include in reasoning summaries.
+    // Supported values are "provider_default", "auto", "concise", and "detailed".
+    // This only affects providers and models that support reasoning summaries.
+    //
+    // Default: provider_default
+    "reasoning_summary": "provider_default",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

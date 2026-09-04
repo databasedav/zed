@@ -74,6 +74,31 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// How much detail providers should include in reasoning summaries.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummarySetting {
+    /// Use the provider integration's existing summary detail.
+    #[default]
+    ProviderDefault,
+    Auto,
+    Concise,
+    Detailed,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -319,6 +344,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// How much detail providers should include in reasoning summaries.
+    /// Only applies to providers and models that support reasoning summaries.
+    ///
+    /// Default: provider_default
+    pub reasoning_summary: Option<ReasoningSummarySetting>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///

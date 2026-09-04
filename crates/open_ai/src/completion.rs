@@ -5,10 +5,11 @@ use http_client::StatusCode;
 use language_model_core::{
     CompactedContext, CompactionUpdate, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelCustomToolFormat, LanguageModelCustomToolGrammarSyntax, LanguageModelImage,
-    LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelRequestToolInput, LanguageModelToolChoice, LanguageModelToolResultContent,
-    LanguageModelToolUse, LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent,
-    ProviderErrorCategory, Role, StopReason, TokenUsage, provider_name_for_id,
+    LanguageModelProviderId, LanguageModelReasoningSummary, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelRequestToolInput, LanguageModelToolChoice,
+    LanguageModelToolResultContent, LanguageModelToolUse, LanguageModelToolUseId,
+    LanguageModelToolUseInput, MessageContent, ProviderErrorCategory, Role, StopReason, TokenUsage,
+    provider_name_for_id,
     util::{fix_streamed_json, parse_tool_arguments},
 };
 use std::pin::Pin;
@@ -270,6 +271,7 @@ pub fn into_open_ai_response(
         temperature,
         thinking_allowed,
         thinking_effort,
+        reasoning_summary,
         speed,
         compact_at_tokens,
     } = request;
@@ -354,7 +356,15 @@ pub fn into_open_ai_response(
         summary: if effort == ReasoningEffort::None {
             None
         } else {
-            Some(crate::responses::ReasoningSummaryMode::Auto)
+            Some(match reasoning_summary.unwrap_or_default() {
+                LanguageModelReasoningSummary::Auto => crate::responses::ReasoningSummaryMode::Auto,
+                LanguageModelReasoningSummary::Concise => {
+                    crate::responses::ReasoningSummaryMode::Concise
+                }
+                LanguageModelReasoningSummary::Detailed => {
+                    crate::responses::ReasoningSummaryMode::Detailed
+                }
+            })
         },
     });
 
@@ -1816,6 +1826,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: Some("high".into()),
+            reasoning_summary: Some(LanguageModelReasoningSummary::Detailed),
             speed: None,
             compact_at_tokens: None,
         };
@@ -1879,7 +1890,7 @@ mod tests {
                 }
             ],
             "prompt_cache_key": "thread-123",
-            "reasoning": { "effort": "high", "summary": "auto" }
+            "reasoning": { "effort": "high", "summary": "detailed" }
         });
 
         assert_eq!(serialized, expected);
@@ -2002,6 +2013,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2103,6 +2115,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2188,6 +2201,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2254,6 +2268,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2300,6 +2315,7 @@ mod tests {
                 temperature: None,
                 thinking_allowed: false,
                 thinking_effort: None,
+                reasoning_summary: None,
                 speed,
                 compact_at_tokens: None,
             };
@@ -2352,6 +2368,7 @@ mod tests {
                 temperature: None,
                 thinking_allowed: false,
                 thinking_effort: None,
+                reasoning_summary: None,
                 speed,
                 compact_at_tokens: None,
             };
@@ -2397,6 +2414,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2436,6 +2454,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2477,6 +2496,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: Some("none".into()),
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2530,6 +2550,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2622,6 +2643,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -2712,6 +2734,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -3972,6 +3995,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };

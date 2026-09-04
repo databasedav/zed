@@ -1011,6 +1011,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            reasoning_summary: None,
         };
 
         cx.update(|cx| {
