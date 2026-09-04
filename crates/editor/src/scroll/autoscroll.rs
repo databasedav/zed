@@ -123,6 +123,35 @@ impl AutoscrollStrategy {
 
 pub(crate) struct NeedsHorizontalAutoscroll(pub(crate) bool);
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AutoscrollTarget {
+    pub(crate) point: DisplayPoint,
+    pub(crate) top: ScrollOffset,
+    pub(crate) bottom: ScrollOffset,
+    fit_fallback: Option<DisplayPoint>,
+}
+
+impl AutoscrollTarget {
+    pub(crate) fn cursor(point: DisplayPoint) -> Self {
+        Self {
+            point,
+            top: point.row().as_f64(),
+            bottom: point.row().next_row().as_f64(),
+            fit_fallback: None,
+        }
+    }
+
+    pub(crate) fn fit_to_height(self, visible_lines: ScrollOffset) -> Self {
+        if self.bottom - self.top > visible_lines
+            && let Some(point) = self.fit_fallback
+        {
+            Self::cursor(point)
+        } else {
+            self
+        }
+    }
+}
+
 impl Editor {
     pub(crate) fn autoscroll_vertically(
         &mut self,
@@ -132,7 +161,11 @@ impl Editor {
         autoscroll_request: Option<(Autoscroll, bool)>,
         window: &mut Window,
         cx: &mut Context<Editor>,
-    ) -> (NeedsHorizontalAutoscroll, WasScrolled) {
+    ) -> (
+        NeedsHorizontalAutoscroll,
+        WasScrolled,
+        Option<AutoscrollTarget>,
+    ) {
         let viewport_height = bounds.size.height;
         let visible_lines = ScrollOffset::from(viewport_height / line_height);
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -158,12 +191,18 @@ impl Editor {
         };
 
         let Some((autoscroll, local)) = autoscroll_request else {
-            return (NeedsHorizontalAutoscroll(false), editor_was_scrolled);
+            return (NeedsHorizontalAutoscroll(false), editor_was_scrolled, None);
         };
 
+        let newest_selection_point = self
+            .selections
+            .newest::<Point>(&display_map)
+            .head()
+            .to_display_point(&display_map);
         let mut target_point;
         let mut target_top;
         let mut target_bottom;
+        let mut fit_fallback = None;
         if let Some(first_highlighted_row) =
             self.highlighted_display_row_for_autoscroll(&display_map)
         {
@@ -172,6 +211,7 @@ impl Editor {
             target_bottom = target_top + 1.;
         } else {
             // Autoscroll only needs the first, last, and newest selections.
+            fit_fallback = Some(newest_selection_point);
             target_point = self
                 .selections
                 .first::<Point>(&display_map)
@@ -194,11 +234,7 @@ impl Editor {
             ) || (matches!(autoscroll, Autoscroll::Strategy(AutoscrollStrategy::Fit, _))
                 && !selections_fit)
             {
-                target_point = self
-                    .selections
-                    .newest::<Point>(&display_map)
-                    .head()
-                    .to_display_point(&display_map);
+                target_point = newest_selection_point;
                 target_top = target_point.row().as_f64();
                 target_bottom = target_top + 1.;
             }
@@ -228,7 +264,17 @@ impl Editor {
             target_point = anchor.to_display_point(&display_map);
             target_top = target_point.row().as_f64();
             target_bottom = target_top + 1.;
+            fit_fallback = None;
         }
+
+        let autoscroll_target = AutoscrollTarget {
+            point: target_point,
+            top: target_top,
+            bottom: target_bottom,
+            fit_fallback: matches!(strategy, AutoscrollStrategy::Fit)
+                .then_some(fit_fallback)
+                .flatten(),
+        };
 
         let visible_sticky_headers =
             self.visible_sticky_header_count_for_point(&display_map, target_point, cx);
@@ -291,7 +337,11 @@ impl Editor {
         ));
 
         let was_scrolled = WasScrolled(editor_was_scrolled.0 || was_autoscrolled.0);
-        (NeedsHorizontalAutoscroll(true), was_scrolled)
+        (
+            NeedsHorizontalAutoscroll(true),
+            was_scrolled,
+            Some(autoscroll_target),
+        )
     }
 
     pub(crate) fn visible_sticky_header_count_for_point(
