@@ -159,6 +159,7 @@ dependencies = [
  "clock",
  "collections",
  "ctor",
+ "diffy",
  "fs",
  "futures 0.3.32",
  "git",
