@@ -616,6 +616,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            reasoning_summary: None,
         }
     }
 

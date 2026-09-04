@@ -4399,6 +4399,7 @@ impl Thread {
             thinking_allowed: self.thinking_enabled
                 || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
             thinking_effort: self.thinking_effort.clone(),
+            reasoning_summary: AgentSettings::get_global(cx).reasoning_summary,
             speed: self.speed(),
             compact_at_tokens: None,
             max_output_tokens: None,
@@ -4815,6 +4816,11 @@ impl Thread {
             temperature: AgentSettings::temperature_for_model(&model, cx),
             thinking_allowed,
             thinking_effort,
+            reasoning_summary: if preserves_request_prefix {
+                AgentSettings::get_global(cx).reasoning_summary
+            } else {
+                None
+            },
             speed: if preserves_request_prefix {
                 self.speed()
             } else {
