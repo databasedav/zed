@@ -80,6 +80,7 @@ impl ThreadStore {
     pub fn fork_thread(
         &mut self,
         source_id: acp::SessionId,
+        source_snapshot: Option<Task<DbThread>>,
         folder_paths: PathList,
         cx: &mut Context<Self>,
     ) -> Task<Result<acp::SessionId>> {
@@ -87,11 +88,14 @@ impl ThreadStore {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let thread = database
-                .load_thread(source_id.clone())
-                .await?
-                .ok_or_else(|| anyhow!("thread {} not found", source_id))?
-                .forked();
+            let thread = match source_snapshot {
+                Some(source_snapshot) => source_snapshot.await,
+                None => database
+                    .load_thread(source_id.clone())
+                    .await?
+                    .ok_or_else(|| anyhow!("thread {} not found", source_id))?,
+            }
+            .forked();
             database
                 .save_thread(fork_id.clone(), thread, folder_paths)
                 .await?;
@@ -339,7 +343,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_fork_thread(cx: &mut TestAppContext) {
+    async fn test_fork_thread_uses_database_fallback(cx: &mut TestAppContext) {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         cx.run_until_parked();
 
@@ -354,6 +358,11 @@ mod tests {
         source_thread.sandboxed_terminal_temp_dir =
             Some(std::path::PathBuf::from("/nonexistent/sandbox-temp-dir"));
         source_thread.sandbox_grants.network_any_host = true;
+        source_thread.draft_prompt = Some(vec![acp::ContentBlock::from("unfinished draft")]);
+        source_thread.ui_scroll_position = Some(crate::db::SerializedScrollPosition {
+            item_ix: 3,
+            offset_in_item: 4.5,
+        });
 
         let save_task = thread_store.update(cx, |store, cx| {
             store.save_thread(source_id.clone(), source_thread, PathList::default(), cx)
@@ -362,7 +371,7 @@ mod tests {
         cx.run_until_parked();
 
         let fork_task = thread_store.update(cx, |store, cx| {
-            store.fork_thread(source_id.clone(), PathList::default(), cx)
+            store.fork_thread(source_id.clone(), None, PathList::default(), cx)
         });
         let fork_id = fork_task.await.unwrap();
         cx.run_until_parked();
@@ -381,7 +390,52 @@ mod tests {
             .unwrap();
         assert_eq!(fork.title.as_ref(), "Thread A (fork)");
         assert!(fork.subagent_context.is_none());
+        assert!(fork.draft_prompt.is_none());
+        assert!(fork.ui_scroll_position.is_none());
         assert!(fork.sandboxed_terminal_temp_dir.is_none());
         assert_eq!(fork.sandbox_grants, crate::DbSandboxGrants::default());
+    }
+
+    #[gpui::test]
+    async fn test_fork_thread_uses_snapshot_without_persisted_source(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let source_id = session_id("unpersisted-thread");
+        let mut source_thread = make_thread(
+            "In-Memory Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        source_thread.draft_prompt = Some(vec![acp::ContentBlock::from("unfinished draft")]);
+        source_thread.ui_scroll_position = Some(crate::db::SerializedScrollPosition {
+            item_ix: 3,
+            offset_in_item: 4.5,
+        });
+
+        let persisted_source = thread_store
+            .update(cx, |store, cx| store.load_thread(source_id.clone(), cx))
+            .await
+            .unwrap();
+        assert!(persisted_source.is_none());
+
+        let fork_task = thread_store.update(cx, |store, cx| {
+            store.fork_thread(
+                source_id,
+                Some(Task::ready(source_thread)),
+                PathList::default(),
+                cx,
+            )
+        });
+        let fork_id = fork_task.await.unwrap();
+        cx.run_until_parked();
+
+        let fork = thread_store
+            .update(cx, |store, cx| store.load_thread(fork_id, cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.title.as_ref(), "In-Memory Thread (fork)");
+        assert!(fork.draft_prompt.is_none());
+        assert!(fork.ui_scroll_position.is_none());
     }
 }
