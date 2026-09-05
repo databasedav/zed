@@ -1154,6 +1154,7 @@ impl ThreadView {
             .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
+                editor.set_use_modal_editing(true);
                 editor.set_text(initial_title, window, cx);
                 editor
             });
@@ -5499,6 +5500,15 @@ impl ThreadView {
                         .gap_1()
                         .child(
                             h_flex()
+                                .key_context("TitleEditor")
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    this.activation_focus_handle(cx).focus(window, cx);
+                                }))
+                                .on_action(cx.listener(
+                                    |this, _: &editor::actions::Cancel, window, cx| {
+                                        this.activation_focus_handle(cx).focus(window, cx);
+                                    },
+                                ))
                                 .flex_1()
                                 .gap_2()
                                 .child(
