@@ -3141,8 +3141,17 @@ impl Editor {
         &self.mode
     }
 
-    pub fn set_mode(&mut self, mode: EditorMode) {
+    pub fn set_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+
+        let single_line_changed = self.mode.is_single_line() != mode.is_single_line();
         self.mode = mode;
+        if single_line_changed {
+            self.refresh_single_line_folds(cx);
+        }
+        cx.notify();
     }
 
     pub fn collaboration_hub(&self) -> Option<&dyn CollaborationHub> {
@@ -9927,7 +9936,9 @@ impl Editor {
                 self.fit_gutter_line_number_width(false, cx);
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions_for_selection(window, cx);
-                self.refresh_single_line_folds(window, cx);
+                if self.mode.is_single_line() {
+                    self.refresh_single_line_folds(cx);
+                }
                 let snapshot = self.snapshot(window, cx);
                 self.refresh_matching_bracket_highlights(&snapshot, cx);
                 self.refresh_outline_symbols_at_cursor(cx);
@@ -12439,13 +12450,16 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
     fn set_multiline(&self, max_lines: Option<usize>, _window: &mut Window, cx: &mut App) {
         self.0.update(cx, |this, cx| {
             if let Some(max_lines) = max_lines {
-                this.set_mode(EditorMode::AutoHeight {
-                    min_lines: 1,
-                    max_lines: Some(max_lines),
-                });
+                this.set_mode(
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: Some(max_lines),
+                    },
+                    cx,
+                );
                 this.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
             } else {
-                this.set_mode(EditorMode::SingleLine);
+                this.set_mode(EditorMode::SingleLine, cx);
             }
             cx.notify();
         });

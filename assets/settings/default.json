@@ -1163,6 +1163,9 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
+    // Maximum number of lines for thread titles: 1 for a single line, a larger
+    // positive integer to wrap up to that many lines, or "unlimited" for no limit.
+    "thread_title_max_lines": "unlimited",
     // The default model to use when creating new threads.
     "default_model": {
       // The provider to use.

@@ -6795,7 +6795,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn agent_panel_section() -> [SettingsPageItem; 7] {
+    fn agent_panel_section() -> [SettingsPageItem; 8] {
         [
             SettingsPageItem::SectionHeader("Agent Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6873,6 +6873,34 @@ fn panels_page() -> SettingsPage {
                     },
                 }),
                 metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Thread Title Max Lines",
+                description: "Maximum number of lines for thread titles. Enter 1 for a single line, a larger positive integer to wrap up to that many lines, or unlimited (the default) for no line limit.",
+                field: Box::new(SettingField::<settings::ThreadTitleMaxLines> {
+                    organization_override: None,
+                    json_path: Some("agent.thread_title_max_lines"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .thread_title_max_lines
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .thread_title_max_lines = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("unlimited"),
+                    // A validation prompt must not trigger another submission on focus-out.
+                    display_confirm_button: true,
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::DynamicItem(DynamicItem {
