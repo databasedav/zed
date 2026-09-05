@@ -5774,13 +5774,14 @@ pub(crate) mod tests {
 
     impl Render for ThreadViewItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            // Render the title editor in the element tree too. In the real app
-            // it is part of the agent panel
+            // Root titles live in the agent panel; subagent titles are already
+            // rendered by the thread view's own header.
             let title_editor = self
                 .0
                 .read(cx)
                 .active_thread()
-                .map(|t| t.read(cx).title_editor.clone());
+                .filter(|thread| thread.read(cx).parent_session_id.is_none())
+                .map(|thread| thread.read(cx).title_editor.clone());
 
             v_flex().children(title_editor).child(self.0.clone())
         }
@@ -9932,6 +9933,109 @@ pub(crate) mod tests {
             outcome.params.is_some(),
             "checked patterns should attach terminal params"
         );
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_subagent_bindings(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            vim::init(cx);
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let subagent_view = conversation_view.update_in(cx, |view, window, cx| {
+            let parent_session_id = view
+                .root_thread(cx)
+                .expect("root thread should exist")
+                .read(cx)
+                .session_id()
+                .clone();
+            let connected = view.as_connected().expect("agent should be connected");
+            let conversation = connected.conversation.clone();
+            let thread = create_test_acp_thread(
+                Some(parent_session_id),
+                "subagent",
+                connected.connection.clone(),
+                view.project.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            let subagent_view = view.new_thread_view(thread, conversation, false, None, window, cx);
+            let session_id = acp::SessionId::new("subagent");
+            view.as_connected_mut()
+                .expect("agent should be connected")
+                .threads
+                .insert(session_id.clone(), subagent_view.clone());
+            view.navigate_to_thread(session_id, window, cx);
+            subagent_view
+        });
+        add_to_workspace(conversation_view, cx);
+        let title_editor = subagent_view.update_in(cx, |view, window, cx| {
+            view.rename("Subagent title".into(), window, cx);
+            view.title_editor.clone()
+        });
+
+        for normal_mode in [None, Some("helix_normal"), Some("normal")] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.vim_mode = Some(normal_mode == Some("normal"));
+                        settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                    });
+                });
+            });
+            cx.run_until_parked();
+            cx.focus(&title_editor);
+
+            let assert_title_mode = |mode: Option<&str>, cx: &mut VisualTestContext| {
+                title_editor.update_in(cx, |editor, window, cx| {
+                    assert!(editor.is_focused(window));
+                    assert_eq!(
+                        editor
+                            .key_context(window, cx)
+                            .get("vim_mode")
+                            .map(|mode| mode.as_ref()),
+                        mode,
+                    );
+                    assert_eq!(editor.text(cx), "Subagent title");
+                });
+            };
+            assert_title_mode(normal_mode, cx);
+            if normal_mode.is_some() {
+                cx.simulate_keystrokes("i");
+                assert_title_mode(Some("insert"), cx);
+                cx.simulate_keystrokes("escape");
+                assert_title_mode(normal_mode, cx);
+            }
+
+            for keystroke in ["enter", "escape"] {
+                cx.focus(&title_editor);
+                cx.simulate_keystrokes(keystroke);
+                subagent_view.update_in(cx, |view, window, cx| {
+                    assert!(view.focus_handle(cx).is_focused(window));
+                    assert!(!view.title_editor.read(cx).is_focused(window));
+                    assert_eq!(view.title_editor.read(cx).text(cx), "Subagent title");
+                });
+            }
+        }
     }
 
     #[gpui::test]
