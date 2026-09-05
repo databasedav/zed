@@ -218,6 +218,7 @@ pub struct AgentSettings {
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
+    pub thread_title_max_lines: Option<usize>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
@@ -794,6 +795,7 @@ impl Settings for AgentSettings {
             } else {
                 None
             },
+            thread_title_max_lines: agent.thread_title_max_lines.unwrap_or_default().max_lines(),
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
@@ -1349,6 +1351,37 @@ mod tests {
                 AgentSettings::get_global(cx).max_idle_retained_threads,
                 expected,
                 "{content}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_thread_title_max_lines(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        assert_eq!(AgentSettings::get_global(cx).thread_title_max_lines, None);
+
+        for (user_settings, expected) in [
+            (r#"{ "agent": { "thread_title_max_lines": 1 } }"#, Some(1)),
+            (r#"{ "agent": { "thread_title_max_lines": 6 } }"#, Some(6)),
+            (
+                r#"{ "agent": { "thread_title_max_lines": "unlimited" } }"#,
+                None,
+            ),
+            (r#"{ "agent": { "thread_title_max_lines": 2 } }"#, Some(2)),
+            ("{}", None),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(user_settings, cx)
+                    .expect("thread title line limit setting should load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).thread_title_max_lines,
+                expected
             );
         }
     }

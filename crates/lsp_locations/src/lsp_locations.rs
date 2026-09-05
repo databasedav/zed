@@ -1386,11 +1386,14 @@ mod tests {
         .replace("\n    let bar", "\n\n\n\n\n\n    let bar");
         cx.set_state(&source);
         if disabled {
-            cx.update_editor(|editor, _, _| {
-                editor.set_mode(editor::EditorMode::AutoHeight {
-                    min_lines: 1,
-                    max_lines: None,
-                })
+            cx.update_editor(|editor, _, cx| {
+                editor.set_mode(
+                    editor::EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    cx,
+                )
             });
         }
         let position = cx
