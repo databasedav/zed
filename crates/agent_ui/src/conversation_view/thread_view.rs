@@ -2359,12 +2359,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Consume boundary movement so the keystroke cannot fall back to scrolling output.
         if !self.message_editor.read(cx).is_empty(cx) {
-            cx.propagate();
             return;
         }
         let Some(last_id) = self.message_queue.last_id() else {
-            cx.propagate();
             return;
         };
         self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
@@ -4356,6 +4355,7 @@ impl ThreadView {
             .bg(editor_bg_color)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .on_action(|_: &zed_actions::editor::MoveDown, _, cx| cx.stop_propagation())
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))

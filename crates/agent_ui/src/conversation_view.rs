@@ -3697,7 +3697,9 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
-    use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
+    use gpui::{
+        ClipboardItem, EventEmitter, TestAppContext, UpdateGlobal, VisualTestContext, point, size,
+    };
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
@@ -10840,6 +10842,111 @@ pub(crate) mod tests {
             text, "existing content\n\nqueued message",
             "Main editor should have existing content and queued message separated by two newlines"
         );
+    }
+
+    #[gpui::test]
+    async fn test_message_editor_arrow_keys_do_not_scroll_output(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("default keymap should load");
+            cx.bind_keys(bindings);
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response paragraph.\n\n".repeat(100).into()),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Hello", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let editor = message_editor.read_with(cx, |editor, _| editor.editor().clone());
+        cx.focus(&message_editor);
+
+        let output_scroll_position = |cx: &TestAppContext| {
+            thread_view.read_with(cx, |view, _| {
+                let offset = view.list_state.logical_scroll_top();
+                (offset.item_ix, offset.offset_in_item)
+            })
+        };
+
+        for (text, end) in [
+            ("", text::Point::new(0, 0)),
+            ("line", text::Point::new(0, 4)),
+            ("first\nsecond\nthird", text::Point::new(2, 5)),
+        ] {
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.set_cursor_offset(0, window, cx);
+            });
+            cx.run_until_parked();
+            thread_view.update(cx, |view, cx| {
+                view.scroll_to_top(cx);
+                view.list_state.scroll_by(px(400.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let scroll_top = output_scroll_position(cx);
+            assert_ne!(scroll_top, (0, px(0.)));
+
+            for keystrokes in ["up up", "down down down down", "up up up up"] {
+                cx.simulate_keystrokes(keystrokes);
+                cx.run_until_parked();
+                assert_eq!(
+                    output_scroll_position(cx),
+                    scroll_top,
+                    "{keystrokes:?} must not scroll output with input {text:?}",
+                );
+                editor.update_in(cx, |editor, window, cx| {
+                    let cursor = editor
+                        .selections
+                        .newest::<text::Point>(&editor.snapshot(window, cx))
+                        .head();
+                    assert_eq!(
+                        cursor,
+                        if keystrokes.starts_with("down") {
+                            end
+                        } else {
+                            text::Point::new(0, 0)
+                        }
+                    );
+                });
+            }
+
+            cx.simulate_keystrokes("ctrl-alt-up");
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "explicit output-scroll shortcuts should still work from the input",
+            );
+        }
+
+        cx.simulate_keystrokes("ctrl-k o");
+        cx.run_until_parked();
+        for keystroke in ["up", "down"] {
+            let scroll_top = output_scroll_position(cx);
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            assert_ne!(
+                output_scroll_position(cx),
+                scroll_top,
+                "{keystroke} should still scroll when output is focused",
+            );
+        }
     }
 
     #[gpui::test]
