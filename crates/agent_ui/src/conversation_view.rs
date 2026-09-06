@@ -21,7 +21,8 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
+    Editor, EditorElement, EditorEvent, EditorMode, EditorStyle, MultiBuffer, PathKey,
+    SelectionEffects, SizingBehavior,
 };
 use file_icons::FileIcons;
 use fs::Fs;
@@ -56,7 +57,7 @@ use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
 use text::Anchor;
-use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
+use theme_settings::{AgentBufferFontSize, AgentUiFontSize, ThemeSettings};
 use ui::{
     Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton,
     DecoratedIcon, DiffStat, Disclosure, Divider, DividerColor, IconDecoration, IconDecorationKind,
