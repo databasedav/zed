@@ -27,9 +27,9 @@ use indoc::indoc;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelImageExt, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolResult, LanguageModelToolUse, MessageContent, ProviderErrorCategory, Role,
-    StopReason, TokenUsage,
+    LanguageModelReasoningSummary, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
+    ProviderErrorCategory, Role, StopReason, TokenUsage,
     fake_provider::{FakeLanguageModel, FakeLanguageModelProvider},
 };
 use pretty_assertions::assert_eq;
@@ -521,6 +521,37 @@ async fn test_thinking_allowed_when_model_cannot_disable_thinking(cx: &mut TestA
             .build_completion_request(CompletionIntent::UserPrompt, cx)
             .unwrap();
         assert!(request.thinking_allowed);
+    });
+}
+
+#[gpui::test]
+async fn test_completion_request_uses_reasoning_summary_setting(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+
+    thread.read_with(cx, |thread, cx| {
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert_eq!(request.reasoning_summary, None);
+    });
+
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().reasoning_summary =
+                    Some(settings::ReasoningSummarySetting::Detailed);
+            });
+        });
+    });
+
+    thread.read_with(cx, |thread, cx| {
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert_eq!(
+            request.reasoning_summary,
+            Some(LanguageModelReasoningSummary::Detailed)
+        );
     });
 }
 

@@ -4125,6 +4125,7 @@ impl Thread {
             // model that could.
             thinking_allowed: self.thinking_enabled || !model.supports_disabling_thinking(),
             thinking_effort: self.thinking_effort.clone(),
+            reasoning_summary: AgentSettings::get_global(cx).reasoning_summary,
             speed: self.speed(),
             compact_at_tokens: None,
         };
