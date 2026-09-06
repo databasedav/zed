@@ -338,6 +338,7 @@ impl UserMessage {
         const OPEN_SYMBOLS_TAG: &str = "<symbols>";
         const OPEN_SELECTIONS_TAG: &str = "<selections>";
         const OPEN_THREADS_TAG: &str = "<threads>";
+        const OPEN_AGENT_RESPONSES_TAG: &str = "<agent_responses>";
         const OPEN_FETCH_TAG: &str = "<fetched_urls>";
         const OPEN_RULES_TAG: &str =
             "<rules>\nThe user has specified the following rules that should be applied:\n";
@@ -352,6 +353,7 @@ impl UserMessage {
         let mut symbol_context = OPEN_SYMBOLS_TAG.to_string();
         let mut selection_context = OPEN_SELECTIONS_TAG.to_string();
         let mut thread_context = OPEN_THREADS_TAG.to_string();
+        let mut agent_response_context = OPEN_AGENT_RESPONSES_TAG.to_string();
         let mut fetch_context = OPEN_FETCH_TAG.to_string();
         let mut rules_context = OPEN_RULES_TAG.to_string();
         let mut diagnostics_context = OPEN_DIAGNOSTICS_TAG.to_string();
@@ -421,6 +423,14 @@ impl UserMessage {
                         }
                         MentionUri::Thread { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
+                        }
+                        MentionUri::AgentResponse => {
+                            write!(
+                                &mut agent_response_context,
+                                "\n<agent_response>\n{}\n</agent_response>\n",
+                                content
+                            )
+                            .ok();
                         }
                         MentionUri::Rule { .. } => {
                             // Deprecated: keeps legacy rule mentions as context.
@@ -530,6 +540,13 @@ impl UserMessage {
             message
                 .content
                 .push(language_model::MessageContent::Text(thread_context));
+        }
+
+        if agent_response_context.len() > OPEN_AGENT_RESPONSES_TAG.len() {
+            agent_response_context.push_str("</agent_responses>\n");
+            message
+                .content
+                .push(language_model::MessageContent::Text(agent_response_context));
         }
 
         if fetch_context.len() > OPEN_FETCH_TAG.len() {
@@ -6873,6 +6890,35 @@ mod tests {
             });
             registry.set_compaction_model(configured, cx);
         });
+    }
+
+    #[test]
+    fn test_agent_response_mention_uses_dedicated_request_context() {
+        let excerpt = "The previous agent response excerpt.";
+        let message = UserMessage {
+            id: ClientUserMessageId::new(),
+            content: vec![UserMessageContent::Mention {
+                uri: MentionUri::AgentResponse,
+                content: excerpt.into(),
+            }]
+            .into(),
+        };
+
+        let request = message.to_request();
+        assert_eq!(request.content.len(), 4);
+        assert_eq!(
+            request.content[0],
+            MessageContent::Text("[@Agent response](zed:///agent/response)".to_string())
+        );
+        assert_eq!(
+            request.content[2],
+            MessageContent::Text(format!(
+                "<agent_responses>\n<agent_response>\n{excerpt}\n</agent_response>\n</agent_responses>\n"
+            ))
+        );
+        let request_text = request.string_contents();
+        assert!(!request_text.contains("<selections>"));
+        assert!(!request_text.contains("```console"));
     }
 
     #[test]

@@ -852,7 +852,7 @@ impl MessageEditor {
             )
         };
         let agent_id = self.agent_id.clone();
-        let build_task = self.build_content_blocks(full_mention_content, cx);
+        let build_task = self.build_content_blocks(full_mention_content, false, cx);
 
         cx.spawn(async move |_, _cx| {
             Self::validate_slash_commands(
@@ -866,7 +866,7 @@ impl MessageEditor {
     }
 
     pub fn draft_contents(&self, cx: &mut Context<Self>) -> Task<Result<Vec<acp::ContentBlock>>> {
-        let build_task = self.build_content_blocks(false, cx);
+        let build_task = self.build_content_blocks(false, true, cx);
         cx.spawn(async move |_, _cx| {
             let (blocks, _tracked_buffers) = build_task.await?;
             Ok(blocks)
@@ -876,6 +876,7 @@ impl MessageEditor {
     fn build_content_blocks(
         &self,
         full_mention_content: bool,
+        preserve_agent_response_mentions: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
         let contents = self
@@ -896,6 +897,7 @@ impl MessageEditor {
                     &crease_snapshot,
                     &buffer_snapshot,
                     supports_embedded_context,
+                    preserve_agent_response_mentions,
                     |crease_id| {
                         contents
                             .remove(crease_id)
@@ -921,6 +923,7 @@ impl MessageEditor {
             &crease_snapshot,
             &buffer_snapshot,
             supports_embedded_context,
+            true,
             |crease_id| mention_set.resolved_mention_for_crease(crease_id),
         );
         chunks
@@ -2075,6 +2078,7 @@ fn build_chunks_from_creases(
     crease_snapshot: &CreaseSnapshot,
     buffer_snapshot: &MultiBufferSnapshot,
     supports_embedded_context: bool,
+    preserve_agent_response_mentions: bool,
     mut resolve: impl FnMut(&CreaseId) -> Option<(MentionUri, Option<Mention>)>,
 ) -> (Vec<acp::ContentBlock>, Vec<Entity<Buffer>>) {
     let mut ix = text
@@ -2096,6 +2100,7 @@ fn build_chunks_from_creases(
             &uri,
             mention.as_ref(),
             supports_embedded_context,
+            preserve_agent_response_mentions,
             &mut tracked_buffers,
         ));
         ix = crease_range.end.0;
@@ -2139,6 +2144,7 @@ fn mention_to_content_block(
     uri: &MentionUri,
     mention: Option<&Mention>,
     supports_embedded_context: bool,
+    preserve_agent_response_mentions: bool,
     tracked_buffers: &mut Vec<Entity<Buffer>>,
 ) -> acp::ContentBlock {
     match mention {
@@ -2147,12 +2153,22 @@ fn mention_to_content_block(
             tracked_buffers: mention_tracked_buffers,
         }) => {
             tracked_buffers.extend(mention_tracked_buffers.iter().cloned());
-            if supports_embedded_context {
+            if supports_embedded_context
+                || (preserve_agent_response_mentions && matches!(uri, MentionUri::AgentResponse))
+            {
                 acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                     acp::EmbeddedResourceResource::TextResourceContents(
                         acp::TextResourceContents::new(content.clone(), uri.to_uri().to_string()),
                     ),
                 ))
+            } else if matches!(uri, MentionUri::AgentResponse) {
+                let mut wrapped_content = String::from("<agent_response>\n");
+                wrapped_content.push_str(content);
+                if !content.ends_with('\n') {
+                    wrapped_content.push('\n');
+                }
+                wrapped_content.push_str("</agent_response>");
+                wrapped_content.into()
             } else {
                 acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
                     uri.name(),
@@ -5550,6 +5566,127 @@ mod tests {
 
         cx.run_until_parked();
         (message_editor, cx)
+    }
+
+    #[gpui::test]
+    async fn test_agent_response_selection_preserves_owned_content_and_draft(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let response = "The response excerpt.\nSecond line.";
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.insert_selections(
+                AgentContextSelection::AgentResponse(response.into()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let contents = mention_contents(&message_editor, cx).await;
+        assert_eq!(
+            contents,
+            vec![(
+                MentionUri::AgentResponse,
+                Mention::Text {
+                    content: response.to_string(),
+                    tracked_buffers: Vec::new(),
+                },
+            )]
+        );
+        let has_collapsed_content = message_editor.update(cx, |editor, cx| {
+            editor.editor.update(cx, |editor, cx| {
+                editor
+                    .display_map
+                    .update(cx, |display_map, cx| display_map.snapshot(cx))
+                    .has_collapsed_content()
+            })
+        });
+        assert!(has_collapsed_content);
+
+        let prompt_task = message_editor.update(cx, |editor, cx| editor.contents(false, cx));
+        let (prompt_blocks, _) = prompt_task.await.unwrap();
+        let [acp::ContentBlock::Text(prompt_text)] = prompt_blocks.as_slice() else {
+            panic!("expected wrapped plain text, got {prompt_blocks:#?}");
+        };
+        assert_eq!(
+            prompt_text.text,
+            "<agent_response>\nThe response excerpt.\nSecond line.\n</agent_response>"
+        );
+
+        message_editor.update(cx, |editor, _cx| {
+            editor
+                .session_capabilities
+                .write()
+                .set_prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true));
+        });
+        let supported_prompt_task =
+            message_editor.update(cx, |editor, cx| editor.contents(false, cx));
+        let (supported_prompt_blocks, _) = supported_prompt_task.await.unwrap();
+        assert!(matches!(
+            supported_prompt_blocks.as_slice(),
+            [acp::ContentBlock::Resource(acp::EmbeddedResource {
+                resource:
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents { uri, text, .. },
+                    ),
+                ..
+            })] if uri == MentionUri::AgentResponse.to_uri().as_str() && text == response
+        ));
+
+        let snapshot_blocks = message_editor.update(cx, |editor, cx| {
+            editor
+                .session_capabilities
+                .write()
+                .set_prompt_capabilities(acp::PromptCapabilities::default());
+            editor.draft_content_blocks_snapshot(cx)
+        });
+        assert!(matches!(
+            snapshot_blocks.as_slice(),
+            [acp::ContentBlock::Resource(acp::EmbeddedResource {
+                resource:
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents { uri, text, .. },
+                    ),
+                ..
+            })] if uri == MentionUri::AgentResponse.to_uri().as_str() && text == response
+        ));
+
+        let draft_task = message_editor.update(cx, |editor, cx| editor.draft_contents(cx));
+        let draft_blocks = draft_task.await.unwrap();
+        let [
+            acp::ContentBlock::Resource(acp::EmbeddedResource {
+                resource:
+                    acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents {
+                        uri,
+                        text,
+                        ..
+                    }),
+                ..
+            }),
+        ] = draft_blocks.as_slice()
+        else {
+            panic!("expected embedded agent response draft, got {draft_blocks:#?}");
+        };
+        assert_eq!(uri, MentionUri::AgentResponse.to_uri().as_str());
+        assert_eq!(text, response);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_message(draft_blocks, window, cx);
+        });
+        let restored_contents = mention_contents(&message_editor, cx).await;
+        assert_eq!(restored_contents, contents);
+        let restored_has_collapsed_content = message_editor.update(cx, |editor, cx| {
+            editor.editor.update(cx, |editor, cx| {
+                editor
+                    .display_map
+                    .update(cx, |display_map, cx| display_map.snapshot(cx))
+                    .has_collapsed_content()
+            })
+        });
+        assert!(restored_has_collapsed_content);
     }
 
     #[gpui::test]
