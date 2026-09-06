@@ -294,7 +294,7 @@ impl Render for QuickActionBar {
                                 this.separator().action_disabled_when(
                                     !has_selection,
                                     "Add to Agent Thread",
-                                    Box::new(AddSelectionToThread),
+                                    Box::new(AddSelectionToThread::default()),
                                 )
                             })
                             .separator()

@@ -88,7 +88,7 @@ Right-click on any agent response in the thread view to access a context menu wi
 
 In long conversations, use the scroll arrow buttons at the bottom of the panel to jump to your most recent prompt or to the very beginning of the thread. You can also scroll the thread using arrow keys, Page Up/Down, Home/End, and Shift+Page Up/Down to jump between messages, when the thread pane is focused.
 
-When focus is in the message editor, you can also use {#kb agent::ScrollOutputPageUp}, {#kb agent::ScrollOutputPageDown}, {#kb agent::ScrollOutputToTop}, {#kb agent::ScrollOutputToBottom}, {#kb agent::ScrollOutputLineUp}, and {#kb agent::ScrollOutputLineDown} to navigate the thread, or {#kb agent::ScrollOutputToPreviousMessage} and {#kb agent::ScrollOutputToNextMessage} to jump between your prompts.
+When focus is in the message editor, you can also use {#kb agent::ScrollOutputPageUp}, {#kb agent::ScrollOutputPageDown}, {#kb agent::ScrollOutputToTop}, {#kb agent::ScrollOutputToBottom}, {#kb agent::ScrollOutputLineUp}, and {#kb agent::ScrollOutputLineDown} to navigate the thread, or {#kb agent::SelectPreviousTranscriptEntry} and {#kb agent::SelectNextTranscriptEntry} to select and navigate between visible transcript entries, including tool calls.
 
 ### Thread titles {#thread-titles}
 
@@ -139,6 +139,8 @@ To paste content without this automatic formatting, use {#kb agent::PasteRaw} to
 ### Selection as Context
 
 Additionally, you can also select text in a buffer or terminal and add it as context by using the {#kb agent::AddSelectionToThread} keybinding, running the {#action agent::AddSelectionToThread} action, or choosing the "Selection" item in the `+` menu in the message editor.
+
+To reuse part of an assistant response as context, select it and choose **Add to Agent Thread** from the context menu. Selections from the rendered response preserve valid Markdown structure, while selections from **Show Markdown Source** use the exact selected source text.
 
 ### Images as Context
 

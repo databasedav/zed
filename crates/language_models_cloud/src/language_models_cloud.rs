@@ -831,10 +831,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                 };
 
                 if enable_thinking && let Some(effort) = effort {
-                    request.reasoning = Some(open_ai::responses::ReasoningConfig {
-                        effort,
-                        summary: Some(open_ai::responses::ReasoningSummaryMode::Auto),
-                    });
+                    set_open_ai_reasoning_effort(&mut request.reasoning, effort);
                 }
 
                 let auth_context = token_provider.auth_context(cx);
@@ -1257,17 +1254,88 @@ pub fn response_lines<T: DeserializeOwned>(
     )
 }
 
+fn set_open_ai_reasoning_effort(
+    reasoning: &mut Option<open_ai::responses::ReasoningConfig>,
+    effort: open_ai::ReasoningEffort,
+) {
+    if let Some(reasoning) = reasoning {
+        reasoning.effort = effort;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn updating_open_ai_reasoning_effort_preserves_summary() {
+        let mut reasoning = Some(open_ai::responses::ReasoningConfig {
+            effort: open_ai::ReasoningEffort::Low,
+            summary: Some(open_ai::responses::ReasoningSummaryMode::Detailed),
+        });
+
+        super::set_open_ai_reasoning_effort(&mut reasoning, open_ai::ReasoningEffort::High);
+
+        let reasoning = reasoning.expect("reasoning config");
+        assert_eq!(reasoning.effort, open_ai::ReasoningEffort::High);
+        assert_eq!(
+            reasoning.summary,
+            Some(open_ai::responses::ReasoningSummaryMode::Detailed)
+        );
+    }
+
     use super::*;
     use http_client::FakeHttpClient;
     use http_client::http::{HeaderMap, StatusCode};
     use language_model::{
-        LanguageModelCompletionError, LanguageModelRequestMessage, MessageContent,
-        ProviderErrorCategory, Role, Speed,
+        LanguageModelCompletionError, LanguageModelReasoningSummary, LanguageModelRequestMessage,
+        MessageContent, ProviderErrorCategory, Role, Speed,
     };
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[gpui::test]
+    async fn cloud_open_ai_forwards_detailed_reasoning_summary(cx: &mut gpui::TestAppContext) {
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_for_handler = captured_body.clone();
+        let http_client = FakeHttpClient::create(move |request| {
+            let captured_body = captured_body_for_handler.clone();
+            async move {
+                let mut body = request.into_body();
+                let mut body_text = String::new();
+                body.read_to_string(&mut body_text).await?;
+                *captured_body.lock().unwrap() = Some(body_text);
+
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(""))?)
+            }
+        });
+        let model = cloud_test_model(http_client);
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text("Think carefully.".to_string())],
+                cache: false,
+                reasoning_details: None,
+            }],
+            thinking_allowed: true,
+            thinking_effort: Some("high".to_string()),
+            reasoning_summary: Some(LanguageModelReasoningSummary::Detailed),
+            ..Default::default()
+        };
+
+        let stream = model
+            .stream_completion(request, &cx.to_async())
+            .await
+            .unwrap();
+        drop(stream);
+
+        let body = captured_body.lock().unwrap().take().unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            body["provider_request"]["reasoning"],
+            json!({"effort": "high", "summary": "detailed"})
+        );
+    }
 
     #[gpui::test]
     async fn cloud_explicit_compaction_forwards_supported_request_fields(

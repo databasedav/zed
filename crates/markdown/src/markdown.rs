@@ -28,7 +28,10 @@ use std::mem;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
 
 use collections::{HashMap, HashSet};
@@ -54,6 +57,8 @@ use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, p
 use util::ResultExt;
 
 use crate::parser::CodeBlockKind;
+
+static NEXT_CONTEXT_MENU_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 const MERMAID_MAX_ZOOM: f32 = 2.0;
 /// Zoom levels within this distance of 1.0 snap back to exactly 1.0 so users
@@ -507,6 +512,7 @@ pub struct Markdown {
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
+    context_menu_capture_id: u64,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
 }
@@ -702,6 +708,7 @@ impl Markdown {
             context_menu_link: None,
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
+            context_menu_capture_id: 0,
             search_highlights: Rc::default(),
             active_search_highlight: None,
         };
@@ -1169,6 +1176,8 @@ impl Markdown {
         link: Option<SharedString>,
         rendered_text: Option<&RenderedText>,
     ) {
+        self.context_menu_capture_id =
+            NEXT_CONTEXT_MENU_CAPTURE_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let range = self.selection.start..self.selection.end;
         if range.end > range.start {
             self.context_menu_selected_markdown = Some(SharedString::new(
@@ -1184,6 +1193,11 @@ impl Markdown {
             self.context_menu_selected_text = None;
         }
         self.context_menu_link = link;
+    }
+
+    /// Identifies the most recent context-menu capture across all Markdown entities.
+    pub fn context_menu_capture_id(&self) -> u64 {
+        self.context_menu_capture_id
     }
 
     /// Returns the URL of the link that was most recently right-clicked, if any.
@@ -1938,8 +1952,14 @@ impl MarkdownElement {
         };
 
         let mut heading_style = self.style.heading.clone();
-        let heading_text_style = heading_style.text_style().clone();
+        let mut heading_text_style = heading_style.text_style().clone();
         heading.style().refine(&heading_style);
+
+        if let Some(level_style) =
+            heading_level_style(level, self.style.heading_level_styles.as_ref())
+        {
+            heading_text_style.refine(level_style);
+        }
 
         builder.push_text_style(TextStyleRefinement {
             text_align: Some(align),
@@ -3341,22 +3361,26 @@ fn apply_heading_style(
         };
     }
 
-    if let Some(styles) = custom_styles {
-        let style_opt = match level {
-            pulldown_cmark::HeadingLevel::H1 => &styles.h1,
-            pulldown_cmark::HeadingLevel::H2 => &styles.h2,
-            pulldown_cmark::HeadingLevel::H3 => &styles.h3,
-            pulldown_cmark::HeadingLevel::H4 => &styles.h4,
-            pulldown_cmark::HeadingLevel::H5 => &styles.h5,
-            pulldown_cmark::HeadingLevel::H6 => &styles.h6,
-        };
-
-        if let Some(style) = style_opt {
-            heading.style().text = style.clone();
-        }
+    if let Some(style) = heading_level_style(level, custom_styles) {
+        heading.style().text = style.clone();
     }
 
     heading
+}
+
+fn heading_level_style(
+    level: pulldown_cmark::HeadingLevel,
+    custom_styles: Option<&HeadingLevelStyles>,
+) -> Option<&TextStyleRefinement> {
+    let styles = custom_styles?;
+    match level {
+        pulldown_cmark::HeadingLevel::H1 => styles.h1.as_ref(),
+        pulldown_cmark::HeadingLevel::H2 => styles.h2.as_ref(),
+        pulldown_cmark::HeadingLevel::H3 => styles.h3.as_ref(),
+        pulldown_cmark::HeadingLevel::H4 => styles.h4.as_ref(),
+        pulldown_cmark::HeadingLevel::H5 => styles.h5.as_ref(),
+        pulldown_cmark::HeadingLevel::H6 => styles.h6.as_ref(),
+    }
 }
 
 fn render_wrap_code_block_button(
@@ -6553,6 +6577,9 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| TestWindow);
         let markdown = cx.new(|cx| Markdown::new("some text".into(), None, None, cx));
         cx.run_until_parked();
+        let initial_capture_id =
+            cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert_eq!(initial_capture_id, 0);
 
         // Simulates right-clicking on a link, with "text" selected
         let url: SharedString = "https://example.com".into();
@@ -6561,6 +6588,8 @@ mod tests {
             md.selection.end = 9;
             md.capture_for_context_menu(Some(url.clone()), None);
         });
+        let first_capture_id = cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert!(first_capture_id > initial_capture_id);
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
             assert_eq!(
@@ -6587,6 +6616,9 @@ mod tests {
             md.selection.end = 0;
             md.capture_for_context_menu(None, None);
         });
+        let second_capture_id =
+            cx.update(|_window, cx| markdown.read(cx).context_menu_capture_id());
+        assert!(second_capture_id > first_capture_id);
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
             assert!(markdown.context_menu_link().is_none());
@@ -6826,7 +6858,7 @@ mod tests {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.theme.ui_font_size = Some(16.0.into());
-                    settings.theme.markdown_preview_font_size = None;
+                    settings.markdown_preview.get_or_insert_default().font_size = None;
                 });
             });
         });
@@ -6854,7 +6886,7 @@ mod tests {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.theme.ui_font_size = Some(20.0.into());
-                    settings.theme.markdown_preview_font_size = None;
+                    settings.markdown_preview.get_or_insert_default().font_size = None;
                 });
             });
         });
@@ -6915,7 +6947,7 @@ mod tests {
         cx.update(|cx| {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.theme.markdown_preview_font_size = Some(14.0.into());
+                    settings.markdown_preview.get_or_insert_default().font_size = Some(14.0.into());
                     settings.theme.buffer_line_height =
                         Some(settings::BufferLineHeight::Custom(1.5));
                 });
@@ -7120,7 +7152,7 @@ mod tests {
     /// Note that this does not reproduce the `WithRemSize` wrapper the real
     /// preview renders inside, so rem-derived lengths (such as the `rems(1.3)`
     /// prose leading) resolve against the default rem size rather than
-    /// `markdown_preview_font_size`. Code block metrics are unaffected, since
+    /// `markdown_preview.font_size`. Code block metrics are unaffected, since
     /// the code font size is set as absolute pixels.
     fn rendered_prose_and_code_line_heights(
         cx: &mut TestAppContext,
@@ -7131,7 +7163,8 @@ mod tests {
         cx.update(|cx| {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.theme.markdown_preview_font_size = Some(font_size.into());
+                    settings.markdown_preview.get_or_insert_default().font_size =
+                        Some(font_size.into());
                     settings.theme.buffer_line_height =
                         Some(settings::BufferLineHeight::Custom(buffer_line_height));
                 });

@@ -86,6 +86,8 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub action_log: action_log::SerializedActionLog,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -169,6 +171,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         }
     }
 
@@ -185,11 +188,36 @@ impl SharedThread {
     }
 }
 
+/// The title given to a forked copy of a thread titled `title`.
+pub fn forked_thread_title(title: &str) -> SharedString {
+    format!("{title} (fork)").into()
+}
+
 impl DbThread {
     pub const VERSION: &'static str = "0.3.0";
 
     pub fn to_markdown(&self) -> String {
         crate::messages_to_markdown(&self.messages)
+    }
+
+    /// Consumes this thread's state and turns it into that of a fork:
+    /// marks the title and clears the state that is owned by or scoped to
+    /// the original thread.
+    pub fn forked(mut self) -> Self {
+        self.title = forked_thread_title(&self.title);
+        self.draft_prompt = None;
+        self.ui_scroll_position = None;
+        // Threads with a subagent parent are hidden from history and
+        // cascade-deleted with their parent, which must not apply to a fork.
+        self.subagent_context = None;
+        // The sandboxed terminal temp dir is owned by the source thread and
+        // removed from disk when that thread is deleted, so the fork cannot
+        // share it.
+        self.sandboxed_terminal_temp_dir = None;
+        // Sandbox grants were approved "for the rest of this thread" only;
+        // the fork is a new thread and must re-prompt.
+        self.sandbox_grants = DbSandboxGrants::default();
+        self
     }
 
     pub fn from_json(json: &[u8]) -> Result<Self> {
@@ -355,6 +383,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         })
     }
 }
@@ -826,6 +855,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            action_log: action_log::SerializedActionLog::default(),
         }
     }
 

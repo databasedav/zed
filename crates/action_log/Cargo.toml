@@ -17,6 +17,7 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 buffer_diff.workspace = true
+diffy = "0.4.2"
 log.workspace = true
 clock.workspace = true
 collections.workspace = true
@@ -25,6 +26,7 @@ futures.workspace = true
 gpui.workspace = true
 language.workspace = true
 project.workspace = true
+serde.workspace = true
 telemetry.workspace = true
 text.workspace = true
 util.workspace = true

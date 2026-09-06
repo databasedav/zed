@@ -4,7 +4,7 @@ use crate::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::is_agents_skills_path;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use fs::Fs;
 use gpui::{App, Entity, Task, WeakEntity};
 use project::{Project, ProjectPath};
@@ -467,6 +467,136 @@ pub fn resolve_project_path(
         });
     }
 
+    Ok(ResolvedProjectPath::Safe(project_path))
+}
+
+/// Resolves existing paths without treating an unloaded scan entry as a missing
+/// file. Only metadata is probed; callers must check exclusions and authorize
+/// symlink escapes before opening files or expanding directories.
+pub async fn resolve_project_path_for_read(
+    project: &Entity<Project>,
+    path: &str,
+    canonical_worktree_roots: &[PathBuf],
+    fs: &Arc<dyn Fs>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<ResolvedProjectPath> {
+    let candidates = project.read_with(cx, |project, cx| {
+        let path_style = project.path_style(cx);
+        let absolute = util::paths::is_absolute(path, path_style);
+        let path = Path::new(path);
+        let mut prefixed = Vec::new();
+        let mut relative = Vec::new();
+        for worktree in project.visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let root = worktree.abs_path();
+            let root_name = worktree.root_name();
+            let prefix = if absolute {
+                root.as_ref()
+            } else {
+                root_name.as_std_path()
+            };
+            let add_candidate = |relative_path: &Path, candidates: &mut Vec<_>| {
+                if let Ok(relative_path) = util::rel_path::RelPath::new(relative_path, path_style) {
+                    let project_path = ProjectPath {
+                        worktree_id: worktree.id(),
+                        path: relative_path.into_arc(),
+                    };
+                    let abs_path = root.join(project_path.path.as_std_path());
+                    let indexed = worktree.entry_for_path(&project_path.path).is_some();
+                    candidates.push((project_path, abs_path, worktree.is_local(), indexed));
+                }
+            };
+            if let Ok(relative_path) = path.strip_prefix(prefix) {
+                add_candidate(relative_path, &mut prefixed);
+            }
+            if !absolute {
+                add_candidate(path, &mut relative);
+            }
+        }
+        if prefixed.is_empty() {
+            relative
+        } else {
+            prefixed
+        }
+    });
+
+    let mut matches = Vec::new();
+    for (project_path, abs_path, local, indexed) in candidates {
+        let exists = if local {
+            let metadata = fs.metadata(&abs_path).await.with_context(|| {
+                format!("Cannot disambiguate {path}: failed to inspect {}. Use an absolute path to select a root.", abs_path.display())
+            })?;
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_symlink)
+            {
+                match fs.canonicalize(&abs_path).await {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            )
+                        }) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.context(format!("Cannot resolve {}", abs_path.display())));
+                    }
+                }
+            }
+            metadata.is_some()
+        } else {
+            indexed
+        };
+        if exists && !matches.iter().any(|(_, path, _)| path == &abs_path) {
+            matches.push((project_path, abs_path, local));
+        }
+    }
+    if matches.len() > 1 {
+        let paths = matches
+            .iter()
+            .map(|(_, path, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Ambiguous project path {path}: matches {paths}. Use an absolute path to disambiguate."
+        );
+    }
+    let Some((project_path, abs_path, local)) = matches.pop() else {
+        return project.read_with(cx, |project, cx| {
+            resolve_project_path(project, path, canonical_worktree_roots, cx)
+        });
+    };
+    if !local {
+        return project.read_with(cx, |project, cx| {
+            resolve_project_path(project, &abs_path, canonical_worktree_roots, cx)
+        });
+    }
+    let root = project
+        .read_with(cx, |project, cx| {
+            project
+                .worktree_for_id(project_path.worktree_id, cx)
+                .map(|worktree| worktree.read(cx).abs_path())
+        })
+        .ok_or_else(|| anyhow!("Worktree for {path} was removed"))?;
+    // Loading an unindexed path can scan its ancestors. A path that leaves the
+    // project and symlinks back in must not authorize those scans implicitly.
+    let ancestors = abs_path
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(root.as_ref()))
+        .collect::<Vec<_>>();
+    for ancestor in ancestors.into_iter().rev() {
+        let canonical_target = fs.canonicalize(ancestor).await?;
+        if !is_within_any_worktree(&canonical_target, canonical_worktree_roots) {
+            return Ok(ResolvedProjectPath::SymlinkEscape {
+                project_path,
+                canonical_target,
+            });
+        }
+    }
     Ok(ResolvedProjectPath::Safe(project_path))
 }
 

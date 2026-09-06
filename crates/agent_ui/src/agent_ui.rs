@@ -225,12 +225,16 @@ actions!(
         CycleFavoriteModels,
         /// Expands the message editor to full size.
         ExpandMessageEditor,
+        /// Toggles focus between the message editor and the transcript output.
+        ToggleInputOutputFocus,
         /// Archives the currently selected thread.
         ArchiveSelectedThread,
         /// Removes the currently selected thread.
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
+        /// Forks the currently selected thread.
+        ForkSelectedThread,
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.
@@ -320,6 +324,10 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Selects the previous navigable entry in the agent transcript.
+        SelectPreviousTranscriptEntry,
+        /// Selects the next navigable entry in the agent transcript.
+        SelectNextTranscriptEntry,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
@@ -977,6 +985,7 @@ mod tests {
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
+            thread_title_max_lines: None,
             default_model: None,
             subagent_model: None,
             inline_assistant_model: None,
@@ -1011,6 +1020,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            reasoning_summary: None,
         };
 
         cx.update(|cx| {

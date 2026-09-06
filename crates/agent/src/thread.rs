@@ -338,6 +338,7 @@ impl UserMessage {
         const OPEN_SYMBOLS_TAG: &str = "<symbols>";
         const OPEN_SELECTIONS_TAG: &str = "<selections>";
         const OPEN_THREADS_TAG: &str = "<threads>";
+        const OPEN_AGENT_RESPONSES_TAG: &str = "<agent_responses>";
         const OPEN_FETCH_TAG: &str = "<fetched_urls>";
         const OPEN_RULES_TAG: &str =
             "<rules>\nThe user has specified the following rules that should be applied:\n";
@@ -352,6 +353,7 @@ impl UserMessage {
         let mut symbol_context = OPEN_SYMBOLS_TAG.to_string();
         let mut selection_context = OPEN_SELECTIONS_TAG.to_string();
         let mut thread_context = OPEN_THREADS_TAG.to_string();
+        let mut agent_response_context = OPEN_AGENT_RESPONSES_TAG.to_string();
         let mut fetch_context = OPEN_FETCH_TAG.to_string();
         let mut rules_context = OPEN_RULES_TAG.to_string();
         let mut diagnostics_context = OPEN_DIAGNOSTICS_TAG.to_string();
@@ -421,6 +423,14 @@ impl UserMessage {
                         }
                         MentionUri::Thread { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
+                        }
+                        MentionUri::AgentResponse => {
+                            write!(
+                                &mut agent_response_context,
+                                "\n<agent_response>\n{}\n</agent_response>\n",
+                                content
+                            )
+                            .ok();
                         }
                         MentionUri::Rule { .. } => {
                             // Deprecated: keeps legacy rule mentions as context.
@@ -530,6 +540,13 @@ impl UserMessage {
             message
                 .content
                 .push(language_model::MessageContent::Text(thread_context));
+        }
+
+        if agent_response_context.len() > OPEN_AGENT_RESPONSES_TAG.len() {
+            agent_response_context.push_str("</agent_responses>\n");
+            message
+                .content
+                .push(language_model::MessageContent::Text(agent_response_context));
         }
 
         if fetch_context.len() > OPEN_FETCH_TAG.len() {
@@ -1751,6 +1768,7 @@ impl Thread {
         project_context: Entity<ProjectContext>,
         context_server_registry: Entity<ContextServerRegistry>,
         templates: Arc<Templates>,
+        action_log: Entity<ActionLog>,
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
@@ -1785,8 +1803,6 @@ impl Thread {
         let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(
             Self::prompt_capabilities(model.as_model().map(|model| model.as_ref())),
         );
-
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
         Self {
             id,
@@ -1935,6 +1951,7 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            action_log: self.action_log.read(cx).serialize(cx),
         };
 
         cx.background_spawn(async move {
@@ -3848,6 +3865,7 @@ impl Thread {
             return Task::ready(None).shared();
         };
         let mut request = LanguageModelRequest {
+            thread_id: Some(self.id.to_string()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
             ..Default::default()
@@ -3936,7 +3954,7 @@ impl Thread {
         log::debug!("Generating title with model: {:?}", model.name());
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
-        let request = build_thread_title_request(&self.messages, temperature);
+        let request = build_thread_title_request(&self.id, &self.messages, temperature);
 
         let title_generation = cx.spawn(async move |_this, cx| {
             stream_thread_title(model, request, cx)
@@ -4125,6 +4143,7 @@ impl Thread {
             // model that could.
             thinking_allowed: self.thinking_enabled || !model.supports_disabling_thinking(),
             thinking_effort: self.thinking_effort.clone(),
+            reasoning_summary: AgentSettings::get_global(cx).reasoning_summary,
             speed: self.speed(),
             compact_at_tokens: None,
         };
@@ -4530,7 +4549,7 @@ impl Thread {
             // provider's requested delay when it gave one, and fall back to
             // exponential backoff when it didn't.
             ProviderRejection { retry_after, .. } => {
-                if error.retry_delay(1).is_none() {
+                if !error.is_transient() {
                     return None;
                 }
                 Some(match retry_after {
@@ -4855,10 +4874,12 @@ fn retained_user_request_messages_before(
 }
 
 pub fn build_thread_title_request(
+    thread_id: &acp::SessionId,
     messages: &[Arc<Message>],
     temperature: Option<f32>,
 ) -> LanguageModelRequest {
     let mut request = LanguageModelRequest {
+        thread_id: Some(thread_id.to_string()),
         intent: Some(CompletionIntent::ThreadSummarization),
         temperature,
         ..Default::default()
@@ -6876,6 +6897,35 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_response_mention_uses_dedicated_request_context() {
+        let excerpt = "The previous agent response excerpt.";
+        let message = UserMessage {
+            id: ClientUserMessageId::new(),
+            content: vec![UserMessageContent::Mention {
+                uri: MentionUri::AgentResponse,
+                content: excerpt.into(),
+            }]
+            .into(),
+        };
+
+        let request = message.to_request();
+        assert_eq!(request.content.len(), 4);
+        assert_eq!(
+            request.content[0],
+            MessageContent::Text("[@Agent response](zed:///agent/response)".to_string())
+        );
+        assert_eq!(
+            request.content[2],
+            MessageContent::Text(format!(
+                "<agent_responses>\n<agent_response>\n{excerpt}\n</agent_response>\n</agent_responses>\n"
+            ))
+        );
+        let request_text = request.string_contents();
+        assert!(!request_text.contains("<selections>"));
+        assert!(!request_text.contains("```console"));
+    }
+
+    #[test]
     fn test_summary_compaction_renders_for_request_and_markdown() {
         let message = Message::Compaction(CompactionInfo::Summary("Older context".into()));
 
@@ -6939,6 +6989,7 @@ mod tests {
     #[gpui::test]
     async fn test_thread_summary_request_uses_compacted_history(cx: &mut TestAppContext) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let thread_id = thread.read_with(cx, |thread, _| thread.id().to_string());
         let summary_model = Arc::new(FakeLanguageModel::default());
 
         let summary_task = cx.update(|cx| {
@@ -6968,6 +7019,10 @@ mod tests {
         cx.run_until_parked();
 
         let summary_request = summary_model.pending_completions().pop().unwrap();
+        assert_eq!(
+            summary_request.thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
         assert_eq!(
             summary_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
@@ -7002,8 +7057,10 @@ mod tests {
             agent_text_message("after assistant"),
         ];
 
-        let request = build_thread_title_request(&messages, Some(0.2));
+        let request =
+            build_thread_title_request(&acp::SessionId::new("thread-id"), &messages, Some(0.2));
 
+        assert_eq!(request.thread_id.as_deref(), Some("thread-id"));
         assert_eq!(request.intent, Some(CompletionIntent::ThreadSummarization));
         assert_eq!(request.temperature, Some(0.2));
         assert_eq!(

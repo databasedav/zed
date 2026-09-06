@@ -254,7 +254,9 @@ pub mod dev {
             ToggleFpsOverlay,
             /// Resets the debug frame-time overlay's statistics, except for the
             /// total frame count.
-            ResetFrameOverlayStats
+            ResetFrameOverlayStats,
+            /// Opens the key context view for debugging keybindings.
+            OpenKeyContextView
         ]
     );
 }
@@ -593,15 +595,25 @@ pub mod agent {
             ReauthenticateAgent,
             /// Logs out of the current external agent
             LogoutAgent,
-            /// Add the current selection as context for threads in the agent panel.
-            #[action(deprecated_aliases = ["assistant::QuoteSelection", "agent::QuoteSelection"])]
-            AddSelectionToThread,
             /// Resets the agent panel zoom levels (agent UI and buffer font sizes).
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
         ]
     );
+
+    /// Add the current selection as context for threads in the agent panel.
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(
+        namespace = agent,
+        deprecated_aliases = ["assistant::QuoteSelection", "agent::QuoteSelection"]
+    )]
+    #[serde(deny_unknown_fields)]
+    pub struct AddSelectionToThread {
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub agent_response_excerpt: Option<SharedString>,
+    }
 
     /// Selects the agent used for new threads in the agent panel, without
     /// opening the panel. The selected agent is launched the next time the

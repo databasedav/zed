@@ -143,7 +143,7 @@ async fn read_global_skill_file(
 
 use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
-    resolve_global_skill_path, resolve_project_path,
+    resolve_global_skill_path, resolve_project_path_for_read,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
 
@@ -277,18 +277,16 @@ impl AgentTool for ReadFileTool {
 
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
 
-            let (project_path, symlink_canonical_target) =
-                project.read_with(cx, |project, cx| {
-                    let resolved =
-                        resolve_project_path(project, &input.path, &canonical_roots, cx)?;
-                    anyhow::Ok(match resolved {
-                        ResolvedProjectPath::Safe(path) => (path, None),
-                        ResolvedProjectPath::SymlinkEscape {
-                            project_path,
-                            canonical_target,
-                        } => (project_path, Some(canonical_target)),
-                    })
-                }).map_err(tool_content_err)?;
+            let resolved = resolve_project_path_for_read(
+                &project, &input.path, &canonical_roots, &fs, cx,
+            ).await.map_err(tool_content_err)?;
+            let (project_path, symlink_canonical_target) = match resolved {
+                ResolvedProjectPath::Safe(path) => (path, None),
+                ResolvedProjectPath::SymlinkEscape {
+                    project_path,
+                    canonical_target,
+                } => (project_path, Some(canonical_target)),
+            };
 
             let abs_path = project
                 .read_with(cx, |project, cx| {
@@ -546,6 +544,162 @@ mod test {
     use std::path::PathBuf;
     use std::sync::Arc;
     use util::path;
+
+    #[gpui::test]
+    async fn test_read_file_duplicate_roots_find_unindexed_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/config/zed"),
+            json!({
+                "deferred": { "other.txt": "wrong checkout" }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/source/zed"),
+            json!({
+                "deferred": { "nested": { "file.txt": "correct checkout" } },
+                "unrelated": { "file.txt": "do not scan" }
+            }),
+        )
+        .await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/config/zed").as_ref(), path!("/source/zed").as_ref()],
+            cx,
+        )
+        .await;
+        cx.executor().run_until_parked();
+        project.read_with(cx, |project, cx| {
+            for worktree in project.worktrees(cx) {
+                assert!(
+                    worktree
+                        .read(cx)
+                        .entry_for_path(
+                            util::rel_path::RelPath::from_unix_str("deferred/nested/file.txt")
+                                .expect("valid relative path")
+                        )
+                        .is_none()
+                );
+            }
+        });
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project.clone(), action_log, false));
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "zed/deferred/nested/file.txt".into(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .expect("unindexed file should resolve in the correct root");
+        assert_eq!(result, "     1\tcorrect checkout".into());
+        project.read_with(cx, |project, cx| {
+            for worktree in project.worktrees(cx) {
+                assert!(
+                    worktree
+                        .read(cx)
+                        .entry_for_path(
+                            util::rel_path::RelPath::from_unix_str("unrelated/file.txt")
+                                .expect("valid relative path")
+                        )
+                        .is_none()
+                );
+                assert!(
+                    worktree
+                        .read(cx)
+                        .entry_for_path(
+                            util::rel_path::RelPath::from_unix_str("deferred/other.txt")
+                                .expect("valid relative path")
+                        )
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_read_file_duplicate_roots_report_ambiguity(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(1);
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/one/zed"),
+            json!({
+                "deferred": { "file.txt": "first checkout" }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/two/zed"),
+            json!({
+                "deferred": { "file.txt": "second checkout" }
+            }),
+        )
+        .await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/one/zed").as_ref(), path!("/two/zed").as_ref()],
+            cx,
+        )
+        .await;
+        cx.executor().run_until_parked();
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, false));
+        let reads = fs.read_dir_call_count();
+        let result = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "zed/deferred/file.txt".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .expect_err("same-named roots must not be guessed");
+        assert!(error_text(result).contains("Ambiguous project path"));
+        assert_eq!(fs.read_dir_call_count(), reads);
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: path!("/two/zed/deferred/file.txt").into(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .expect("an absolute path disambiguates the roots");
+        assert_eq!(result, "     1\tsecond checkout".into());
+    }
 
     #[gpui::test]
     async fn test_read_directory_path(cx: &mut TestAppContext) {

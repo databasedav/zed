@@ -6,7 +6,10 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::v1 as acp;
-use std::cell::RefCell;
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -31,9 +34,9 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
-use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{EntityId, List};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
@@ -54,6 +57,13 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+struct MarkdownSourceEditor {
+    buffer: Entity<Buffer>,
+    editor: Entity<Editor>,
+    observed_markdown: HashSet<EntityId>,
+    _subscriptions: Vec<Subscription>,
+}
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -590,8 +600,11 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    selected_transcript_entry: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+    markdown_source_editors: HashMap<usize, MarkdownSourceEditor>,
+    last_markdown_context_menu_capture_id: Cell<u64>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -886,6 +899,8 @@ impl ThreadView {
             .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
+                Self::configure_title_editor(&mut editor, cx);
+                editor.set_use_modal_editing(true);
                 editor.set_text(initial_title, window, cx);
                 editor
             });
@@ -893,11 +908,49 @@ impl ThreadView {
             editor
         };
 
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            this.title_editor.update(cx, Self::configure_title_editor);
+            cx.notify();
+        }));
+
         subscriptions.push(cx.subscribe_in(
             &entry_view_state,
             window,
             Self::handle_entry_view_event,
         ));
+
+        subscriptions.push(
+            cx.subscribe_in(
+                &thread,
+                window,
+                |this, thread, event, window, cx| match event {
+                    AcpThreadEvent::EntryUpdated(entry_index) => {
+                        this.sync_markdown_source_editor(*entry_index, thread, window, cx);
+                        this.reconcile_selected_transcript_entry(*entry_index, cx);
+                    }
+                    AcpThreadEvent::EntriesRemoved(range) => {
+                        this.reconcile_selected_transcript_entry_after_removal(range.clone(), cx);
+                        let focused_source_was_removed =
+                            this.markdown_source_editors
+                                .iter()
+                                .any(|(entry_index, source)| {
+                                    *entry_index >= range.start
+                                        && source
+                                            .editor
+                                            .focus_handle(cx)
+                                            .contains_focused(window, cx)
+                                });
+                        this.markdown_source_editors
+                            .retain(|entry_index, _| *entry_index < range.start);
+                        if focused_source_was_removed {
+                            this.message_editor.focus_handle(cx).focus(window, cx);
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        );
 
         subscriptions.push(cx.subscribe_in(
             &message_editor,
@@ -999,6 +1052,7 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            selected_transcript_entry: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1010,6 +1064,8 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            markdown_source_editors: HashMap::default(),
+            last_markdown_context_menu_capture_id: Cell::new(0),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -2359,12 +2415,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Consume boundary movement so the keystroke cannot fall back to scrolling output.
         if !self.message_editor.read(cx).is_empty(cx) {
-            cx.propagate();
             return;
         }
         let Some(last_id) = self.message_queue.last_id() else {
-            cx.propagate();
             return;
         };
         self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
@@ -2390,6 +2445,31 @@ impl ThreadView {
         self.editor_expanded = is_expanded;
         self.sync_editor_mode(cx);
         cx.notify();
+    }
+
+    fn configure_title_editor(editor: &mut Editor, cx: &mut Context<Editor>) {
+        let max_lines = AgentSettings::get_global(cx).thread_title_max_lines;
+        let expand = max_lines != Some(1);
+        let mode = if expand {
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines,
+            }
+        } else {
+            EditorMode::SingleLine
+        };
+        if editor.mode() != &mode {
+            editor.set_mode(mode, cx);
+            editor.set_soft_wrap_mode(
+                if expand {
+                    language::language_settings::SoftWrap::EditorWidth
+                } else {
+                    language::language_settings::SoftWrap::None
+                },
+                cx,
+            );
+            editor.set_offset_content(expand, cx);
+        }
     }
 
     pub fn handle_title_editor_event(
@@ -4255,12 +4335,21 @@ impl ThreadView {
         let is_done = thread.read(cx).status() == ThreadStatus::Idle;
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let settings = AgentSettings::get_global(cx);
+        let max_content_width = settings.max_content_width;
+        let title_wraps = settings.thread_title_max_lines != Some(1);
 
         Some(
             h_flex()
                 .w_full()
-                .h(Tab::container_height(cx))
+                .map(|this| {
+                    if title_wraps {
+                        this.min_h(Tab::container_height(cx))
+                    } else {
+                        this.h(Tab::container_height(cx))
+                    }
+                })
+                .flex_shrink_0()
                 .border_b_1()
                 .when(is_done && is_canceled_or_failed, |this| {
                     this.border_dashed()
@@ -4269,7 +4358,13 @@ impl ThreadView {
                 .bg(cx.theme().colors().editor_background.opacity(0.2))
                 .child(
                     h_flex()
-                        .size_full()
+                        .map(|this| {
+                            if title_wraps {
+                                this.w_full().py(DynamicSpacing::Base04.rems(cx))
+                            } else {
+                                this.size_full()
+                            }
+                        })
                         .when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto())
                         .pl_2()
                         .pr_1()
@@ -4278,14 +4373,24 @@ impl ThreadView {
                         .gap_1()
                         .child(
                             h_flex()
+                                .key_context("TitleEditor")
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    this.activation_focus_handle(cx).focus(window, cx);
+                                }))
+                                .on_action(cx.listener(
+                                    |this, _: &editor::actions::Cancel, window, cx| {
+                                        this.activation_focus_handle(cx).focus(window, cx);
+                                    },
+                                ))
                                 .flex_1()
+                                .min_w_0()
                                 .gap_2()
                                 .child(
                                     Icon::new(IconName::ForwardArrowUp)
                                         .size(IconSize::Small)
                                         .color(Color::Muted),
                                 )
-                                .child(self.title_editor.clone())
+                                .child(div().flex_1().min_w_0().child(self.title_editor.clone()))
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(Icon::new(IconName::Close).color(Color::Error))
                                 })
@@ -4356,6 +4461,7 @@ impl ThreadView {
             .bg(editor_bg_color)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .on_action(|_: &zed_actions::editor::MoveDown, _, cx| cx.stop_propagation())
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
@@ -5624,7 +5730,8 @@ impl ThreadView {
                         .handler({
                             move |window, cx| {
                                 window.dispatch_action(
-                                    zed_actions::agent::AddSelectionToThread.boxed_clone(),
+                                    zed_actions::agent::AddSelectionToThread::default()
+                                        .boxed_clone(),
                                     cx,
                                 );
                             }
@@ -6098,7 +6205,27 @@ impl ThreadView {
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
+                    let selected = this.selected_transcript_entry == Some(index)
+                        && this.focus_handle.is_focused(window);
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered =
+                        div()
+                            .relative()
+                            .w_full()
+                            .child(rendered)
+                            .when(selected, |this| {
+                                this.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "transcript-selection-outline".to_string()
+                                        })
+                                        .absolute()
+                                        .inset_0()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border_focused),
+                                )
+                            });
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
@@ -6325,47 +6452,113 @@ impl ThreadView {
                 let is_last = entry_ix + 1 == total_entries;
 
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                let message_body = v_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(chunks.iter().enumerate().filter_map(
-                        |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-
-                                    Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
-                                    )
-                                })
-                            }
-                            AssistantMessageChunk::Thought { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-                                    Some(
-                                        self.render_thinking_block(
-                                            entry_ix,
-                                            chunk_ix,
-                                            md.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .into_any_element(),
-                                    )
-                                })
-                            }
+                let showing_markdown_source = self.markdown_source_editors.contains_key(&entry_ix);
+                let message_body = if let Some(source_editor) = self
+                    .markdown_source_editors
+                    .get(&entry_ix)
+                    .map(|source| source.editor.clone())
+                {
+                    is_blank = false;
+                    let settings = ThemeSettings::get_global(cx);
+                    let source_editor = EditorElement::new(
+                        &source_editor,
+                        EditorStyle {
+                            background: cx.theme().colors().editor_background,
+                            local_player: cx.theme().players().local(),
+                            text: TextStyle {
+                                color: cx.theme().colors().text,
+                                font_family: settings.agent_buffer_font_family().clone(),
+                                font_fallbacks: settings.buffer_font.fallbacks.clone(),
+                                font_features: settings.buffer_font.features.clone(),
+                                font_size: settings.agent_buffer_font_size(cx).into(),
+                                font_weight: settings.buffer_font.weight,
+                                line_height: relative(settings.buffer_line_height.value()),
+                                ..Default::default()
+                            },
+                            syntax: cx.theme().syntax().clone(),
+                            inlay_hints_style: editor::make_inlay_hints_style(cx),
+                            ..Default::default()
                         },
-                    ))
-                    .into_any();
+                    );
+                    v_flex()
+                        .w_full()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .h_7()
+                                .px_2()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border)
+                                .child(
+                                    Label::new("Markdown Source")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        ("show_rendered_markdown", entry_ix),
+                                        IconName::Eye,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Show Rendered Markdown"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.toggle_markdown_source(entry_ix, window, cx);
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(div().w_full().p_2().child(source_editor))
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .children(chunks.iter().enumerate().filter_map(|(chunk_ix, chunk)| {
+                            match chunk {
+                                AssistantMessageChunk::Message { block, .. } => {
+                                    block.markdown().and_then(|md| {
+                                        let this_is_blank = md.read(cx).source().trim().is_empty();
+                                        is_blank = is_blank && this_is_blank;
+                                        if this_is_blank {
+                                            return None;
+                                        }
+
+                                        Some(
+                                            self.render_markdown(md.clone(), style.clone(), cx)
+                                                .into_any_element(),
+                                        )
+                                    })
+                                }
+                                AssistantMessageChunk::Thought { block, .. } => {
+                                    block.markdown().and_then(|md| {
+                                        let this_is_blank = md.read(cx).source().trim().is_empty();
+                                        is_blank = is_blank && this_is_blank;
+                                        if this_is_blank {
+                                            return None;
+                                        }
+                                        Some(
+                                            self.render_thinking_block(
+                                                entry_ix,
+                                                chunk_ix,
+                                                md.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                            .into_any_element(),
+                                        )
+                                    })
+                                }
+                            }
+                        }))
+                        .into_any_element()
+                };
 
                 assistant_message_is_blank = is_blank;
 
@@ -6373,12 +6566,17 @@ impl ThreadView {
                     Empty.into_any()
                 } else {
                     v_flex()
-                        .px_5()
+                        .when(showing_markdown_source, |this| this.px_2())
+                        .when(!showing_markdown_source, |this| this.px_5())
                         .py_1p5()
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
-                        .child(self.render_message_context_menu(entry_ix, message_body, cx))
+                        .child(if showing_markdown_source {
+                            message_body
+                        } else {
+                            self.render_message_context_menu(entry_ix, message_body, cx)
+                        })
                         .when_some(
                             self.entry_view_state
                                 .read(cx)
@@ -6390,18 +6588,8 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status, ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content.iter().any(|content| match content {
-                            ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
+                if !Self::should_render_tool_call(tool_call, cx) {
+                    return Empty.into_any();
                 }
 
                 let tool_call = self.render_any_tool_call(
@@ -6524,7 +6712,9 @@ impl ThreadView {
         let is_turn_end = Self::entry_is_finalized_turn_end(thread.read(cx).entries(), entry_ix)
             .unwrap_or(!is_generating);
 
-        let primary = if is_turn_end && !assistant_message_is_blank {
+        let primary = if (is_turn_end || (is_generating && entry_ix + 1 == total_entries))
+            && !assistant_message_is_blank
+        {
             let user_message_index = thread
                 .read(cx)
                 .entries()
@@ -6778,7 +6968,43 @@ impl ThreadView {
         let needs_confirmation = thread.read(cx).is_waiting_for_confirmation()
             || self.has_pending_request_elicitation(cx);
 
+        let markdown_source_button = copy_response_index
+            .filter(|response_index| {
+                Self::get_assistant_message_entry_markdown(
+                    thread.read(cx).entries(),
+                    *response_index,
+                    cx,
+                )
+                .is_some()
+            })
+            .map(|response_index| {
+                let showing_source = self.markdown_source_editors.contains_key(&response_index);
+                IconButton::new(("toggle_markdown_source", entry_ix), IconName::FileMarkdown)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .toggle_state(showing_source)
+                    .tooltip(Tooltip::text(if showing_source {
+                        "Show Rendered Markdown"
+                    } else {
+                        "Show Markdown Source"
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_markdown_source(response_index, window, cx);
+                    }))
+            });
+
         if is_thread_bottom && (is_generating || needs_confirmation) {
+            if let Some(markdown_source_button) = markdown_source_button {
+                return h_flex()
+                    .w_full()
+                    .py_1p5()
+                    .px_4()
+                    .justify_end()
+                    .opacity(0.4)
+                    .hover(|style| style.opacity(1.))
+                    .child(markdown_source_button)
+                    .into_any_element();
+            }
             return Empty.into_any_element();
         }
 
@@ -6935,6 +7161,7 @@ impl ThreadView {
                 },
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+            .when_some(markdown_source_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
@@ -7044,6 +7271,20 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn toggle_input_output_focus(
+        &mut self,
+        _: &ToggleInputOutputFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input_focus_handle = self.active_editor(cx).focus_handle(cx);
+        if input_focus_handle.contains_focused(window, cx) {
+            self.focus_handle.focus(window, cx);
+        } else {
+            input_focus_handle.focus(window, cx);
+        }
+    }
+
     fn scroll_output_page_up(
         &mut self,
         _: &ScrollOutputPageUp,
@@ -7141,6 +7382,145 @@ impl ThreadView {
             });
             cx.notify();
         }
+    }
+
+    fn should_render_tool_call(tool_call: &ToolCall, cx: &App) -> bool {
+        !matches!(tool_call.status, ToolCallStatus::Canceled)
+            || tool_call.content.iter().any(|content| match content {
+                ToolCallContent::ContentBlock(block) => block.visible_content(cx),
+                ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
+            })
+    }
+
+    fn is_navigable_transcript_entry(entry: &AgentThreadEntry, cx: &App) -> bool {
+        match entry {
+            AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => true,
+            AgentThreadEntry::ToolCall(tool_call) => Self::should_render_tool_call(tool_call, cx),
+            _ => false,
+        }
+    }
+
+    fn select_previous_transcript_entry(
+        &mut self,
+        _: &SelectPreviousTranscriptEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.thread.read(cx).entries();
+        let end = self
+            .selected_transcript_entry
+            .unwrap_or_else(|| {
+                self.list_state
+                    .logical_scroll_top()
+                    .item_ix
+                    .saturating_add(1)
+            })
+            .min(entries.len());
+        let target = (0..end)
+            .rev()
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx));
+        if let Some(target) = target {
+            self.select_transcript_entry(target, cx);
+        }
+    }
+
+    fn select_next_transcript_entry(
+        &mut self,
+        _: &SelectNextTranscriptEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.thread.read(cx).entries();
+        let start = self
+            .selected_transcript_entry
+            .map_or_else(
+                || self.list_state.logical_scroll_top().item_ix,
+                |index| index.saturating_add(1),
+            )
+            .min(entries.len());
+        let target = (start..entries.len())
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx));
+        if let Some(target) = target {
+            self.select_transcript_entry(target, cx);
+        }
+    }
+
+    fn select_transcript_entry(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        self.selected_transcript_entry = Some(entry_index);
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry_index,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    fn reconcile_selected_transcript_entry(
+        &mut self,
+        updated_entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_transcript_entry != Some(updated_entry_index) {
+            return;
+        }
+
+        let entries = self.thread.read(cx).entries();
+        if entries
+            .get(updated_entry_index)
+            .is_some_and(|entry| Self::is_navigable_transcript_entry(entry, cx))
+        {
+            return;
+        }
+
+        let selected = Self::nearest_navigable_transcript_entry(entries, updated_entry_index, cx);
+        if self.selected_transcript_entry != selected {
+            self.selected_transcript_entry = selected;
+            cx.notify();
+        }
+    }
+
+    fn reconcile_selected_transcript_entry_after_removal(
+        &mut self,
+        removed_range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected) = self.selected_transcript_entry else {
+            return;
+        };
+
+        let removed_count = removed_range.end.saturating_sub(removed_range.start);
+        let entries = self.thread.read(cx).entries();
+        let adjusted = if selected < removed_range.start {
+            Some(selected)
+        } else if selected >= removed_range.end {
+            Some(selected.saturating_sub(removed_count))
+        } else {
+            Self::nearest_navigable_transcript_entry(entries, removed_range.start, cx)
+        };
+        let adjusted = adjusted.filter(|&index| {
+            entries
+                .get(index)
+                .is_some_and(|entry| Self::is_navigable_transcript_entry(entry, cx))
+        });
+
+        if self.selected_transcript_entry != adjusted {
+            self.selected_transcript_entry = adjusted;
+            cx.notify();
+        }
+    }
+
+    fn nearest_navigable_transcript_entry(
+        entries: &[AgentThreadEntry],
+        index: usize,
+        cx: &App,
+    ) -> Option<usize> {
+        let index = index.min(entries.len());
+        (index..entries.len())
+            .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx))
+            .or_else(|| {
+                (0..index)
+                    .rev()
+                    .find(|&index| Self::is_navigable_transcript_entry(&entries[index], cx))
+            })
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7582,15 +7962,44 @@ impl ThreadView {
                         })
                         .unwrap_or(false);
 
-                    let context_menu_link = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let md = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            md.and_then(|m| m.read(cx).context_menu_link().cloned())
+                    let context_menu_markdown = chunks
+                        .and_then(|chunks| {
+                            chunks
+                                .iter()
+                                .filter_map(|chunk| match chunk {
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdown().map(|markdown| (markdown, true))
+                                    }
+                                    AssistantMessageChunk::Thought { block, .. } => {
+                                        block.markdown().map(|markdown| (markdown, false))
+                                    }
+                                })
+                                .max_by_key(|(markdown, _)| {
+                                    markdown.read(cx).context_menu_capture_id()
+                                })
                         })
-                    });
+                        .filter(|(markdown, _)| {
+                            let capture_id = markdown.read(cx).context_menu_capture_id();
+                            if capture_id <= this.last_markdown_context_menu_capture_id.get() {
+                                return false;
+                            }
+                            this.last_markdown_context_menu_capture_id.set(capture_id);
+                            true
+                        });
+
+                    let selected_response_excerpt = context_menu_markdown
+                        .as_ref()
+                        .filter(|(_, is_message)| *is_message)
+                        .and_then(|(markdown, _)| {
+                            markdown
+                                .read(cx)
+                                .context_menu_selected_markdown()
+                                .cloned()
+                                .filter(|excerpt| !excerpt.is_empty())
+                        });
+                    let has_response_excerpt = selected_response_excerpt.is_some();
+                    let context_menu_link = context_menu_markdown
+                        .and_then(|(markdown, _)| markdown.read(cx).context_menu_link().cloned());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -7606,6 +8015,23 @@ impl ThreadView {
                                 });
                             }
                         });
+
+                    let show_markdown_source = Self::get_assistant_message_entry_markdown(
+                        this.thread.read(cx).entries(),
+                        entry_ix,
+                        cx,
+                    )
+                    .is_some()
+                    .then(|| {
+                        ContextMenuEntry::new("Show Markdown Source").handler({
+                            let entity = entity.clone();
+                            move |window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.toggle_markdown_source(entry_ix, window, cx);
+                                });
+                            }
+                        })
+                    });
 
                     let scroll_item = if is_at_top {
                         ContextMenuEntry::new("Scroll to Bottom").handler({
@@ -7654,13 +8080,365 @@ impl ThreadView {
                             "Copy Selection",
                             Box::new(markdown::CopyAsMarkdown),
                         )
+                        .action_disabled_when(
+                            !has_response_excerpt,
+                            "Add to Agent Thread",
+                            Box::new(AddSelectionToThread {
+                                agent_response_excerpt: selected_response_excerpt,
+                            }),
+                        )
                         .item(copy_this_agent_response)
+                        .when_some(show_markdown_source, |menu, item| menu.item(item))
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)
                 })
             })
             .into_any_element()
+    }
+
+    fn toggle_markdown_source(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.hide_markdown_source(entry_index, window, cx) {
+            self.show_markdown_source(entry_index, window, cx);
+        }
+    }
+
+    fn hide_markdown_source(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(source) = self.markdown_source_editors.remove(&entry_index) else {
+            return false;
+        };
+        if source.editor.focus_handle(cx).contains_focused(window, cx) {
+            self.message_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    fn show_markdown_source(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.markdown_source_editors.contains_key(&entry_index) {
+            return true;
+        }
+
+        let Some((markdown, markdown_entities)) = Self::get_assistant_message_entry_markdown(
+            self.thread.read(cx).entries(),
+            entry_index,
+            cx,
+        ) else {
+            return false;
+        };
+
+        let language_registry = self
+            .project
+            .upgrade()
+            .map(|project| project.read(cx).languages().clone());
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local(markdown, cx);
+            buffer.set_capability(language::Capability::ReadOnly, cx);
+            if let Some(language_registry) = language_registry.clone() {
+                buffer.set_language_registry(language_registry);
+            }
+            buffer
+        });
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: None,
+                },
+                multi_buffer,
+                None,
+                window,
+                cx,
+            );
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_read_only(true);
+            editor.set_use_modal_editing(true);
+            editor.disable_mouse_wheel_zoom();
+            editor.set_custom_context_menu(|editor, _point, window, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                let mut selected_markdown = String::new();
+                let mut has_selection = false;
+                for selection in editor
+                    .selections
+                    .all::<MultiBufferOffset>(&display_snapshot)
+                {
+                    if selection.is_empty() {
+                        continue;
+                    }
+                    if has_selection {
+                        selected_markdown.push('\n');
+                    }
+                    selected_markdown.extend(buffer.text_for_range(selection.start..selection.end));
+                    has_selection = true;
+                }
+                let selected_markdown =
+                    has_selection.then(|| SharedString::from(selected_markdown));
+
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.action_disabled_when(
+                        !has_selection,
+                        "Copy Selection",
+                        Box::new(editor::actions::Copy),
+                    )
+                    .action_disabled_when(
+                        !has_selection,
+                        "Add to Agent Thread",
+                        Box::new(AddSelectionToThread {
+                            agent_response_excerpt: selected_markdown,
+                        }),
+                    )
+                }))
+            });
+            editor
+        });
+
+        if let Some(language_registry) = language_registry {
+            let buffer = buffer.clone();
+            cx.spawn(async move |_, cx| {
+                let markdown_language = language_registry.language_for_name("Markdown").await?;
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language(Some(markdown_language), cx);
+                });
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+
+        self.markdown_source_editors.insert(
+            entry_index,
+            MarkdownSourceEditor {
+                buffer,
+                editor,
+                observed_markdown: HashSet::default(),
+                _subscriptions: Vec::new(),
+            },
+        );
+        self.observe_markdown_source_entities(entry_index, markdown_entities, window, cx);
+        cx.notify();
+        true
+    }
+
+    fn sync_markdown_source_editor(
+        &mut self,
+        entry_index: usize,
+        thread: &Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.markdown_source_editors.contains_key(&entry_index) {
+            return;
+        }
+
+        let Some((markdown, markdown_entities)) =
+            Self::get_assistant_message_entry_markdown(thread.read(cx).entries(), entry_index, cx)
+        else {
+            self.hide_markdown_source(entry_index, window, cx);
+            return;
+        };
+
+        self.set_markdown_source_editor_text(entry_index, markdown, cx);
+        self.observe_markdown_source_entities(entry_index, markdown_entities, window, cx);
+    }
+
+    fn observe_markdown_source_entities(
+        &mut self,
+        entry_index: usize,
+        markdown_entities: Vec<Entity<Markdown>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for markdown in markdown_entities {
+            let markdown_id = markdown.entity_id();
+            let is_observed = self
+                .markdown_source_editors
+                .get(&entry_index)
+                .is_some_and(|source| source.observed_markdown.contains(&markdown_id));
+            if is_observed {
+                continue;
+            }
+
+            let subscription = cx.observe_in(&markdown, window, move |this, _, _, cx| {
+                let Some((markdown, _)) = Self::get_assistant_message_entry_markdown(
+                    this.thread.read(cx).entries(),
+                    entry_index,
+                    cx,
+                ) else {
+                    return;
+                };
+                this.set_markdown_source_editor_text(entry_index, markdown, cx);
+            });
+
+            if let Some(source) = self.markdown_source_editors.get_mut(&entry_index) {
+                source.observed_markdown.insert(markdown_id);
+                source._subscriptions.push(subscription);
+            }
+        }
+    }
+
+    fn set_markdown_source_editor_text(
+        &self,
+        entry_index: usize,
+        markdown: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(buffer) = self
+            .markdown_source_editors
+            .get(&entry_index)
+            .map(|source| source.buffer.clone())
+        else {
+            return;
+        };
+        let current_text = buffer.read(cx).text();
+        if current_text == markdown {
+            return;
+        }
+
+        buffer.update(cx, |buffer, cx| {
+            if let Some(suffix) = markdown.strip_prefix(&current_text) {
+                buffer.append(suffix, cx);
+            } else {
+                buffer.set_text(markdown, cx);
+            }
+        });
+    }
+
+    fn get_assistant_message_entry_markdown(
+        entries: &[AgentThreadEntry],
+        entry_index: usize,
+        cx: &App,
+    ) -> Option<(String, Vec<Entity<Markdown>>)> {
+        let AgentThreadEntry::AssistantMessage(message) = entries.get(entry_index)? else {
+            return None;
+        };
+
+        let mut markdown_entities = Vec::new();
+        let markdown = message
+            .chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } => {
+                    if let Some(markdown) = block.markdown() {
+                        markdown_entities.push(markdown.clone());
+                    }
+                    let markdown = block.to_markdown(cx);
+                    (!markdown.trim().is_empty()).then(|| markdown.to_string())
+                }
+                AssistantMessageChunk::Thought { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        (!markdown.trim().is_empty()).then_some((markdown, markdown_entities))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_transcript_entry_for_tests(&self) -> Option<usize> {
+        self.selected_transcript_entry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_previous_transcript_entry_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_previous_transcript_entry(&SelectPreviousTranscriptEntry, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_next_transcript_entry_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_next_transcript_entry(&SelectNextTranscriptEntry, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn toggle_markdown_source_for_tests(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_markdown_source(entry_index, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_is_shown_for_tests(&self, entry_index: usize) -> bool {
+        self.markdown_source_editors.contains_key(&entry_index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_editor_for_tests(
+        &self,
+        entry_index: usize,
+    ) -> Option<Entity<Editor>> {
+        self.markdown_source_editors
+            .get(&entry_index)
+            .map(|source| source.editor.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_text_for_tests(
+        &self,
+        entry_index: usize,
+        cx: &App,
+    ) -> Option<String> {
+        self.markdown_source_editors
+            .get(&entry_index)
+            .map(|source| source.buffer.read(cx).text())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_language_for_tests(
+        &self,
+        entry_index: usize,
+        cx: &App,
+    ) -> Option<language::LanguageName> {
+        self.markdown_source_editors
+            .get(&entry_index)
+            .and_then(|source| {
+                source
+                    .buffer
+                    .read(cx)
+                    .language()
+                    .map(|language| language.name())
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source_is_read_only_for_tests(
+        &self,
+        entry_index: usize,
+        cx: &App,
+    ) -> bool {
+        self.markdown_source_editors
+            .get(&entry_index)
+            .is_some_and(|source| {
+                source.buffer.read(cx).capability() == language::Capability::ReadOnly
+                    && source.editor.read(cx).capability(cx) == language::Capability::ReadOnly
+            })
     }
 
     fn get_agent_message_content(
@@ -11484,7 +12262,7 @@ impl ThreadView {
     }
 
     fn render_resume_notice(_cx: &Context<Self>) -> AnyElement {
-        let description = "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.";
+        let description = "Previous messages can't be displayed right now. However, your session will still continue from where you last left off.";
 
         Callout::new()
             .border_position(CalloutBorderPosition::Bottom)
@@ -12260,6 +13038,7 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::handle_toggle_command_pattern))
             .on_action(cx.listener(Self::open_permission_dropdown))
             .on_action(cx.listener(Self::open_add_context_menu))
+            .on_action(cx.listener(Self::toggle_input_output_focus))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
             .on_action(cx.listener(Self::scroll_output_line_up))
@@ -12268,6 +13047,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::select_previous_transcript_entry))
+            .on_action(cx.listener(Self::select_next_transcript_entry))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
@@ -12599,6 +13380,7 @@ pub(crate) fn open_link(
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
+            MentionUri::AgentResponse => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
             MentionUri::Rule { name, .. } => {

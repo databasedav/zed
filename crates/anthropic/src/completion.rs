@@ -905,6 +905,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -1013,6 +1014,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -1073,6 +1075,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: Some("xhigh".into()),
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -1124,6 +1127,7 @@ mod tests {
                 tool_choice: None,
                 thinking_allowed: true,
                 thinking_effort: None,
+                reasoning_summary: None,
                 speed: None,
                 compact_at_tokens: None,
             };
@@ -1193,6 +1197,7 @@ mod tests {
                 tool_choice: None,
                 thinking_allowed: false,
                 thinking_effort: None,
+                reasoning_summary: None,
                 speed: None,
                 compact_at_tokens: None,
             };
@@ -1259,6 +1264,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
+            reasoning_summary: None,
             speed: None,
             compact_at_tokens: None,
         };
@@ -1291,6 +1297,7 @@ mod tests {
                 reasoning_details: None,
             }],
             thinking_effort: None,
+            reasoning_summary: None,
             thread_id: None,
             prompt_id: None,
             intent: None,

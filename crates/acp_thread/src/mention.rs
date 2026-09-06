@@ -36,6 +36,7 @@ pub enum MentionUri {
         id: acp::SessionId,
         name: String,
     },
+    AgentResponse,
     /// Deprecated: kept so threads from before rules became skills still
     /// deserialize. `id` (an opaque `prompt_store::PromptId`) is preserved
     /// verbatim so re-saved threads stay loadable by older Zed versions.
@@ -147,7 +148,12 @@ impl MentionUri {
                 }
             }
             "zed" => {
-                if let Some(thread_id) = path.strip_prefix("/agent/thread/") {
+                if path == "/agent/response" {
+                    if url.query().is_some() || url.fragment().is_some() {
+                        bail!("invalid agent response URL");
+                    }
+                    Ok(Self::AgentResponse)
+                } else if let Some(thread_id) = path.strip_prefix("/agent/thread/") {
                     let name = single_query_param(&url, "name")?.context("Missing thread name")?;
                     Ok(Self::Thread {
                         id: acp::SessionId::new(thread_id),
@@ -323,6 +329,7 @@ impl MentionUri {
             } => Some(skill_file_path),
             MentionUri::PastedImage { .. }
             | MentionUri::Thread { .. }
+            | MentionUri::AgentResponse
             | MentionUri::Rule { .. }
             | MentionUri::Diagnostics { .. }
             | MentionUri::Fetch { .. }
@@ -342,6 +349,7 @@ impl MentionUri {
             MentionUri::PastedImage { name } => name.clone(),
             MentionUri::Symbol { name, .. } => name.clone(),
             MentionUri::Thread { name, .. } => name.clone(),
+            MentionUri::AgentResponse => "Agent response".to_string(),
             MentionUri::Rule { name, .. } => name.clone(),
             MentionUri::Diagnostics { .. } => "Diagnostics".to_string(),
             MentionUri::TerminalSelection { line_count } => {
@@ -443,6 +451,7 @@ impl MentionUri {
                 .unwrap_or_else(|| IconName::Folder.path().into()),
             MentionUri::Symbol { .. } => IconName::Code.path().into(),
             MentionUri::Thread { .. } => IconName::Thread.path().into(),
+            MentionUri::AgentResponse => IconName::ZedAssistant.path().into(),
             MentionUri::Rule { .. } => IconName::Reader.path().into(),
             MentionUri::Diagnostics { .. } => IconName::Warning.path().into(),
             MentionUri::TerminalSelection { .. } => IconName::Terminal.path().into(),
@@ -526,6 +535,7 @@ impl MentionUri {
                 url.query_pairs_mut().append_pair("name", name);
                 url
             }
+            MentionUri::AgentResponse => Url::parse("zed:///agent/response").unwrap(),
             MentionUri::Rule { id, name } => {
                 let mut url = Url::parse("zed:///").unwrap();
                 let rule_id = id
@@ -1333,6 +1343,22 @@ mod tests {
             _ => panic!("Expected Thread variant"),
         }
         assert_eq!(parsed.to_uri().to_string(), thread_uri);
+    }
+
+    #[test]
+    fn test_parse_agent_response_uri_round_trip() {
+        let agent_response_uri = "zed:///agent/response";
+        let parsed = MentionUri::parse(agent_response_uri, PathStyle::local()).unwrap();
+
+        assert_eq!(parsed, MentionUri::AgentResponse);
+        assert_eq!(parsed.to_uri().as_str(), agent_response_uri);
+        assert_eq!(parsed.name(), "Agent response");
+        assert!(parsed.abs_path().is_none());
+        assert!(parsed.tooltip_text().is_none());
+        assert!(
+            MentionUri::parse("zed:///agent/response?session_id=123", PathStyle::local()).is_err()
+        );
+        assert!(MentionUri::parse("zed:///agent/response#content", PathStyle::local()).is_err());
     }
 
     #[test]

@@ -17,8 +17,8 @@ use agent_ui::threads_archive_view::{
 };
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
-    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
+    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, ForkSelectedThread,
+    NewTerminalThread, NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
@@ -3847,7 +3847,11 @@ impl Sidebar {
                     anyhow::bail!("Thread not found in database");
                 };
 
-                let request = agent::build_thread_title_request(&db_thread.messages, temperature);
+                let request = agent::build_thread_title_request(
+                    &session_id,
+                    &db_thread.messages,
+                    temperature,
+                );
                 let title =
                     SharedString::from(agent::stream_thread_title(model, request, cx).await?);
 
@@ -3894,6 +3898,96 @@ impl Sidebar {
             result.map(|_| ())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn fork_thread(
+        &mut self,
+        source_session_id: &acp::SessionId,
+        source_thread_id: ThreadId,
+        thread_workspace: Option<Entity<Workspace>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(source_thread_id)
+            .cloned()
+        else {
+            self.show_fork_thread_error("source thread metadata not found", cx);
+            return;
+        };
+        let is_zed_thread = source.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+        let workspace = match thread_workspace {
+            Some(workspace) => Some(workspace),
+            None if is_zed_thread => self.active_workspace(cx),
+            None => None,
+        };
+        let Some(panel) =
+            workspace.and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+        else {
+            self.show_fork_thread_error("no agent panel available", cx);
+            return;
+        };
+
+        let fork_task = panel.update(cx, |panel, cx| {
+            panel.fork_thread(
+                source.agent_id.clone(),
+                source_session_id.clone(),
+                source.folder_paths().clone(),
+                cx,
+            )
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let fork_session_id = fork_task.await?;
+                let save_task = cx.update(|cx| {
+                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                        let title_override = agent::forked_thread_title(&source.display_title());
+                        // Give the fork the source's display time so the two
+                        // threads sort next to each other in the sidebar;
+                        // sending a message in the fork bumps it as usual.
+                        let display_time = source.interacted_at.unwrap_or(source.updated_at);
+                        store.save_durable(
+                            ThreadMetadata {
+                                thread_id: ThreadId::new(),
+                                session_id: Some(fork_session_id),
+                                title_override: Some(title_override),
+                                interacted_at: Some(display_time),
+                                ..source
+                            },
+                            cx,
+                        )
+                    })
+                });
+                save_task.await
+            }
+            .await;
+
+            if let Err(error) = result {
+                this.update(cx, |this, cx| {
+                    this.show_fork_thread_error(&format!("{error:#}"), cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn show_fork_thread_error(&self, message: &str, cx: &mut App) {
+        log::error!("Failed to fork thread: {message}");
+        if let Some(workspace) = self.active_workspace(cx) {
+            workspace.update(cx, |workspace, cx| {
+                struct ForkThreadErrorToast;
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<ForkThreadErrorToast>(),
+                        format!("Failed to fork thread: {message}"),
+                    )
+                    .autohide(),
+                    cx,
+                );
+            });
+        }
     }
 
     fn is_thread_active_in_workspace(
@@ -5756,6 +5850,38 @@ impl Sidebar {
         self.start_renaming_entry(ix, target, title, window, cx);
     }
 
+    fn fork_selected_thread(
+        &mut self,
+        _: &ForkSelectedThread,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_threads_list_view_active() {
+            return;
+        }
+        let Some(ix) = self.selection else {
+            return;
+        };
+        let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
+            return;
+        };
+        let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+        if thread.workspace.is_remote(cx)
+            || (!is_zed_thread && matches!(&thread.workspace, ThreadEntryWorkspace::Closed { .. }))
+        {
+            return;
+        }
+        let Some(session_id) = thread.metadata.session_id.clone() else {
+            return;
+        };
+        let thread_id = thread.metadata.thread_id;
+        let thread_workspace = match &thread.workspace {
+            ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
+            ThreadEntryWorkspace::Closed { .. } => None,
+        };
+        self.fork_thread(&session_id, thread_id, thread_workspace, cx);
+    }
+
     fn record_thread_access(&mut self, id: &ThreadId) {
         self.thread_last_accessed.insert(*id, Utc::now());
     }
@@ -6419,6 +6545,7 @@ impl Sidebar {
         let sidebar = cx.weak_entity();
 
         let active_workspace = self.active_workspace(cx);
+        let is_closed = matches!(&thread_workspace, ThreadEntryWorkspace::Closed { .. });
         let thread_workspace = match &thread_workspace {
             ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
             ThreadEntryWorkspace::Closed { .. } => None,
@@ -6426,6 +6553,10 @@ impl Sidebar {
 
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
+        // Forking a remote thread isn't supported: its conversation state
+        // lives on the remote host. Closed external-agent sessions also need
+        // their original workspace's panel, while native forks are global.
+        let can_fork = !is_remote && (is_zed_thread || !is_closed);
         let folder_paths = thread.metadata.folder_paths().clone();
 
         right_click_menu(context_menu_id)
@@ -6517,6 +6648,26 @@ impl Sidebar {
                                             cx,
                                         );
                                     }
+                                }
+                            });
+                        }
+
+                        if can_fork {
+                            menu = menu.entry("Fork Thread", None, {
+                                let session_id = session_id.clone();
+                                let sidebar = sidebar.clone();
+                                let thread_workspace = thread_workspace.clone();
+                                move |_window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.fork_thread(
+                                                &session_id,
+                                                thread_id,
+                                                thread_workspace.clone(),
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
                                 }
                             });
                         }
@@ -7898,6 +8049,7 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::archive_selected_thread))
             .on_action(cx.listener(Self::rename_selected_thread))
+            .on_action(cx.listener(Self::fork_selected_thread))
             .on_action(cx.listener(Self::new_thread_in_group))
             .on_action(cx.listener(Self::new_terminal_thread))
             .on_action(cx.listener(Self::toggle_archive))
