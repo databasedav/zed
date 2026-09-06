@@ -13087,6 +13087,149 @@ mod tests {
         });
     }
     #[gpui::test]
+    async fn test_thread_title_helix_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(Some("helix_normal"), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_vim_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(Some("normal"), cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_title_non_modal_bindings(cx: &mut TestAppContext) {
+        assert_thread_title_editing(None, cx).await;
+    }
+
+    async fn assert_thread_title_editing(normal_mode: Option<&str>, cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel_with_sidebar(cx, false).await;
+        cx.update(|_, cx| {
+            vim::init(cx);
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.vim_mode = Some(normal_mode == Some("normal"));
+                    settings.helix_mode = Some(normal_mode == Some("helix_normal"));
+                });
+            });
+            for (asset, source) in [
+                (
+                    "keymaps/default-linux.json",
+                    settings::KeybindSource::Default,
+                ),
+                ("keymaps/vim.json", settings::KeybindSource::Vim),
+            ] {
+                let mut bindings =
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(source.meta());
+                }
+                cx.bind_keys(bindings);
+            }
+        });
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel.active_thread_view(cx).expect("thread should be open")
+        });
+        let (title_editor, message_editor) = thread_view.update_in(&mut cx, |view, window, cx| {
+            view.rename("Original title".into(), window, cx);
+            (
+                view.title_editor.clone(),
+                view.message_editor.read(cx).editor().clone(),
+            )
+        });
+        cx.focus(&title_editor);
+
+        let assert_title_mode = |mode: Option<&str>, cx: &mut VisualTestContext| {
+            title_editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.use_modal_editing());
+                assert!(editor.is_focused(window));
+                assert_eq!(
+                    editor
+                        .key_context(window, cx)
+                        .get("vim_mode")
+                        .map(|mode| mode.as_ref()),
+                    mode,
+                );
+            });
+        };
+        let assert_message_focused = |cx: &mut VisualTestContext| {
+            message_editor.update_in(cx, |editor, window, _| {
+                assert!(editor.is_focused(window));
+            });
+        };
+        assert_title_mode(normal_mode, &mut cx);
+
+        match normal_mode {
+            Some("helix_normal") => cx.simulate_keystrokes("% c"),
+            Some(_) => cx.simulate_keystrokes("shift-s"),
+            None => cx.simulate_keystrokes("ctrl-a"),
+        }
+        assert_title_mode(normal_mode.map(|_| "insert"), &mut cx);
+        cx.simulate_input("Renamed thread");
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |view, cx| {
+            assert_eq!(view.title_editor.read(cx).text(cx), "Renamed thread");
+            assert_eq!(view.thread.read(cx).title(), Some("Renamed thread".into()));
+        });
+
+        if let Some(normal_mode) = normal_mode {
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+
+            cx.simulate_keystrokes("v h");
+            assert_title_mode(
+                Some(if normal_mode == "helix_normal" {
+                    "helix_select"
+                } else {
+                    "visual"
+                }),
+                &mut cx,
+            );
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+
+            cx.simulate_keystrokes("f");
+            assert_title_mode(Some("waiting"), &mut cx);
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(Some(normal_mode), &mut cx);
+        }
+
+        cx.simulate_keystrokes("enter");
+        assert_message_focused(&mut cx);
+
+        cx.focus(&title_editor);
+        if normal_mode.is_some() {
+            cx.simulate_keystrokes("i");
+            assert_title_mode(Some("insert"), &mut cx);
+        }
+        cx.simulate_keystrokes("enter");
+        assert_message_focused(&mut cx);
+
+        cx.focus(&title_editor);
+        if normal_mode.is_some() {
+            cx.simulate_keystrokes("escape");
+            assert_title_mode(normal_mode, &mut cx);
+        }
+        cx.simulate_keystrokes("escape");
+        assert_message_focused(&mut cx);
+        thread_view.read_with(&cx, |view, cx| {
+            assert_eq!(view.title_editor.read(cx).text(cx), "Renamed thread");
+            assert_eq!(view.thread.read(cx).title(), Some("Renamed thread".into()));
+            assert!(
+                view.message_editor
+                    .read(cx)
+                    .editor()
+                    .read(cx)
+                    .text(cx)
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_vim_search_does_not_steal_focus_from_agent_panel(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
