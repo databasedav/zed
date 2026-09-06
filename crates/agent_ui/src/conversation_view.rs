@@ -6820,6 +6820,7 @@ pub(crate) mod tests {
             });
             thread_view.select_next_transcript_entry_for_tests(window, cx);
             thread_view.select_next_transcript_entry_for_tests(window, cx);
+            thread_view.select_next_transcript_entry_for_tests(window, cx);
         });
         thread_view.read_with(cx, |thread_view, _cx| {
             assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(2));
@@ -6837,7 +6838,7 @@ pub(crate) mod tests {
             assert_eq!(thread.entries().len(), 2);
         });
         thread_view.read_with(cx, |thread_view, _cx| {
-            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(0));
+            assert_eq!(thread_view.selected_transcript_entry_for_tests(), Some(1));
         });
 
         conversation_view.read_with(cx, |view, cx| {

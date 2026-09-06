@@ -9455,7 +9455,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_transcript_entry_navigation_selects_messages_without_moving_focus(
+    async fn test_transcript_entry_navigation_selects_visible_entries_without_moving_focus(
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
@@ -9508,7 +9508,7 @@ mod tests {
             assert_eq!(thread_view.list_state.logical_scroll_top().item_ix, 0);
         });
 
-        for expected_entry_index in [1, 2, 4, 4] {
+        for expected_entry_index in [1, 2, 3, 4, 4] {
             thread_view.update_in(&mut cx, |thread_view, window, cx| {
                 thread_view.select_next_transcript_entry_for_tests(window, cx);
             });
@@ -9518,7 +9518,7 @@ mod tests {
         thread_view.update_in(&mut cx, |thread_view, window, cx| {
             thread_view.select_previous_transcript_entry_for_tests(window, cx);
         });
-        assert_transcript_selection(&thread_view, 2, &cx);
+        assert_transcript_selection(&thread_view, 3, &cx);
 
         cx.update(|window, cx| {
             assert!(markdown_source_editor.focus_handle(cx).is_focused(window));
@@ -9644,6 +9644,104 @@ mod tests {
         cx.run_until_parked();
         assert_transcript_selection(&thread_view, 1, &cx);
         assert!(cx.debug_bounds("transcript-selection-outline").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_transcript_entry_navigation_skips_hidden_canceled_tool_calls(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        let session_id = active_session_id(&panel, &cx);
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("hidden-canceled-tool-call", "Hidden canceled output")
+                        .kind(acp::ToolKind::Other)
+                        .status(acp::ToolCallStatus::InProgress),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("visible-canceled-tool-call", "Visible canceled output")
+                        .kind(acp::ToolKind::Other)
+                        .status(acp::ToolCallStatus::InProgress)
+                        .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(
+                                "Visible output".to_string(),
+                            )),
+                        ))]),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update(&mut cx, |thread_view, cx| {
+            thread_view.cancel_generation(cx);
+        });
+        cx.run_until_parked();
+
+        send_message(&panel, &mut cx);
+        let selected_tool_call_id = acp::ToolCallId::new("selected-tool-call");
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(selected_tool_call_id, "In-progress output")
+                        .kind(acp::ToolKind::Other)
+                        .status(acp::ToolCallStatus::InProgress),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Response".into())),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        thread_view.update(&mut cx, |thread_view, _cx| {
+            thread_view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+
+        for expected_entry_index in [0, 2, 3, 4, 5] {
+            thread_view.update_in(&mut cx, |thread_view, window, cx| {
+                thread_view.select_next_transcript_entry_for_tests(window, cx);
+            });
+            assert_transcript_selection(&thread_view, expected_entry_index, &cx);
+        }
+
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.select_previous_transcript_entry_for_tests(window, cx);
+        });
+        assert_transcript_selection(&thread_view, 4, &cx);
+
+        thread_view.update(&mut cx, |thread_view, cx| {
+            thread_view.cancel_generation(cx);
+        });
+        cx.run_until_parked();
+
+        assert_transcript_selection(&thread_view, 5, &cx);
     }
 
     fn assert_transcript_selection(
