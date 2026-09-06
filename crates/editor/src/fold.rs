@@ -898,18 +898,21 @@ impl Editor {
         });
     }
 
-    pub(super) fn refresh_single_line_folds(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Editor>,
-    ) {
+    pub(super) fn refresh_single_line_folds(&mut self, cx: &mut Context<Editor>) {
         struct NewlineFold;
         let type_id = std::any::TypeId::of::<NewlineFold>();
-        if !self.mode.is_single_line() {
-            return;
-        }
-        let snapshot = self.snapshot(window, cx);
-        if snapshot.buffer_snapshot().max_point().row == 0 {
+        // Cancel even when there are no newlines, so an older snapshot cannot restore stale folds.
+        self.folding_newlines = Task::ready(());
+        let snapshot = self.display_snapshot(cx);
+        if !self.mode.is_single_line() || snapshot.buffer_snapshot().max_point().row == 0 {
+            self.display_map.update(cx, |display_map, cx| {
+                display_map.remove_folds_with_type(
+                    [MultiBufferOffset(0)..snapshot.buffer_snapshot().len()],
+                    type_id,
+                    cx,
+                );
+            });
+            cx.notify();
             return;
         }
         let task = cx.background_spawn(async move {
@@ -965,10 +968,14 @@ impl Editor {
                 .map(|range| Crease::simple(range, placeholder.clone()))
                 .collect();
             this.update(cx, |this, cx| {
+                if !this.mode.is_single_line() {
+                    return;
+                }
                 this.display_map.update(cx, |display_map, cx| {
                     display_map.remove_folds_with_type(existing_newlines, type_id, cx);
                     display_map.fold(creases, cx);
                 });
+                cx.notify();
             })
             .ok();
         });

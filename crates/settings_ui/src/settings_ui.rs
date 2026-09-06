@@ -613,6 +613,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::EditPredictionDataCollectionChoice>(render_dropdown)
         .add_basic_renderer::<f32>(render_editable_number_field)
         .add_basic_renderer::<settings::AutoCompactThreshold>(render_text_field)
+        .add_basic_renderer::<settings::ThreadTitleMaxLines>(render_text_field)
         .add_basic_renderer::<u32>(render_editable_number_field)
         .add_basic_renderer::<u64>(render_editable_number_field)
         .add_basic_renderer::<usize>(render_editable_number_field)
@@ -656,6 +657,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::IconThemeName>(render_icon_theme_picker)
         .add_basic_renderer::<settings::BufferLineHeightDiscriminants>(render_dropdown)
         .add_basic_renderer::<settings::GitGutterWidthDiscriminants>(render_dropdown)
+        .add_basic_renderer::<settings::ProjectPanelTitleTooltipDelayDiscriminants>(render_dropdown)
         .add_basic_renderer::<settings::AutosaveSettingDiscriminants>(render_dropdown)
         .add_basic_renderer::<settings::WorkingDirectoryDiscriminants>(render_dropdown)
         .add_basic_renderer::<settings::IncludeIgnoredContent>(render_dropdown)
@@ -4893,7 +4895,7 @@ fn get_current_value<'a, T>(
     })
 }
 
-fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
+fn render_text_field<T: TryFrom<String> + Into<String> + Clone + Send>(
     field: SettingField<T>,
     file: SettingsUiFile,
     metadata: Option<&SettingsFieldMetadata>,
@@ -4901,19 +4903,17 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
     description: &'static str,
     _window: &mut Window,
     cx: &mut App,
-) -> AnyElement {
+) -> AnyElement
+where
+    T::Error: std::fmt::Display,
+{
     let (_, initial_text) =
         SettingsStore::global(cx).get_value_from_file(file.to_settings(), field.pick);
+    let initial_text: Option<String> = initial_text.cloned().map(Into::into);
     let initial_text = if metadata.is_some_and(|metadata| metadata.treat_missing_text_as_empty) {
-        Some(
-            initial_text
-                .map(|text| text.as_ref().to_string())
-                .unwrap_or_default(),
-        )
+        Some(initial_text.unwrap_or_default())
     } else {
-        initial_text
-            .filter(|text| !text.as_ref().is_empty())
-            .map(|text| text.as_ref().to_string())
+        initial_text.filter(|text| !text.is_empty())
     };
 
     // The JSON path uniquely identifies the setting this field edits, making
@@ -4943,13 +4943,30 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
         )
         .on_confirm({
             move |new_text, window, cx| {
+                let value = match new_text.map(T::try_from).transpose() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let answer = window.prompt(
+                            gpui::PromptLevel::Warning,
+                            &format!("Invalid value for {title}"),
+                            Some(&error.to_string()),
+                            &["OK"],
+                            cx,
+                        );
+                        cx.spawn(async move |_| {
+                            answer.await.log_err();
+                        })
+                        .detach();
+                        return;
+                    }
+                };
                 update_settings_file(
                     file.clone(),
                     field.json_path,
                     window,
                     cx,
                     move |settings, app| {
-                        (field.write)(settings, new_text.map(Into::into), app);
+                        (field.write)(settings, value, app);
                     },
                 )
                 .log_err(); // todo(settings_ui) don't log err
