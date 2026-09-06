@@ -225,6 +225,8 @@ actions!(
         CycleFavoriteModels,
         /// Expands the message editor to full size.
         ExpandMessageEditor,
+        /// Toggles focus between the message editor and the transcript output.
+        ToggleInputOutputFocus,
         /// Archives the currently selected thread.
         ArchiveSelectedThread,
         /// Removes the currently selected thread.
@@ -320,6 +322,10 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Selects the previous navigable entry in the agent transcript.
+        SelectPreviousTranscriptEntry,
+        /// Selects the next navigable entry in the agent transcript.
+        SelectNextTranscriptEntry,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
