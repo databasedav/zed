@@ -5154,6 +5154,59 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_acp_queued_message_steer_syncs_to_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_steer_at_boundary(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let acp_thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.supports_steer(cx));
+        });
+
+        let id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "steer me".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+            view.message_queue.first_id().unwrap()
+        });
+        cx.run_until_parked();
+
+        assert!(!acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert!(connection.take_steer_at_boundary_calls().is_empty());
+
+        thread_view.update(cx, |view, cx| {
+            view.message_queue.toggle_steer(id);
+            view.sync_queue_flag_to_native_thread(cx);
+        });
+        assert!(acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert_eq!(
+            connection.take_steer_at_boundary_calls(),
+            vec![(session_id.clone(), true)]
+        );
+
+        thread_view.update(cx, |view, cx| {
+            view.message_queue.toggle_steer(id);
+            view.sync_queue_flag_to_native_thread(cx);
+        });
+        assert!(!acp_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+        assert_eq!(
+            connection.take_steer_at_boundary_calls(),
+            vec![(session_id, false)]
+        );
+    }
+
+    #[gpui::test]
     async fn test_receipt_submission_waits_for_echo_and_reported_idle(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -6886,6 +6939,7 @@ pub(crate) mod tests {
                 session_id: acp_v2::SessionId::new("child"),
                 message_start_index: 2,
                 message_end_index: Some(5),
+                model_name: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -7036,6 +7090,7 @@ pub(crate) mod tests {
                     session_id: acp_v2::SessionId::new("child"),
                     message_start_index: 0,
                     message_end_index: end,
+                    model_name: None,
                 })
                 .expect("subagent session info should serialize"),
             )]);
@@ -17649,6 +17704,7 @@ pub(crate) mod tests {
                     session_id: child_session_id.clone(),
                     message_start_index: 0,
                     message_end_index: None,
+                    model_name: None,
                 })
                 .expect("subagent session info should serialize"),
             )]));
@@ -19326,6 +19382,7 @@ pub(crate) mod tests {
                         session_id: child_session_id.clone(),
                         message_start_index: 0,
                         message_end_index: None,
+                        model_name: None,
                     })
                     .expect("subagent session context"),
                 )]));
@@ -21353,5 +21410,216 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[gpui::test]
+    async fn test_queued_steer_beats_subagent_continuation_without_loading_spinner(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let message_editor = message_editor(&conversation_view, cx);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // While Turn 1 is active, a background subagent finishes (requesting a silent
+        // continuation) AND the user queues a steering follow-up message.
+        thread.update(cx, |thread, cx| {
+            thread.request_subagent_continuation(cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["steer message".into()], vec![], window, cx);
+        });
+        cx.run_until_parked();
+
+        let finish_steer = connection.defer_next_prompt_response();
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(
+                !view.is_loading_contents,
+                "queued dispatch must never lock composer behind Loading Added Context"
+            );
+            assert!(view.message_queue.is_empty());
+            assert!(view.pending_queued_dispatch.is_none());
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "steer message"
+                ),
+                "user's queued message must beat background subagent continuation"
+            );
+            assert!(
+                view.thread
+                    .read(cx)
+                    .to_markdown(cx)
+                    .contains("steer message"),
+                "queued message should appear in thread entries immediately on dispatch"
+            );
+        });
+
+        finish_steer
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("steer prompt still pending");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_interrupt_and_send_supersedes_in_flight_queued_send_now(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Queue a steering message and click "Send Now" while Turn 1 is still unwinding.
+        let queued_id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["queued steer".into()], vec![], window, cx);
+            view.message_queue.first_id().expect("queued entry")
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(queued_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        // While Turn 1's prompt RPC is still unwinding:
+        // - Composer must NOT show "Loading Added Context…" (`is_loading_contents == false`).
+        // - The queued item must remain visible in `pending_queued_dispatch` instead of vanishing.
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(!view.is_loading_contents);
+            assert!(view.pending_queued_dispatch.is_some());
+            assert!(view.has_queued_messages());
+        });
+
+        // Now user types a new message in the composer and hits Send Immediately (`interrupt_and_send`).
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("send this instead", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.interrupt_and_send(window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.pending_queued_dispatch.is_none());
+            assert_eq!(
+                view.message_queue.len(),
+                1,
+                "superseded Send Now entry should be restored to the queue"
+            );
+        });
+
+        // Finish unwinding Turn 1: "send this instead" must be sent, NOT "queued steer"!
+        let finish_second = connection.defer_next_prompt_response();
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("first turn unwind still pending");
+        cx.run_until_parked();
+
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            ""
+        );
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "send this instead"
+                ),
+                "composer interrupt_and_send must send composer text, not the superseded queued message"
+            );
+            assert_eq!(view.message_queue.len(), 1);
+        });
+
+        // Once "send this instead" finishes, the restored "queued steer" auto-dispatches next.
+        let finish_queued = connection.defer_next_prompt_response();
+        finish_second
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("second turn still pending");
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            assert!(matches!(
+                view.in_flight_prompt(cx).as_deref(),
+                Some([acp_v2::ContentBlock::Text(text)]) if text.text == "queued steer"
+            ));
+        });
+
+        finish_queued
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("queued turn still pending");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_acp_subagent_card_populates_model_name_from_session_info(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("child-with-model");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id,
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Gemini 3 Flash".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("invoke-model", "Audit overlay")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta);
+            connection.send_update(root_session_id, acp_v1::SessionUpdate::ToolCall(call), cx);
+        });
+        cx.run_until_parked();
+
+        root_thread.read_with(cx, |thread, cx| {
+            let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) = thread.entries().first()
+            else {
+                panic!("expected subagent tool call entry");
+            };
+            let card = subagent_card::SubagentCardState::from_tool_call(tool_call, cx);
+            assert_eq!(card.model_name.as_deref(), Some("Gemini 3 Flash"));
+        });
     }
 }

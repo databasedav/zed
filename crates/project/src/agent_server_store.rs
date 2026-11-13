@@ -1303,8 +1303,23 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
             let mut args = target_config.args.clone();
             args.extend(extra_args);
 
+            let wrapper_path = env
+                .remove("ZED_AGENT_WRAPPER")
+                .filter(|wrapper| !wrapper.is_empty())
+                .map(PathBuf::from);
+
+            let path = if let Some(wrapper_path) = wrapper_path {
+                let mut wrapped_args = Vec::with_capacity(args.len() + 1);
+                wrapped_args.push(cmd_path.to_string_lossy().into_owned());
+                wrapped_args.extend(args);
+                args = wrapped_args;
+                wrapper_path
+            } else {
+                cmd_path
+            };
+
             let command = AgentServerCommand {
-                path: cmd_path,
+                path,
                 args,
                 env: Some(env),
             };
@@ -2207,6 +2222,51 @@ mod tests {
                 .join("agent")
         );
         assert_eq!(std::fs::read(command.path).unwrap(), contents);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui::test]
+    async fn registry_archive_agent_wraps_command_when_zed_agent_wrapper_set(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_settings(cx);
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let installation_dir = temp_dir.path().join("agent");
+        let wrapper_path = temp_dir.path().join("custom-wrapper");
+        let contents = b"wrapped agent";
+        let http_client = static_http_client(contents.to_vec());
+        let mut agent =
+            make_registry_archive_agent(cx, installation_dir.clone(), http_client, None);
+        let extra_env = [(
+            "ZED_AGENT_WRAPPER".to_string(),
+            wrapper_path.to_string_lossy().into_owned(),
+        )]
+        .into_iter()
+        .collect();
+        let get_command = cx.update(|cx| {
+            agent.get_command(vec!["--uid=".to_string()], extra_env, &mut cx.to_async())
+        });
+
+        let command = get_command.await.unwrap();
+        cx.run_until_parked();
+        let expected_binary =
+            versioned_archive_cache_dir(&installation_dir, Some("1.0.0"), TEST_ARCHIVE_URL, None)
+                .join("agent");
+        assert_eq!(command.path, wrapper_path);
+        assert_eq!(
+            command.args,
+            vec![
+                expected_binary.to_string_lossy().into_owned(),
+                "--uid=".to_string(),
+            ]
+        );
+        assert!(
+            !command
+                .env
+                .as_ref()
+                .is_some_and(|env| env.contains_key("ZED_AGENT_WRAPPER"))
+        );
     }
 
     #[gpui::test]

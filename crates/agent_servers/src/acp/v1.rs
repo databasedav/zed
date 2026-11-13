@@ -13,7 +13,7 @@ use acp_thread::{
 use action_log::ActionLog;
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::{
-    Agent, Client, HandleDispatchFrom, JsonRpcRequest, Lines,
+    Agent, Client, HandleDispatchFrom, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Lines,
     v1::{Builder, ConnectionTo, Responder},
     v2::Builder as V2Builder,
 };
@@ -30,7 +30,7 @@ use futures::future::Shared;
 use futures::{Future, FutureExt as _};
 use project::agent_server_store::{AgentServerCommand, AgentServerStore, AllAgentServersSettings};
 use project::{AgentId, Project};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -51,6 +51,43 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/diagnostics", response = ZedDiagnosticsResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedDiagnosticsRequest {
+    session_id: acp::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedDiagnosticsResponse {
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/set_end_turn_at_next_boundary")]
+#[serde(rename_all = "camelCase")]
+struct ZedSetEndTurnAtNextBoundaryNotification {
+    session_id: acp::SessionId,
+    end_at_boundary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/interrupt_for_follow_up")]
+#[serde(rename_all = "camelCase")]
+struct ZedInterruptForFollowUpNotification {
+    session_id: acp::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/subagent_continuation")]
+#[serde(rename_all = "camelCase")]
+struct ZedSubagentContinuationNotification {
+    session_id: acp::SessionId,
+}
 async fn close_session_and_drain(
     connection: &ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
@@ -460,6 +497,10 @@ fn client_builder(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            on_request!(handle_zed_diagnostics),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             on_request!(handle_create_terminal),
             agent_client_protocol::on_receive_request!(),
         )
@@ -492,6 +533,10 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            on_notification!(handle_zed_subagent_continuation),
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 /// `acp_beta` advertises the unstable subagents and plan operations RFDs, which Zed only
@@ -500,6 +545,9 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        ("zed_diagnostics".into(), true.into()),
+        ("zed_steer_at_boundary".into(), true.into()),
+        ("zed_async_subagents".into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -1744,8 +1792,44 @@ impl AgentConnection for AcpConnection {
         Ok(())
     }
 
+    fn interrupt_for_follow_up(&self, session_id: &acp_v2::SessionId, _cx: &mut App) -> Result<()> {
+        let params = ZedInterruptForFollowUpNotification {
+            session_id: acp::SessionId::new(session_id.0.clone()),
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
+    }
+
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
+    }
+
+    fn supports_steer_at_boundary(&self) -> bool {
+        true
+    }
+
+    fn set_end_turn_at_next_boundary(
+        &self,
+        session_id: &acp_v2::SessionId,
+        end_at_boundary: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let params = ZedSetEndTurnAtNextBoundaryNotification {
+            session_id: acp::SessionId::new(session_id.0.clone()),
+            end_at_boundary,
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if end_at_boundary && let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
     }
 
     fn session_modes(
@@ -2073,8 +2157,30 @@ pub mod test_support {
             self.inner.cancel(session_id, cx)
         }
 
+        fn interrupt_for_follow_up(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner.interrupt_for_follow_up(session_id, cx)
+        }
+
         fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
             self.inner.request_elicitations()
+        }
+
+        fn supports_steer_at_boundary(&self) -> bool {
+            self.inner.supports_steer_at_boundary()
+        }
+
+        fn set_end_turn_at_next_boundary(
+            &self,
+            session_id: &acp_v2::SessionId,
+            end_at_boundary: bool,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner
+                .set_end_turn_at_next_boundary(session_id, end_at_boundary, cx)
         }
 
         fn truncate(
@@ -10019,6 +10125,82 @@ exit 7
         );
     }
 
+    #[test]
+    fn test_zed_parity_capabilities_and_extension_wire_shapes() {
+        use agent_client_protocol::JsonRpcMessage as _;
+
+        let caps = client_capabilities_for_agent(&AgentId::new("custom-agent"), true);
+        let meta = caps.meta.expect("client capabilities meta");
+        assert_eq!(
+            meta.get("zed_diagnostics"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            meta.get("zed_steer_at_boundary"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            meta.get("zed_async_subagents"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let diag_req = ZedDiagnosticsRequest {
+            session_id: acp::SessionId::new("sess-1"),
+            path: Some("/tmp/main.rs".to_string()),
+        };
+        assert_eq!(diag_req.method(), "_zed/diagnostics");
+        let untyped_diag = diag_req.to_untyped_message().unwrap();
+        assert_eq!(untyped_diag.method, "_zed/diagnostics");
+        assert_eq!(
+            untyped_diag.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "path": "/tmp/main.rs",
+            })
+        );
+
+        let steer_notif = ZedSetEndTurnAtNextBoundaryNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            end_at_boundary: true,
+        };
+        assert_eq!(steer_notif.method(), "_zed/set_end_turn_at_next_boundary");
+        let untyped_steer = steer_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_steer.method, "_zed/set_end_turn_at_next_boundary");
+        assert_eq!(
+            untyped_steer.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "endAtBoundary": true,
+            })
+        );
+
+        let interrupt_notif = ZedInterruptForFollowUpNotification {
+            session_id: acp::SessionId::new("sess-1"),
+        };
+        assert_eq!(interrupt_notif.method(), "_zed/interrupt_for_follow_up");
+        let untyped_interrupt = interrupt_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_interrupt.method, "_zed/interrupt_for_follow_up");
+        assert_eq!(
+            untyped_interrupt.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+            })
+        );
+
+        let cont_notif = ZedSubagentContinuationNotification {
+            session_id: acp::SessionId::new("sess-1"),
+        };
+        assert_eq!(cont_notif.method(), "_zed/subagent_continuation");
+        let untyped_cont = cont_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_cont.method, "_zed/subagent_continuation");
+        assert_eq!(
+            untyped_cont.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+            })
+        );
+    }
+
     fn release_dropped_entities(cx: &mut gpui::TestAppContext) {
         // Cancelled task futures may own entities until the executor drops them.
         cx.run_until_parked();
@@ -10376,6 +10558,37 @@ fn handle_read_text_file(
     .detach();
 }
 
+fn handle_zed_diagnostics(
+    args: ZedDiagnosticsRequest,
+    responder: Responder<ZedDiagnosticsResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+        Ok(t) => t,
+        Err(e) => return respond_err(responder, e),
+    };
+
+    cx.spawn(async move |cx| {
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async {
+                thread
+                    .update(cx, |thread, cx| thread.read_diagnostics(args.path, cx))
+                    .map_err(agent_client_protocol::Error::from)?
+                    .await
+                    .map_err(agent_client_protocol::Error::from)
+            })
+            .await;
+
+        respond_result(
+            responder,
+            result.map(|content| ZedDiagnosticsResponse { content }),
+        );
+    })
+    .detach();
+}
+
 fn apply_v1_subagent_update(
     parent: &Entity<AcpThread>,
     update: acp::SubagentUpdate,
@@ -10391,6 +10604,27 @@ fn apply_v1_subagent_update(
         MaybeUndefined::Null => subagent.clear_session_state(cx),
         MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
     })
+}
+
+fn handle_zed_subagent_continuation(
+    notification: ZedSubagentContinuationNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let session_id = acp_v2::SessionId::new(notification.session_id.0);
+    let thread = {
+        let sessions = ctx.sessions.borrow();
+        sessions
+            .get(&session_id)
+            .map(|session| session.thread.clone())
+    };
+    if let Some(thread) = thread {
+        thread
+            .update(cx, |thread, cx| {
+                thread.request_subagent_continuation(cx);
+            })
+            .ok();
+    }
 }
 
 fn handle_session_notification(

@@ -774,6 +774,8 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    pub pending_queued_dispatch: Option<(u64, QueueEntry, Task<()>)>,
+    next_queued_dispatch_id: u64,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
@@ -980,8 +982,10 @@ impl ThreadView {
                 .collect(),
             draft,
             queued: self
-                .message_queue
+                .pending_queued_dispatch
                 .iter()
+                .map(|(_, entry, _)| entry)
+                .chain(self.message_queue.iter())
                 .map(|entry| {
                     let editor = entry.editor.read(cx);
                     QueuedMessageRecovery {
@@ -1306,6 +1310,8 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            pending_queued_dispatch: None,
+            next_queued_dispatch_id: 0,
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -1484,6 +1490,10 @@ impl ThreadView {
             .thread(acp_thread.session_id(), cx)
     }
 
+    pub fn supports_steer(&self, cx: &App) -> bool {
+        self.as_native_thread(cx).is_some() || self.thread.read(cx).supports_steer_at_boundary()
+    }
+
     /// Resolves the message editor's contents into content blocks. For profiles
     /// that do not enable any tools, directory mentions are expanded to inline
     /// file contents since the agent can't read files on its own.
@@ -1570,7 +1580,14 @@ impl ThreadView {
     }
 
     pub fn has_queued_messages(&self) -> bool {
-        !self.message_queue.is_empty()
+        !self.message_queue.is_empty() || self.pending_queued_dispatch.is_some()
+    }
+
+    fn is_effectively_generating(&self, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        thread.status() == ThreadStatus::Generating
+            || self.pending_queued_dispatch.is_some()
+            || thread.has_follow_up_interrupt_in_flight()
     }
 
     fn materialize_tool_call_views(
@@ -2206,7 +2223,7 @@ impl ThreadView {
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
-        let is_generating = thread.read(cx).status() == ThreadStatus::Generating;
+        let is_generating = self.is_effectively_generating(cx);
 
         if is_editor_empty {
             if self.message_queue.can_fast_track()
@@ -2214,6 +2231,11 @@ impl ThreadView {
                 && !self.validate_queued_entry(id, cx)
             {
                 return;
+            }
+            if self.message_queue.can_fast_track() {
+                if let Some((_, prev_entry, _task)) = self.pending_queued_dispatch.take() {
+                    self.message_queue.restore_after_failed_send(prev_entry);
+                }
             }
             if let Some(entry) = self.message_queue.try_fast_track(is_generating) {
                 self.dispatch_queued_entry(entry, window, cx);
@@ -2329,12 +2351,7 @@ impl ThreadView {
                 if !content.is_empty() {
                     this.add_to_queue(content, tracked_buffers, window, cx);
                 }
-                this.send_content(
-                    Task::ready(Ok(Some((vec![command_block], Vec::new())))),
-                    true,
-                    window,
-                    cx,
-                );
+                this.send_resolved_content(vec![command_block], Vec::new(), true, window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -2392,16 +2409,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session_id = self.thread.read(cx).session_id().clone();
-        let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
-        let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
-        let is_first_message = self.thread.read(cx).entries().is_empty();
-        let thread = self.thread.downgrade();
-
         self.is_loading_contents = true;
-
-        let model_id = self.current_model_id(cx);
-        let mode_id = self.current_mode_id(cx);
         let guard = cx.new(|_| ());
         cx.observe_release(&guard, |this, _guard, cx| {
             this.is_loading_contents = false;
@@ -2409,30 +2417,112 @@ impl ThreadView {
         })
         .detach();
 
-        let side = crate::agent_sidebar_side(cx);
-
         let task = cx.spawn_in(window, async move |this, cx| {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
-
-            let uses_reported_activity =
-                thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
-            let generation = this.update(cx, |this, cx| {
-                this.clear_external_source_prompt_warning(cx);
-                this.thread_error.take();
-                (!uses_reported_activity).then(|| this.start_turn(cx))
+            drop(guard);
+            this.update_in(cx, |this, window, cx| {
+                this.send_resolved_content(
+                    contents,
+                    tracked_buffers,
+                    is_native_command,
+                    window,
+                    cx,
+                );
             })?;
+            anyhow::Ok(())
+        });
 
-            this.update_in(cx, |this, _window, cx| {
-                this.set_editor_is_expanded(false, cx);
-            })?;
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = task.await {
+                this.update(cx, |this, cx| {
+                    this.handle_thread_error(err, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
 
-            let _ = this.update(cx, |this, cx| {
-                this.list_state.scroll_to_end();
-                cx.notify();
+    fn send_resolved_content(
+        &mut self,
+        contents: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        is_native_command: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
+        let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
+        let is_first_message = self.thread.read(cx).entries().is_empty();
+        let uses_reported_activity = self.thread.read(cx).uses_reported_activity();
+        let model_id = self.current_model_id(cx);
+        let mode_id = self.current_mode_id(cx);
+        let side = crate::agent_sidebar_side(cx);
+
+        self.clear_external_source_prompt_warning(cx);
+        self.thread_error.take();
+        let generation = (!uses_reported_activity).then(|| self.start_turn(cx));
+        self.set_editor_is_expanded(false, cx);
+        self.list_state.scroll_to_end();
+
+        if is_first_message && self.thread.read(cx).title().is_none() {
+            let text: String = contents
+                .iter()
+                .filter_map(|block| match block {
+                    acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+                    acp_v2::ContentBlock::ResourceLink(resource_link) => {
+                        Some(format!("@{}", resource_link.name))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = text.lines().next().unwrap_or("").trim();
+            if !text.is_empty() {
+                let title: SharedString = util::truncate_and_trailoff(text, 200).into();
+                self.thread.update(cx, |thread, cx| {
+                    thread.set_provisional_title(title, cx);
+                });
+            }
+        }
+
+        let turn_start_time = Instant::now();
+        let send_model_id = model_id.clone();
+        let send_mode_id = mode_id.clone();
+        let send_session_id = session_id.clone();
+        let send_parent_session_id = parent_session_id.clone();
+        let send = self.thread.update(cx, |thread, cx| {
+            thread.action_log().update(cx, |action_log, cx| {
+                for buffer in tracked_buffers {
+                    action_log.buffer_read(buffer, cx)
+                }
             });
 
+            telemetry::event!(
+                "Agent Message Sent",
+                agent = agent_telemetry_id,
+                session = send_session_id,
+                parent_session_id = send_parent_session_id.as_ref().map(|id| id.to_string()),
+                model = send_model_id,
+                mode = send_mode_id,
+                side = side
+            );
+
+            if is_native_command {
+                thread.send_command(contents, cx)
+            } else {
+                thread.send(contents, cx)
+            }
+        });
+        let submission_id = send.id;
+        self.current_submission = Some(submission_id);
+        self.sync_generating_indicator(cx);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
             let _stop_turn = (!uses_reported_activity).then(|| {
                 let this = this.clone();
                 let mut cx = cx.clone();
@@ -2445,59 +2535,6 @@ impl ThreadView {
                     })
                     .ok();
                 })
-            });
-            if is_first_message && thread.read_with(cx, |thread, _cx| thread.title().is_none())? {
-                let text: String = contents
-                    .iter()
-                    .filter_map(|block| match block {
-                        acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
-                        acp_v2::ContentBlock::ResourceLink(resource_link) => {
-                            Some(format!("@{}", resource_link.name))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let text = text.lines().next().unwrap_or("").trim();
-                if !text.is_empty() {
-                    let title: SharedString = util::truncate_and_trailoff(text, 200).into();
-                    thread.update(cx, |thread, cx| {
-                        thread.set_provisional_title(title, cx);
-                    })?;
-                }
-            }
-
-            let turn_start_time = Instant::now();
-            let send = thread.update(cx, |thread, cx| {
-                thread.action_log().update(cx, |action_log, cx| {
-                    for buffer in tracked_buffers {
-                        action_log.buffer_read(buffer, cx)
-                    }
-                });
-                drop(guard);
-
-                telemetry::event!(
-                    "Agent Message Sent",
-                    agent = agent_telemetry_id,
-                    session = session_id,
-                    parent_session_id = parent_session_id.as_ref().map(|id| id.to_string()),
-                    model = model_id,
-                    mode = mode_id,
-                    side = side
-                );
-
-                if is_native_command {
-                    thread.send_command(contents, cx)
-                } else {
-                    thread.send(contents, cx)
-                }
-            })?;
-            let submission_id = send.id;
-
-            let _ = this.update(cx, |this, cx| {
-                this.current_submission = Some(submission_id);
-                this.sync_generating_indicator(cx);
-                cx.notify();
             });
 
             let res = send.await;
@@ -2537,17 +2574,8 @@ impl ThreadView {
                     Ok(None) => {}
                     Err(error) => this.handle_thread_error(error, cx),
                 }
-            })?;
-            anyhow::Ok(())
-        });
-
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = task.await {
-                this.update(cx, |this, cx| {
-                    this.handle_thread_error(err, cx);
-                })
-                .ok();
-            }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2562,7 +2590,6 @@ impl ThreadView {
             );
             return;
         }
-        let thread = &self.thread;
 
         if self.is_loading_contents {
             return;
@@ -2571,7 +2598,7 @@ impl ThreadView {
         cx.emit(AcpThreadViewEvent::Interacted);
 
         let message_editor = self.message_editor.clone();
-        if thread.read(cx).status() == ThreadStatus::Idle {
+        if !self.is_effectively_generating(cx) {
             self.send_impl(message_editor, window, cx);
             return;
         }
@@ -2585,10 +2612,26 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((_, entry, _task)) = self.pending_queued_dispatch.take() {
+            self.message_queue.restore_after_failed_send(entry);
+        }
         let thread = self.thread.clone();
         self.message_queue.pause();
+        self.sync_queue_flag_to_native_thread(cx);
+        cx.notify();
 
-        let cancelled = thread.update(cx, |thread, cx| thread.interrupt_for_follow_up(cx));
+        let cancelled =
+            match thread.update(cx, |thread, cx| thread.interrupt_for_follow_up_or_ready(cx)) {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    self.send_impl(message_editor, window, cx);
+                    return;
+                }
+                Err(error) => {
+                    self.handle_thread_error(error, cx);
+                    return;
+                }
+            };
 
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = cancelled.await {
@@ -2725,9 +2768,13 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, entry, _task)) = self.pending_queued_dispatch.take() {
+            self.message_queue.restore_after_failed_send(entry);
+        }
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
+        self.sync_queue_flag_to_native_thread(cx);
         self._cancel_task = Some(self.cancel_thread(&self.thread, cx));
         self.sync_generating_indicator(cx);
         cx.notify();
@@ -3052,18 +3099,22 @@ impl ThreadView {
     }
 
     pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
+        // By default queued messages wait for the turn to fully complete.
+        // Only a "steering" front message ends the turn at the next boundary.
+        let end_at_boundary = self.message_queue.front_wants_steer()
+            && self.message_queue.first().is_some_and(|entry| {
+                self.thread
+                    .read(cx)
+                    .validate_prompt_content(&entry.content)
+                    .is_ok()
+            });
         if let Some(native_thread) = self.as_native_thread(cx) {
-            // By default queued messages wait for the turn to fully complete.
-            // Only a "steering" front message ends the turn at the next boundary.
-            let end_at_boundary = self.message_queue.front_wants_steer()
-                && self.message_queue.first().is_some_and(|entry| {
-                    self.thread
-                        .read(cx)
-                        .validate_prompt_content(&entry.content)
-                        .is_ok()
-                });
             native_thread.update(cx, |thread, _| {
                 thread.set_end_turn_at_next_boundary(end_at_boundary);
+            });
+        } else if self.thread.read(cx).supports_steer_at_boundary() {
+            self.thread.update(cx, |thread, cx| {
+                thread.set_end_turn_at_next_boundary(end_at_boundary, cx);
             });
         }
     }
@@ -3087,6 +3138,7 @@ impl ThreadView {
     ) -> bool {
         if self.thread.read(cx).foreground_activity() != ForegroundActivity::Idle
             || self.is_loading_contents
+            || self.pending_queued_dispatch.is_some()
         {
             return false;
         }
@@ -3118,7 +3170,10 @@ impl ThreadView {
         if !self.validate_queued_entry(id, cx) {
             return;
         }
-        let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
+        let is_generating = self.is_effectively_generating(cx);
+        if let Some((_, prev_entry, _task)) = self.pending_queued_dispatch.take() {
+            self.message_queue.restore_after_failed_send(prev_entry);
+        }
         if let Some(entry) = self.message_queue.send_now(id, is_generating) {
             self.dispatch_queued_entry(entry, window, cx);
         }
@@ -3155,35 +3210,96 @@ impl ThreadView {
             })
             .is_some();
 
-        let cancelled = self
+        let interrupt = self
             .thread
-            .update(cx, |thread, cx| thread.interrupt_for_follow_up(cx));
+            .update(cx, |thread, cx| thread.interrupt_for_follow_up_or_ready(cx));
 
+        let cancelled = match interrupt {
+            Err(error) => {
+                self.message_queue.restore_after_failed_send(entry);
+                self.sync_queue_flag_to_native_thread(cx);
+                self.handle_thread_error(error, cx);
+                return;
+            }
+            Ok(None) => {
+                if self.should_be_following {
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.follow(CollaboratorId::Agent, window, cx);
+                        })
+                        .ok();
+                }
+                self.send_resolved_content(
+                    entry.content,
+                    entry.tracked_buffers,
+                    is_native_command,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            Ok(Some(task)) => task,
+        };
+
+        if let Some((_, prev_entry, _task)) = self.pending_queued_dispatch.take() {
+            self.message_queue.restore_after_failed_send(prev_entry);
+        }
+
+        self.next_queued_dispatch_id += 1;
+        let dispatch_id = self.next_queued_dispatch_id;
         let workspace = self.workspace.clone();
-
         let should_be_following = self.should_be_following;
-        let contents_task = cx.spawn_in(window, async move |this, cx| {
+
+        let task = cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = cancelled.await {
                 this.update(cx, |this, cx| {
-                    this.message_queue.restore_after_failed_send(entry);
-                    this.sync_queue_flag_to_native_thread(cx);
-                    cx.notify();
+                    if this
+                        .pending_queued_dispatch
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id == dispatch_id)
+                    {
+                        if let Some((_, entry, _)) = this.pending_queued_dispatch.take() {
+                            this.message_queue.restore_after_failed_send(entry);
+                            this.sync_queue_flag_to_native_thread(cx);
+                        }
+                    }
+                    this.handle_thread_error(error, cx);
                 })
                 .log_err();
-                return Err(error);
-            }
-            if should_be_following {
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.follow(CollaboratorId::Agent, window, cx);
-                    })
-                    .ok();
+                return;
             }
 
-            Ok(Some((entry.content, entry.tracked_buffers)))
+            this.update_in(cx, |this, window, cx| {
+                let matches_id = this
+                    .pending_queued_dispatch
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| *id == dispatch_id);
+                if !matches_id {
+                    return;
+                }
+                let Some((_, entry, _)) = this.pending_queued_dispatch.take() else {
+                    return;
+                };
+                if should_be_following {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.follow(CollaboratorId::Agent, window, cx);
+                        })
+                        .ok();
+                }
+                this.send_resolved_content(
+                    entry.content,
+                    entry.tracked_buffers,
+                    is_native_command,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
         });
 
-        self.send_content(contents_task, is_native_command, window, cx);
+        self.pending_queued_dispatch = Some((dispatch_id, entry, task));
+        cx.notify();
     }
 
     pub fn move_queued_message_to_main_editor(
@@ -4811,7 +4927,8 @@ impl ThreadView {
         _window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let queue_count = self.message_queue.len();
+        let queue_count =
+            self.message_queue.len() + usize::from(self.pending_queued_dispatch.is_some());
         let title: SharedString = if queue_count == 1 {
             "1 Queued Message".into()
         } else {
@@ -4852,6 +4969,7 @@ impl ThreadView {
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.pending_queued_dispatch.take();
         self.message_queue.clear();
         self.sync_queue_flag_to_native_thread(cx);
         cx.notify();
@@ -5793,17 +5911,54 @@ impl ThreadView {
         let focus_handle = message_editor.focus_handle(cx);
 
         let queue_len = self.message_queue.len();
+        let has_pending_dispatch = self.pending_queued_dispatch.is_some();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let supports_steer = self.supports_steer(cx);
 
         v_flex()
             .id("message_queue_list")
             .max_h_40()
             .overflow_y_scroll()
+            .when_some(
+                self.pending_queued_dispatch.as_ref(),
+                |this, (_, pending_entry, _)| {
+                    this.child(
+                        h_flex()
+                            .id("pending_queue_entry")
+                            .w_full()
+                            .flex_wrap()
+                            .p_1p5()
+                            .gap_1()
+                            .bg(cx.theme().colors().editor_background)
+                            .when(queue_len > 0, |row| {
+                                row.border_b_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                            })
+                            .child(
+                                div()
+                                    .id("sending_queued_message")
+                                    .flex_none()
+                                    .child(SpinnerLabel::new().size(LabelSize::Small))
+                                    .tooltip(Tooltip::text("Sending…")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(rems_from_px(120_f32))
+                                    .child(pending_entry.editor.clone()),
+                            )
+                            .child(
+                                Label::new("Sending…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                },
+            )
             .children(self.message_queue.iter().enumerate().map(|(index, entry)| {
                 let entry_id = entry.id;
                 let editor = &entry.editor;
-                let is_next = index == 0;
+                let is_next = index == 0 && !has_pending_dispatch;
                 let (icon_color, tooltip_text) = if is_next {
                     (Color::Accent, "Next in Queue")
                 } else {
@@ -5864,7 +6019,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(supports_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -5938,7 +6093,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(supports_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -9927,9 +10082,7 @@ impl ThreadView {
                     confirmation_content.into_any()
                 }
                 ToolCallStatus::Pending | ToolCallStatus::InProgress
-                    if is_edit
-                        && tool_call.content().is_empty()
-                        && self.as_native_connection(cx).is_some() =>
+                    if is_edit && tool_call.content().is_empty() =>
                 {
                     self.render_diff_loading(cx)
                 }
@@ -12192,7 +12345,7 @@ impl ThreadView {
             })
             .child(if let Some(editor) = revealed_diff_editor {
                 editor.into_any_element()
-            } else if tool_progress && self.as_native_connection(cx).is_some() {
+            } else if tool_progress {
                 self.render_diff_loading(cx)
             } else {
                 Empty.into_any()
@@ -12390,12 +12543,8 @@ impl ThreadView {
         let is_failed_or_canceled = state.status.is_failed_or_canceled();
 
         let model_name = thread_view
-            .and_then(|view| view.read(cx).as_native_thread(cx))
-            .and_then(|thread| {
-                let thread = thread.read(cx);
-                let model = thread.model()?;
-                Some(model.name().0)
-            });
+            .and_then(|view| view.read(cx).subagent_model_name(cx))
+            .or_else(|| state.model_name.clone());
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -13219,6 +13368,23 @@ impl ThreadView {
                 div()
                     .debug_selector(|| "authenticate-submission".into())
                     .child(button)
+            })
+    }
+
+    pub(crate) fn subagent_model_name(&self, cx: &App) -> Option<SharedString> {
+        self.as_native_thread(cx)
+            .and_then(|thread| Some(thread.read(cx).model()?.name().0))
+            .or_else(|| {
+                self.model_selector
+                    .as_ref()
+                    .and_then(|selector| selector.read(cx).active_model(cx))
+                    .map(|model| model.name.clone())
+            })
+            .or_else(|| {
+                self.config_options_view.as_ref().and_then(|view| {
+                    view.read(cx)
+                        .selected_category_value_name(acp_v2::SessionConfigOptionCategory::Model)
+                })
             })
     }
 
@@ -14222,7 +14388,7 @@ impl Render for ThreadView {
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
+                    if !this.supports_steer(cx) {
                         return;
                     }
                     if let Some(id) = this.message_queue.first_id() {

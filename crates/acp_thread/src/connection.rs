@@ -92,6 +92,8 @@ pub fn build_terminal_auth_task(
     }
 }
 
+pub const ZED_SUBAGENT_CONTINUATION_PROMPT: &str = "__zed_subagent_continuation__";
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
@@ -290,6 +292,22 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::anyhow!(
             "Cancelling terminals is not supported"
         )))
+    }
+
+    /// Whether this connection supports ending a running turn at the next tool/step boundary
+    /// so queued steering messages can be sent without tearing down in-progress tool work.
+    fn supports_steer_at_boundary(&self) -> bool {
+        false
+    }
+
+    /// Updates whether the session should end its current turn at the next tool/step boundary.
+    fn set_end_turn_at_next_boundary(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _end_at_boundary: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Request-scoped elicitations are connection-level because they can arrive before a session
@@ -1044,6 +1062,8 @@ mod test_support {
         supports_session_additional_directories: bool,
         supports_set_title: bool,
         supports_truncate: bool,
+        supports_steer_at_boundary: bool,
+        steer_at_boundary_calls: Arc<Mutex<Vec<(acp_v2::SessionId, bool)>>>,
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
@@ -1095,6 +1115,8 @@ mod test_support {
                 supports_session_additional_directories: false,
                 supports_set_title: true,
                 supports_truncate: true,
+                supports_steer_at_boundary: false,
+                steer_at_boundary_calls: Default::default(),
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
                 prompt_capabilities_rx: watch::Receiver::constant(
@@ -1243,6 +1265,15 @@ mod test_support {
         pub fn with_receipt_submissions(mut self, enabled: bool) -> Self {
             self.supports_receipt_submissions = enabled;
             self
+        }
+
+        pub fn with_steer_at_boundary(mut self, enabled: bool) -> Self {
+            self.supports_steer_at_boundary = enabled;
+            self
+        }
+
+        pub fn take_steer_at_boundary_calls(&self) -> Vec<(acp_v2::SessionId, bool)> {
+            std::mem::take(&mut *self.steer_at_boundary_calls.lock())
         }
 
         pub fn with_retry(mut self) -> Self {
@@ -1604,6 +1635,22 @@ mod test_support {
                     next_truncate: self.next_truncate.clone(),
                 }) as Rc<dyn AgentSessionTruncate>
             })
+        }
+
+        fn supports_steer_at_boundary(&self) -> bool {
+            self.supports_steer_at_boundary
+        }
+
+        fn set_end_turn_at_next_boundary(
+            &self,
+            session_id: &acp_v2::SessionId,
+            end_at_boundary: bool,
+            _cx: &mut App,
+        ) -> Result<()> {
+            self.steer_at_boundary_calls
+                .lock()
+                .push((session_id.clone(), end_at_boundary));
+            Ok(())
         }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

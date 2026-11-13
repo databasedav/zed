@@ -4137,6 +4137,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     session_id,
                     message_start_index: entry_count,
                     message_end_index: None,
+                    model_name: None,
                 },
                 pending_steers,
             });

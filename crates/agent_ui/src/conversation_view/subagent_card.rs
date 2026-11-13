@@ -185,6 +185,7 @@ pub(crate) struct SubagentCardState {
     /// An ACP parent's own label for the subagent describes it in the parent's view, so it
     /// wins over the subagent's title for itself.
     pub label_wins: bool,
+    pub model_name: Option<SharedString>,
     pub status: SubagentStatus,
     pub error: Option<SharedString>,
     pub can_stop: bool,
@@ -208,6 +209,12 @@ impl SubagentCardState {
         Self {
             label: (!label.is_empty()).then(|| label.to_string().into()),
             label_wins: false,
+            model_name: tool_call
+                .subagent_session_info
+                .as_ref()
+                .and_then(|info| info.model_name.as_deref())
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_string().into()),
             status,
             error: tool_call_error(tool_call, cx),
             can_stop: status == SubagentStatus::Running,
@@ -269,6 +276,7 @@ impl SubagentCardState {
         Self {
             label: Some(subagent_label(thread)),
             label_wins: true,
+            model_name: None,
             status,
             error,
             can_stop: status == SubagentStatus::Running && can_cancel,
@@ -353,6 +361,7 @@ mod tests {
         SubagentCardState {
             label: label.map(|label| label.to_string().into()),
             label_wins: false,
+            model_name: None,
             status,
             error: None,
             can_stop: false,

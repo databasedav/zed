@@ -272,6 +272,7 @@ impl AgentTool for SpawnAgentTool {
                                     session_id: subagent.id(),
                                     message_start_index: subagent.num_entries(cx),
                                     message_end_index: None,
+                                    model_name: None,
                                 };
                                 LaunchOutcome::Spawned(subagent, session_info)
                             }
@@ -292,6 +293,7 @@ impl AgentTool for SpawnAgentTool {
                                 session_id: subagent.id(),
                                 message_start_index: subagent.num_entries(cx),
                                 message_end_index: None,
+                                model_name: None,
                             };
                             LaunchOutcome::Spawned(subagent, session_info)
                         }),
