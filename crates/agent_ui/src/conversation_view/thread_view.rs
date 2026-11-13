@@ -5428,8 +5428,24 @@ impl ThreadView {
             )
     }
 
+    fn parent_subagent_tool_call_status(&self, cx: &App) -> Option<SubagentStatus> {
+        let parent_session_id = self.parent_session_id.as_ref()?;
+        let my_session_id = self.thread.read(cx).session_id().clone();
+        self.server_view
+            .upgrade()
+            .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
+            .and_then(|parent_view| {
+                parent_view
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .tool_call_for_subagent(&my_session_id)
+                    .map(|tool_call| SubagentStatus::from_tool_call(tool_call, cx))
+            })
+    }
+
     fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
-        let Some(parent_session_id) = self.parent_session_id.as_ref() else {
+        if self.parent_session_id.is_none() {
             return false;
         };
 
@@ -5442,21 +5458,8 @@ impl ThreadView {
                 .is_failed_or_canceled();
         }
 
-        let my_session_id = thread.session_id().clone();
-
-        self.server_view
-            .upgrade()
-            .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
-            .is_some_and(|parent_view| {
-                parent_view
-                    .read(cx)
-                    .thread
-                    .read(cx)
-                    .tool_call_for_subagent(&my_session_id)
-                    .is_some_and(|tool_call| {
-                        SubagentStatus::from_tool_call(tool_call, cx).is_failed_or_canceled()
-                    })
-            })
+        self.parent_subagent_tool_call_status(cx)
+            .is_some_and(SubagentStatus::is_failed_or_canceled)
     }
 
     pub(crate) fn render_subagent_titlebar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
@@ -5467,7 +5470,9 @@ impl ThreadView {
 
         let server_view = self.server_view.clone();
         let thread = self.thread.clone();
-        let is_done = thread.read(cx).status() == ThreadStatus::Idle;
+        let is_running_in_parent =
+            self.parent_subagent_tool_call_status(cx) == Some(SubagentStatus::Running);
+        let is_done = thread.read(cx).status() == ThreadStatus::Idle && !is_running_in_parent;
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
         // An ACP subagent can only be cancelled when its parent advertises `cancel` for it.
         let can_stop = !is_done

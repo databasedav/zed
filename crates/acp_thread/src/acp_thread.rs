@@ -6251,6 +6251,12 @@ impl AcpThread {
         if self.subagents.contains_key(&session_id) {
             return;
         }
+        let parent_session_id = self.session_id().clone();
+        subagent.update(cx, |subagent, _| {
+            if subagent.parent_session_id.is_none() && subagent.session_id() != &parent_session_id {
+                subagent.parent_session_id = Some(parent_session_id);
+            }
+        });
         self.subagents.insert(session_id.clone(), subagent);
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
@@ -7890,6 +7896,11 @@ impl AcpThread {
         self.cancel_outstanding_elicitations(cx);
 
         let Some(turn) = self.running_turn.take() else {
+            if self.parent_session_id.is_some()
+                && matches!(permission_outcome, RequestPermissionOutcome::Cancelled)
+            {
+                self.connection.cancel(self.session_id(), cx)?;
+            }
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);

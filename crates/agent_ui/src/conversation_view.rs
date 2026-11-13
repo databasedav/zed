@@ -968,6 +968,7 @@ pub struct ConnectedServerState {
     auth_state: AuthState,
     active_id: Option<acp_v2::SessionId>,
     pub(crate) threads: HashMap<acp_v2::SessionId, Entity<ThreadView>>,
+    loading_subagent_sessions: HashSet<acp_v2::SessionId>,
     connection: Rc<dyn AgentConnection>,
     conversation: Entity<Conversation>,
     _connection_entry_subscription: Subscription,
@@ -1523,6 +1524,7 @@ impl ConversationView {
                                 auth_state: AuthState::Ok,
                                 active_id: Some(root_session_id.clone()),
                                 threads: HashMap::from_iter([(root_session_id, current)]),
+                                loading_subagent_sessions: HashSet::default(),
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                                 _request_elicitation_subscription: request_elicitation_subscription,
@@ -1803,6 +1805,7 @@ impl ConversationView {
                         auth_state,
                         active_id: None,
                         threads: HashMap::default(),
+                        loading_subagent_sessions: HashSet::default(),
                         connection,
                         conversation: cx.new(|_cx| Conversation::default()),
                         _connection_entry_subscription: Subscription::new(|| {}),
@@ -2006,27 +2009,30 @@ impl ConversationView {
                         active.sync_generating_indicator(cx);
                     });
                 }
+                self.load_subagent_session_for_entry(thread, index, cx);
             }
             AcpThreadEvent::EntryUpdated(index) => {
+                let index = *index;
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
-                        view_state.sync_entry(*index, thread, window, cx);
+                        view_state.sync_entry(index, thread, window, cx);
                     });
-                    list_state.remeasure_items(*index..*index + 1);
+                    list_state.remeasure_items(index..index + 1);
                     active.update(cx, |active, cx| {
-                        if active.editing_message == Some(*index)
-                            && !active.can_edit_user_message(*index, cx)
+                        if active.editing_message == Some(index)
+                            && !active.can_edit_user_message(index, cx)
                         {
                             active.editing_message = None;
                             cx.notify();
                         }
-                        active.sync_elicitation_state_for_entry(*index, window, cx);
+                        active.sync_elicitation_state_for_entry(index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
                     });
                 }
+                self.load_subagent_session_for_entry(thread, index, cx);
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2597,6 +2603,31 @@ impl ConversationView {
     /// the parent already owns are never loaded: ACP forbids loading subagent sessions.
     /// Neither is any session where the subagents RFD applies, since a child referenced
     /// there may still be announced, and loading it first would reject the announcement.
+    fn load_subagent_session_for_entry(
+        &mut self,
+        parent_thread: &Entity<AcpThread>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subagent_id) =
+            parent_thread
+                .read(cx)
+                .entries()
+                .get(index)
+                .and_then(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) => call
+                        .subagent_session_info
+                        .as_ref()
+                        .map(|info| info.session_id.clone()),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        let parent_session_id = parent_thread.read(cx).session_id().clone();
+        self.load_subagent_session(subagent_id, parent_session_id, cx);
+    }
+
     fn load_subagent_session(
         &mut self,
         subagent_id: acp_v2::SessionId,
@@ -2607,6 +2638,7 @@ impl ConversationView {
             return;
         };
         if connected.threads.contains_key(&subagent_id)
+            || connected.loading_subagent_sessions.contains(&subagent_id)
             || !connected.connection.supports_load_session()
             || connected.connection.announces_subagents()
         {
@@ -2622,28 +2654,73 @@ impl ConversationView {
         if parent_thread.read(cx).subagent(&subagent_id).is_some() {
             return;
         }
+        let (running_tool_call_id, provisional_title) = {
+            let parent_ref = parent_thread.read(cx);
+            let tool_call = parent_ref.tool_call_for_subagent(&subagent_id);
+            let running_id = tool_call
+                .filter(|call| {
+                    matches!(
+                        call.status(),
+                        acp_thread::ToolCallStatus::Pending
+                            | acp_thread::ToolCallStatus::InProgress
+                    )
+                })
+                .map(|call| call.id.clone());
+            let title = tool_call
+                .map(|call| call.label.read(cx).source().to_string())
+                .filter(|label| !label.is_empty())
+                .map(SharedString::from);
+            (running_id, title)
+        };
         let work_dirs = parent_thread
             .read(cx)
             .work_dirs()
             .cloned()
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let connection = connected.connection.clone();
+        if let Some(connected) = self.as_connected_mut() {
+            connected
+                .loading_subagent_sessions
+                .insert(subagent_id.clone());
+        }
 
-        let subagent_thread_task = connected.connection.clone().load_session(
-            subagent_id,
+        let subagent_thread_task = connection.load_session(
+            subagent_id.clone(),
             self.project.clone(),
             work_dirs,
-            None,
+            provisional_title,
             cx,
         );
 
         let parent_thread = parent_thread.downgrade();
-        cx.spawn(async move |_, cx| {
-            let subagent_thread = subagent_thread_task.await?;
+        cx.spawn(async move |this, cx| {
+            let result = subagent_thread_task.await;
+            this.update(cx, |this, _| {
+                if let Some(connected) = this.as_connected_mut() {
+                    connected.loading_subagent_sessions.remove(&subagent_id);
+                }
+            })
+            .ok();
+            let subagent_thread = result?;
             let registered = parent_thread.update(cx, |parent_thread, cx| {
                 parent_thread.register_subagent(subagent_thread, cx);
             });
             if registered.is_err() {
                 log::debug!("Subagent parent was released while its session loaded");
+                return anyhow::Ok(());
+            }
+            if let Some(tool_call_id) = running_tool_call_id {
+                this.update(cx, |this, cx| {
+                    if let Some(parent_view) = this.thread_view(&parent_session_id) {
+                        parent_view.update(cx, |view, cx| {
+                            view.entry_view_state.update(cx, |state, _| {
+                                state.expand_tool_call(tool_call_id);
+                            });
+                            cx.notify();
+                        });
+                    }
+                })
+                .ok();
             }
             anyhow::Ok(())
         })
@@ -21347,5 +21424,99 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[gpui::test]
+    async fn test_live_acp_subagent_tool_call_loads_and_streams_child_session(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("live-acp-subagent");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("invoke-1", "Workspace Tour (research)")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+            let mut progress = acp_v1::ToolCallUpdate::new(
+                "invoke-1",
+                acp_v1::ToolCallUpdateFields::new()
+                    .title("Workspace Tour (research)")
+                    .status(acp_v1::ToolCallStatus::InProgress),
+            );
+            progress.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCallUpdate(progress),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let child_view = conversation_view
+            .read_with(cx, |view, _| view.thread_view(&child_session_id))
+            .expect("live subagent tool call should load and register child ThreadView");
+        let child_thread = child_view.read_with(cx, |view, _| view.thread.clone());
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.parent_session_id().cloned()),
+            Some(root_session_id.clone()),
+        );
+        assert!(
+            root_view.read_with(cx, |view, cx| {
+                view.entry_view_state
+                    .read(cx)
+                    .is_tool_call_expanded(&acp_v2::ToolCallId::new("invoke-1"))
+            }),
+            "live running subagent card should auto-expand",
+        );
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                child_session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Inspecting Cargo.toml".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.entries().len()),
+            1,
+        );
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let stop_bounds = cx
+            .debug_bounds("subagent-titlebar-stop")
+            .expect("running external subagent should show stop button in fullscreen titlebar");
+        cx.simulate_click(stop_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(connection.take_cancel_calls(), vec![child_session_id]);
     }
 }
