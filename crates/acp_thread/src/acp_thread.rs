@@ -4666,6 +4666,15 @@ impl AcpThread {
                             matches!(elicitation.status, ElicitationStatus::Pending { .. })
                         })
                 }
+                AgentThreadEntry::ToolCall(call) => {
+                    call.is_subagent()
+                        && matches!(
+                            call.status(),
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::InProgress
+                                | ToolCallStatus::WaitingForConfirmation
+                        )
+                }
                 _ => false,
             })
     }
@@ -5777,6 +5786,22 @@ impl AcpThread {
         self.push_assistant_content_block_with_indent(chunk, is_thought, false, cx)
     }
 
+    pub fn push_keyed_assistant_content_block(
+        &mut self,
+        message_id: SharedString,
+        chunk: acp_v2::ContentBlock,
+        is_thought: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_assistant_content_block_with_message_id(
+            Some(acp_v1::MessageId::new(message_id.to_string())),
+            chunk,
+            is_thought,
+            false,
+            cx,
+        )
+    }
+
     pub fn push_assistant_content_block_with_indent(
         &mut self,
         chunk: acp_v2::ContentBlock,
@@ -6301,6 +6326,16 @@ impl AcpThread {
 
     pub fn update_retry_status(&mut self, status: RetryStatus, cx: &mut Context<Self>) {
         cx.emit(AcpThreadEvent::Retry(status));
+    }
+
+    pub fn has_tool_call(&self, id: &acp_v2::ToolCallId) -> bool {
+        self.index_for_tool_call(id).is_some()
+    }
+
+    pub fn has_running_subagents(&self, cx: &App) -> bool {
+        self.subagents
+            .values()
+            .any(|subagent| subagent.read(cx).status() == ThreadStatus::Generating)
     }
 
     pub fn update_tool_call(
@@ -7808,6 +7843,13 @@ impl AcpThread {
         }
     }
 
+    pub fn interrupt_for_follow_up(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        match self.request_cancellation(RequestPermissionOutcome::InterruptedByFollowUp, cx) {
+            Ok(task) => task,
+            Err(error) => Task::ready(Err(error)),
+        }
+    }
+
     /// Asks the agent to stop one tool call, without cancelling the rest of the session's work.
     pub fn cancel_tool_call(
         &self,
@@ -7854,13 +7896,21 @@ impl AcpThread {
                 .is_none_or(|association| association.can_cancel),
             "This subagent's parent does not allow cancelling it"
         );
+        let cancel_subagents = matches!(permission_outcome, RequestPermissionOutcome::Cancelled);
         self.flush_streaming_text(cx);
         if self.uses_reported_activity() {
             self.activity.ensure_observable()?;
+            let has_running_subagents = cancel_subagents && self.has_running_subagents(cx);
             if self.foreground_activity() != ForegroundActivity::Idle
                 || self.has_unsettled_submissions()
+                || has_running_subagents
             {
-                self.connection.cancel(self.session_id(), cx)?;
+                if cancel_subagents {
+                    self.connection.cancel(self.session_id(), cx)?;
+                } else {
+                    self.connection
+                        .interrupt_for_follow_up(self.session_id(), cx)?;
+                }
             }
             if self.connection.answers_permission_requests_on_cancel() {
                 if self.subagent_association.is_some() {
@@ -7875,17 +7925,42 @@ impl AcpThread {
                 }
             }
             let receiver = self.activity.wait_for_idle()?;
-            let Some(receiver) = receiver else {
+            let mut subagent_receivers = Vec::new();
+            if cancel_subagents {
+                for subagent in self.subagents.values() {
+                    if let Ok(Some(rx)) = subagent.update(cx, |subagent, _| {
+                        if subagent.uses_reported_activity() {
+                            subagent.activity.wait_for_idle()
+                        } else {
+                            Ok(None)
+                        }
+                    }) {
+                        subagent_receivers.push(rx);
+                    }
+                }
+            }
+            if receiver.is_none() && subagent_receivers.is_empty() {
                 return Ok(Task::ready(Ok(())));
-            };
+            }
             return Ok(cx.spawn(async move |_, _| {
-                receiver
-                    .await
-                    .context("Agent connection lost before cancellation was confirmed")
+                if let Some(receiver) = receiver {
+                    receiver
+                        .await
+                        .context("Agent connection lost before cancellation was confirmed")?;
+                }
+                for subagent_rx in subagent_receivers {
+                    subagent_rx.await.ok();
+                }
+                Ok(())
             }));
         }
         if self.running_turn.is_some() {
-            self.connection.cancel(self.session_id(), cx)?;
+            if cancel_subagents {
+                self.connection.cancel(self.session_id(), cx)?;
+            } else {
+                self.connection
+                    .interrupt_for_follow_up(self.session_id(), cx)?;
+            }
         }
         self.cancel_outstanding_elicitations(cx);
 
@@ -7897,7 +7972,7 @@ impl AcpThread {
             return Ok(Task::ready(Ok(())));
         };
         self.shrink_message_source_capacity(turn.first_entry_index);
-        self.mark_pending_entries_as_canceled(permission_outcome, cx);
+        self.mark_pending_entries_as_canceled(permission_outcome, cancel_subagents, cx);
         self.set_foreground_state(
             acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
             cx,
@@ -7982,7 +8057,7 @@ impl AcpThread {
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
-        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, cx);
+        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, false, cx);
         self.cancel_outstanding_elicitations(cx);
     }
 
@@ -7991,7 +8066,8 @@ impl AcpThread {
         outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
-        self.mark_pending_entries_as_canceled(outcome.clone(), cx);
+        let cancel_subagents = matches!(outcome, RequestPermissionOutcome::Cancelled);
+        self.mark_pending_entries_as_canceled(outcome.clone(), cancel_subagents, cx);
         let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
         for id in request_ids {
             self.cancel_permission_request_with_outcome(id, outcome.clone(), cx);
@@ -8002,12 +8078,17 @@ impl AcpThread {
     fn mark_pending_entries_as_canceled(
         &mut self,
         permission_outcome: RequestPermissionOutcome,
+        cancel_subagents: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let mut canceled_any = false;
         let mut canceled_requests = Vec::new();
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
+                    if !cancel_subagents && call.is_subagent() {
+                        continue;
+                    }
                     let cancel = matches!(
                         call.status(),
                         ToolCallStatus::Pending
@@ -8015,6 +8096,7 @@ impl AcpThread {
                             | ToolCallStatus::InProgress
                     );
                     if cancel {
+                        canceled_any = true;
                         call.set_local_status(ToolCallStatus::Canceled);
                         if let Some(id) = call.authorization.take() {
                             canceled_requests.push(id);
@@ -8024,6 +8106,7 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ContextCompaction(compaction) => {
                     if compaction.status == ContextCompactionStatus::InProgress {
+                        canceled_any = true;
                         compaction.status = ContextCompactionStatus::Canceled;
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
                     }
@@ -8035,6 +8118,7 @@ impl AcpThread {
             self.resolve_permission_request(id, permission_outcome.clone(), cx);
         }
         self.cancel_generic_permission_requests(cx);
+        canceled_any
     }
 
     pub fn cancel_outstanding_elicitations(&mut self, cx: &mut Context<Self>) {

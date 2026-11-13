@@ -1425,6 +1425,7 @@ mod tests {
             // Sibling/subagent thread creation delegates permission checks to
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
+            "query_subagent",
             "spawn_agent",
         ];
 

@@ -89,6 +89,10 @@ impl ActionLog {
         self.file_read_times.get(path).copied()
     }
 
+    pub fn read_files(&self) -> impl Iterator<Item = &Path> {
+        self.file_read_times.keys().map(PathBuf::as_path)
+    }
+
     fn update_file_read_time(&mut self, buffer: &Entity<Buffer>, cx: &App) {
         let buffer = buffer.read(cx);
         if let Some(file) = buffer.file() {

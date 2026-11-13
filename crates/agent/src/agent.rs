@@ -274,6 +274,7 @@ enum NativeRetryAction {
         content: Vec<acp_v2::ContentBlock>,
     },
     Compact,
+    SubagentContinuation,
 }
 
 impl NativeRetryAction {
@@ -1038,19 +1039,142 @@ impl NativeAgent {
         acp_thread
     }
 
-    fn cancel_session(&mut self, session_id: &acp_v2::SessionId) {
+    fn cancel_session(&mut self, session_id: &acp_v2::SessionId) -> bool {
         let Some(session) = self.sessions.get_mut(session_id) else {
-            return;
+            return false;
         };
         if session.pending_cancellation.send(()).is_err() {
             log::debug!("No pending native submissions to cancel");
         }
         if let Some(execution) = session.execution.as_mut()
             && let Some(sender) = execution.cancellation.take()
-            && sender.send(NativeCancellation::Cancelled).is_err()
+        {
+            if sender.send(NativeCancellation::Cancelled).is_err() {
+                log::debug!("Native execution already completed");
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    fn cancel_session_and_subagents(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let had_running_execution = self.cancel_session(session_id);
+        if !had_running_execution && let Some(session) = self.sessions.get(session_id) {
+            let thread = session.thread.clone();
+            let acp_thread = session.acp_thread.clone();
+            thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+            cx.spawn(async move |_, cx| {
+                acp_thread
+                    .update(cx, |thread, cx| {
+                        thread.cancel_local_actions(
+                            acp_thread::RequestPermissionOutcome::Cancelled,
+                            cx,
+                        );
+                    })
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn interrupt_session_for_follow_up(&mut self, session_id: &acp_v2::SessionId) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if let Some(execution) = session.execution.as_mut()
+            && let Some(sender) = execution.cancellation.take()
+            && sender
+                .send(NativeCancellation::InterruptedByFollowUp)
+                .is_err()
         {
             log::debug!("Native execution already completed");
         }
+    }
+
+    fn schedule_subagent_result_delivery(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.maybe_start_subagent_continuation(&session_id, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn maybe_start_subagent_continuation(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((thread, acp_thread)) = self.sessions.get(session_id).and_then(|session| {
+            if session
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.completion.peek().is_none())
+            {
+                return None;
+            }
+            Some((session.thread.clone(), session.acp_thread.upgrade()?))
+        }) else {
+            return;
+        };
+
+        if !thread.read(cx).has_pending_subagent_results() {
+            return;
+        }
+        if acp_thread.read(cx).has_unsettled_submissions()
+            || acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle
+        {
+            return;
+        }
+
+        let message_id = thread
+            .read(cx)
+            .last_user_message_id()
+            .unwrap_or_else(ClientUserMessageId::new);
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        let completion = completion_receiver.shared();
+        let (cancellation_sender, cancellation_receiver) = oneshot::channel();
+        let retry_action = Some(NativeRetryAction::SubagentContinuation);
+        let driver = NativeAgentConnection::drive_execution(
+            cx.weak_entity(),
+            session_id.clone(),
+            thread,
+            acp_thread.downgrade(),
+            message_id.clone(),
+            retry_action.clone(),
+            cancellation_receiver,
+            completion_sender,
+            cx,
+        );
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.execution = Some(NativeExecution {
+                _driver: driver,
+                message_id,
+                retry_action,
+                cancellation: Some(cancellation_sender),
+                completion,
+            });
+        }
+        acp_thread
+            .update(cx, |thread, cx| {
+                thread.update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+            })
+            .log_err();
     }
 
     pub fn models(&self) -> &LanguageModels {
@@ -2671,6 +2795,7 @@ impl NativeAgentConnection {
         cx.spawn(async move |cx| {
             let execution = cx.spawn({
                 let agent = agent.clone();
+                let session_id = session_id.clone();
                 async move |cx| {
                     let task = cx.update(|cx| -> Result<_> {
                         let connection = NativeAgentConnection(
@@ -2688,7 +2813,10 @@ impl NativeAgentConnection {
                     let model_started = !thread.read_with(cx, |thread, _cx| thread.is_turn_complete());
                     // Tools may ignore cancellation. Their native cleanup must not
                     // delay the bridge's Stop event or the next accepted prompt.
-                    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+                    thread.update(cx, |thread, cx| match cancellation {
+                        NativeCancellation::InterruptedByFollowUp => thread.cancel_turn(cx),
+                        NativeCancellation::Cancelled => thread.cancel(cx),
+                    }).detach();
                     if model_started {
                         // Drain cancellation updates (including compaction terminalization)
                         // before publishing Idle or allowing another submission to insert.
@@ -2712,9 +2840,12 @@ impl NativeAgentConnection {
             };
             if result.is_err() {
                 acp_thread.update(cx, |thread, cx| {
-                    thread.cancel_local_actions(acp_thread::RequestPermissionOutcome::Cancelled, cx);
+                    thread.cancel_local_actions(
+                        acp_thread::RequestPermissionOutcome::InterruptedByFollowUp,
+                        cx,
+                    );
                 }).log_err();
-                thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+                thread.update(cx, |thread, cx| thread.cancel_turn(cx)).detach();
             }
             let result = match result {
                 Ok(reason) => acp_thread
@@ -2750,8 +2881,16 @@ impl NativeAgentConnection {
                     Err(error)
                 }
             };
+            let should_check_subagents = matches!(result, Ok(acp_v2::StopReason::EndTurn));
             if completion.send(result).is_err() {
                 log::debug!("Native completion observer was dropped");
+            }
+            if should_check_subagents {
+                agent
+                    .update(cx, |agent, cx| {
+                        agent.schedule_subagent_result_delivery(session_id, cx);
+                    })
+                    .ok();
             }
         })
     }
@@ -2786,6 +2925,8 @@ impl NativeAgentConnection {
         cx: &App,
     ) -> Task<Result<acp_v2::StopReason>> {
         cx.spawn(async move |cx| {
+            let mut assistant_message_id: SharedString =
+                uuid::Uuid::new_v4().to_string().into();
             // Handle response stream and forward to session.acp_thread
             while let Some(result) = events.next().await {
                 match result {
@@ -2801,14 +2942,30 @@ impl NativeAgentConnection {
                                     thread.upsert_local_user_message(message.id, content, cx)
                                 })??;
                             }
+                            ThreadEvent::SubagentResultBoundary => {
+                                assistant_message_id =
+                                    uuid::Uuid::new_v4().to_string().into();
+                            }
                             ThreadEvent::AgentText(text) => {
+                                let message_id = assistant_message_id.clone();
                                 acp_thread.update(cx, |thread, cx| {
-                                    thread.push_assistant_content_block(text.into(), false, cx)
+                                    thread.push_keyed_assistant_content_block(
+                                        message_id,
+                                        text.into(),
+                                        false,
+                                        cx,
+                                    )
                                 })?;
                             }
                             ThreadEvent::AgentThinking(text) => {
+                                let message_id = assistant_message_id.clone();
                                 acp_thread.update(cx, |thread, cx| {
-                                    thread.push_assistant_content_block(text.into(), true, cx)
+                                    thread.push_keyed_assistant_content_block(
+                                        message_id,
+                                        text.into(),
+                                        true,
+                                        cx,
+                                    )
                                 })?;
                             }
                             ThreadEvent::ToolCallAuthorization(ToolCallAuthorization {
@@ -3372,8 +3529,16 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
         log::info!("Cancelling on session: {}", session_id);
+        self.0.update(cx, |agent, cx| {
+            agent.cancel_session_and_subagents(session_id, cx);
+        });
+        Ok(())
+    }
+
+    fn interrupt_for_follow_up(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
+        log::info!("Interrupting session for follow-up: {}", session_id);
         self.0.update(cx, |agent, _cx| {
-            agent.cancel_session(session_id);
+            agent.interrupt_session_for_follow_up(session_id);
         });
         Ok(())
     }
@@ -3461,6 +3626,18 @@ impl NativeAgentConnection {
             Some(NativeRetryAction::Compact) => self.0.update(cx, |agent, cx| {
                 agent.send_compact_command(message_id, session_id, cx)
             }),
+            Some(NativeRetryAction::SubagentContinuation) => {
+                self.run_turn(session_id, cx, |thread, cx| {
+                    thread.update(cx, |thread, cx| {
+                        thread
+                            .deliver_pending_subagent_results(cx)
+                            .unwrap_or_else(|| {
+                                let (_tx, rx) = mpsc::unbounded();
+                                Ok(rx)
+                            })
+                    })
+                })
+            }
             None => self.run_turn(session_id, cx, |thread, cx| {
                 thread.update(cx, |thread, cx| thread.resume(cx))
             }),
@@ -3750,6 +3927,14 @@ impl NativeThreadEnvironment {
             anyhow::Ok((session.thread.clone(), acp_thread))
         })??;
 
+        if acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle
+            || subagent_thread.read(cx).is_active_subagent_run()
+        {
+            anyhow::bail!(
+                "Subagent session {session_id} is still running; use follow_up_subagent to steer it"
+            );
+        }
+
         let depth = subagent_thread.read(cx).depth();
 
         if let Some(parent_thread_entity) = self.thread.upgrade() {
@@ -3779,6 +3964,8 @@ impl NativeThreadEnvironment {
             subagent_thread,
             acp_thread,
             parent_thread_entity,
+            self.acp_thread.clone(),
+            self.agent.clone(),
         )) as _)
     }
 }
@@ -3905,6 +4092,93 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         self.resume_subagent_thread(session_id, cx)
     }
 
+    fn follow_up_subagent(
+        &self,
+        session_id: acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        cx: &mut App,
+    ) -> Result<crate::SubagentFollowUp> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            anyhow::bail!("Parent thread no longer exists");
+        };
+        let parent_session_id = parent_thread_entity.read(cx).id().clone();
+
+        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
+            let session = agent
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
+            let acp_thread = session
+                .acp_thread
+                .upgrade()
+                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
+            anyhow::Ok((session.thread.clone(), acp_thread))
+        })??;
+
+        if subagent_thread.read(cx).parent_thread_id().as_ref() != Some(&parent_session_id) {
+            anyhow::bail!("Session {session_id} is not a subagent of this thread");
+        }
+
+        let is_running = subagent_thread.read(cx).is_active_subagent_run()
+            || acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle;
+        if is_running {
+            let entry_count = acp_thread.read(cx).entries().len();
+            let pending_steers = subagent_thread.update(cx, |thread, cx| {
+                thread.enqueue_subagent_steer(message, interrupt, cx)
+            });
+            if interrupt {
+                self.agent.update(cx, |agent, _cx| {
+                    agent.interrupt_session_for_follow_up(&session_id);
+                })?;
+            }
+            return Ok(crate::SubagentFollowUp::Steered {
+                session_info: acp_thread::SubagentSessionInfo {
+                    session_id,
+                    message_start_index: entry_count,
+                    message_end_index: None,
+                },
+                pending_steers,
+            });
+        }
+
+        self.resume_subagent_thread(session_id, cx)
+            .map(crate::SubagentFollowUp::Resumed)
+    }
+
+    fn query_subagents(
+        &self,
+        input: crate::QuerySubagentToolInput,
+        cx: &mut App,
+    ) -> Result<crate::QuerySubagentToolOutput> {
+        let parent_thread = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?;
+        let parent_acp_thread = self
+            .acp_thread
+            .upgrade()
+            .context("Parent ACP thread no longer exists")?;
+        let project = parent_thread.read(cx).project().clone();
+
+        let child_acp_threads: Vec<Entity<AcpThread>> =
+            parent_acp_thread.read(cx).subagents().cloned().collect();
+        let subagents: Vec<(Option<Entity<Thread>>, Entity<AcpThread>)> =
+            self.agent.read_with(cx, |agent, cx| {
+                child_acp_threads
+                    .into_iter()
+                    .map(|acp_thread| {
+                        let session_id = acp_thread.read(cx).session_id();
+                        let native_thread =
+                            agent.sessions.get(session_id).map(|s| s.thread.clone());
+                        (native_thread, acp_thread)
+                    })
+                    .collect()
+            })?;
+
+        crate::evaluate_subagent_query(&subagents, &project, input, cx)
+    }
+
     fn create_sibling_thread(
         &self,
         request: SiblingThreadRequest,
@@ -3943,6 +4217,8 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 pub struct NativeSubagentHandle {
     session_id: acp_v2::SessionId,
     parent_thread: WeakEntity<Thread>,
+    parent_acp_thread: WeakEntity<acp_thread::AcpThread>,
+    agent: WeakEntity<NativeAgent>,
     subagent_thread: Entity<Thread>,
     acp_thread: Entity<acp_thread::AcpThread>,
 }
@@ -3953,11 +4229,15 @@ impl NativeSubagentHandle {
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<acp_thread::AcpThread>,
         parent_thread_entity: Entity<Thread>,
+        parent_acp_thread: WeakEntity<acp_thread::AcpThread>,
+        agent: WeakEntity<NativeAgent>,
     ) -> Self {
         NativeSubagentHandle {
             session_id,
             subagent_thread,
             parent_thread: parent_thread_entity.downgrade(),
+            parent_acp_thread,
+            agent,
             acp_thread,
         }
     }
@@ -3972,66 +4252,103 @@ impl SubagentHandle for NativeSubagentHandle {
         self.acp_thread.read(cx).entries().len()
     }
 
-    fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
+    fn mark_started(&self, cx: &mut App) {
+        self.subagent_thread
+            .update(cx, |thread, _| thread.set_active_subagent_run(true));
+    }
+
+    fn send(&self, message: String, cx: &AsyncApp) -> Task<crate::SubagentSendResult> {
         let thread = self.subagent_thread.clone();
         let acp_thread = self.acp_thread.clone();
         let subagent_session_id = self.session_id.clone();
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
-            let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+            cx.update(|cx| {
+                thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
                     })
                     .ok();
-
-                let ratio_before_prompt = thread
-                    .read(cx)
-                    .latest_token_usage()
-                    .map_or(TokenUsageRatio::Normal, |usage| usage.ratio());
-                let (token_limit_tx, token_limit_rx) = oneshot::channel();
-                let mut token_limit_tx = Some(token_limit_tx);
-                let subscription = cx.subscribe(
-                    &thread,
-                    move |thread, event: &TokenUsageUpdated, cx| {
-                        if !thread.read(cx).auto_compaction_enabled(cx)
-                            && event.0.as_ref().is_some_and(|usage| usage.ratio() > ratio_before_prompt)
-                            && let Some(sender) = token_limit_tx.take()
-                        {
-                            sender.send(()).ok();
-                        }
-                    },
-                );
-                let task = match acp_thread.read(cx).connection().clone().into_any()
-                    .downcast::<NativeAgentConnection>()
-                {
-                    Ok(connection) => connection.send_and_wait_for_completion(
-                        acp_thread.clone(), vec![message.into()], cx,
-                    ),
-                    Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
-                };
-                (task, token_limit_rx, subscription)
             });
 
-            let mut task = task.fuse();
-            let response = futures::select_biased! {
-                response = task => response,
-                _ = token_limit_rx.fuse() => {
-                    if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
-                        task.await
-                    } else {
-                        thread.update(cx, |thread, cx| thread.request_cancel(cx)).await;
-                        // Let the run report its own idle state first, so this run's outcome
-                        // reported below comes after it.
-                        task.await.log_err();
-                        Err(anyhow!(
-                            "The agent is nearing the end of its context window and has been \
-                             stopped. You can prompt the thread again to have the agent wrap up \
-                             or hand off its work."
-                        ))
+            let mut current_message = message;
+            let response = loop {
+                let prompt_message = current_message;
+                let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+                    let ratio_before_prompt = thread
+                        .read(cx)
+                        .latest_token_usage()
+                        .map_or(TokenUsageRatio::Normal, |usage| usage.ratio());
+                    let (token_limit_tx, token_limit_rx) = oneshot::channel();
+                    let mut token_limit_tx = Some(token_limit_tx);
+                    let subscription = cx.subscribe(
+                        &thread,
+                        move |thread, event: &TokenUsageUpdated, cx| {
+                            if !thread.read(cx).auto_compaction_enabled(cx)
+                                && event
+                                    .0
+                                    .as_ref()
+                                    .is_some_and(|usage| usage.ratio() > ratio_before_prompt)
+                                && let Some(sender) = token_limit_tx.take()
+                            {
+                                sender.send(()).ok();
+                            }
+                        },
+                    );
+                    let task = match acp_thread
+                        .read(cx)
+                        .connection()
+                        .clone()
+                        .into_any()
+                        .downcast::<NativeAgentConnection>()
+                    {
+                        Ok(connection) => connection.send_and_wait_for_completion(
+                            acp_thread.clone(),
+                            vec![prompt_message.into()],
+                            cx,
+                        ),
+                        Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
+                    };
+                    (task, token_limit_rx, subscription)
+                });
+
+                let mut task = task.fuse();
+                let turn_response = futures::select_biased! {
+                    response = task => response,
+                    _ = token_limit_rx.fuse() => {
+                        if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
+                            task.await
+                        } else {
+                            thread.update(cx, |thread, cx| thread.request_cancel(cx)).await;
+                            // Let the run report its own idle state first, so this run's outcome
+                            // reported below comes after it.
+                            task.await.log_err();
+                            Err(anyhow!(
+                                "The agent is nearing the end of its context window and has been \
+                                 stopped. You can prompt the thread again to have the agent wrap up \
+                                 or hand off its work."
+                            ))
+                        }
+                    }
+                };
+
+                let queued_steer = cx.update(|cx| {
+                    thread.update(cx, |thread, _| thread.take_queued_subagent_steer())
+                });
+                if let Some((steered_message, was_interrupted)) = queued_steer {
+                    let can_continue_into_steer = match &turn_response {
+                        Ok(acp_v2::StopReason::EndTurn) => true,
+                        Ok(acp_v2::StopReason::Cancelled) if was_interrupted => true,
+                        _ => false,
+                    };
+                    if can_continue_into_steer {
+                        current_message = steered_message;
+                        continue;
                     }
                 }
+                break turn_response;
             };
             let discard_partial_output = matches!(
                 &response,
@@ -4073,11 +4390,14 @@ impl SubagentHandle for NativeSubagentHandle {
                 Err(error) => Err(error),
             };
 
-            parent_thread
-                .update(cx, |parent_thread, cx| {
-                    parent_thread.unregister_running_subagent(&subagent_session_id, cx)
-                })
-                .ok();
+            cx.update(|cx| {
+                thread.update(cx, |thread, _| thread.set_active_subagent_run(false));
+                parent_thread
+                    .update(cx, |parent_thread, cx| {
+                        parent_thread.unregister_running_subagent(&subagent_session_id, cx)
+                    })
+                    .ok();
+            });
 
             let result = if discard_partial_output {
                 result
@@ -4092,6 +4412,8 @@ impl SubagentHandle for NativeSubagentHandle {
                 })
             };
 
+            let was_cancelled =
+                matches!(response_stop_reason, Some(acp_v2::StopReason::Cancelled));
             // The run's own idle state only says how the model stopped. Report the verdict
             // the parent's tool call gets, so the subagent's cards agree with it.
             let stop_reason = match (&result, response_stop_reason) {
@@ -4136,8 +4458,119 @@ impl SubagentHandle for NativeSubagentHandle {
             })
             .log_err();
 
-            result
+            match result {
+                Ok(output) => crate::SubagentSendResult::Completed(output),
+                Err(_) if was_cancelled => crate::SubagentSendResult::Canceled,
+                Err(error) => crate::SubagentSendResult::Error(error.to_string()),
+            }
         })
+    }
+
+    fn complete(
+        &self,
+        label: SharedString,
+        tool_use_id: language_model::LanguageModelToolUseId,
+        tool_call_id: acp_v2::ToolCallId,
+        session_info: acp_thread::SubagentSessionInfo,
+        result: crate::SubagentSendResult,
+        cx: &mut App,
+    ) {
+        let meta = acp_v2::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::json!(&session_info),
+        )]);
+        let (tool_output, status, content, result_status, result_text) = match result {
+            crate::SubagentSendResult::Completed(output) => (
+                crate::SpawnAgentToolOutput::Success {
+                    session_id: session_info.session_id.clone(),
+                    output: output.clone(),
+                    session_info,
+                },
+                acp_v2::ToolCallStatus::Completed,
+                Some(output.clone()),
+                crate::SubagentResultStatus::Completed,
+                output,
+            ),
+            crate::SubagentSendResult::Error(error) => (
+                crate::SpawnAgentToolOutput::Error {
+                    session_id: Some(session_info.session_id.clone()),
+                    error: error.clone(),
+                    session_info: Some(session_info),
+                },
+                acp_v2::ToolCallStatus::Failed,
+                Some(error.clone()),
+                crate::SubagentResultStatus::Error,
+                error,
+            ),
+            crate::SubagentSendResult::Canceled => (
+                crate::SpawnAgentToolOutput::Canceled {
+                    session_id: session_info.session_id.clone(),
+                    canceled: true,
+                    session_info,
+                },
+                acp_v2::ToolCallStatus::Cancelled,
+                None,
+                crate::SubagentResultStatus::Canceled,
+                "Subagent was canceled by the user.".to_string(),
+            ),
+        };
+        let raw_output = serde_json::to_value(&tool_output).unwrap_or(serde_json::Value::Null);
+        let completed_tool_call = crate::CompletedBackgroundToolCall {
+            status: status.clone(),
+            raw_output: raw_output.clone(),
+            content: content.clone(),
+            meta: Some(meta.clone()),
+        };
+        let subagent_result = crate::SubagentResultMessage {
+            session_id: self.session_id.clone(),
+            label,
+            status: result_status,
+            output: result_text,
+        };
+
+        let mut parent_session_id = None;
+        let mut updated_stored_result = false;
+        if let Ok(updated) = self.parent_thread.update(cx, |parent_thread, cx| {
+            parent_session_id = Some(parent_thread.id().clone());
+            parent_thread.record_background_subagent_completion(
+                tool_use_id,
+                completed_tool_call,
+                subagent_result,
+                cx,
+            )
+        }) {
+            updated_stored_result = updated;
+        }
+
+        if updated_stored_result {
+            self.parent_acp_thread
+                .update(cx, |acp_thread, cx| {
+                    if !acp_thread.has_tool_call(&tool_call_id) {
+                        return;
+                    }
+                    let mut update = acp_v2::ToolCallUpdate::new(tool_call_id)
+                        .status(status.clone())
+                        .meta(meta);
+                    if status != acp_v2::ToolCallStatus::Cancelled {
+                        update = update.raw_output(raw_output);
+                    }
+                    if let Some(content) = content {
+                        update = update.content(vec![content.into()]);
+                    }
+                    acp_thread.update_tool_call(update, cx).log_err();
+                })
+                .ok();
+        }
+
+        if result_status != crate::SubagentResultStatus::Canceled
+            && let Some(parent_session_id) = parent_session_id
+        {
+            self.agent
+                .update(cx, |agent, cx| {
+                    agent.schedule_subagent_result_delivery(parent_session_id, cx);
+                })
+                .ok();
+        }
     }
 }
 

@@ -1956,7 +1956,13 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
-        if !is_subagent && affects_thread_metadata(event) {
+        if (!is_subagent && affects_thread_metadata(event))
+            || (is_subagent
+                && matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged | AcpThreadEvent::Stopped { .. }
+                ))
+        {
             cx.emit(RootThreadUpdated);
         }
         match event {

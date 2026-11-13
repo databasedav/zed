@@ -8146,7 +8146,13 @@ fn all_thread_infos_for_workspace(
                 match thread.status() {
                     ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
                     ThreadStatus::Generating => AgentThreadStatus::Running,
-                    ThreadStatus::Idle => AgentThreadStatus::Completed,
+                    ThreadStatus::Idle => {
+                        if thread.has_running_subagents(cx) {
+                            AgentThreadStatus::Running
+                        } else {
+                            AgentThreadStatus::Completed
+                        }
+                    }
                 }
             };
 

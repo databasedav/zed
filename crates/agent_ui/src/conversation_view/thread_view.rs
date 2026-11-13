@@ -2588,7 +2588,7 @@ impl ThreadView {
         let thread = self.thread.clone();
         self.message_queue.pause();
 
-        let cancelled = thread.update(cx, |thread, cx| thread.cancel(cx));
+        let cancelled = thread.update(cx, |thread, cx| thread.interrupt_for_follow_up(cx));
 
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = cancelled.await {
@@ -3155,7 +3155,9 @@ impl ThreadView {
             })
             .is_some();
 
-        let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
+        let cancelled = self
+            .thread
+            .update(cx, |thread, cx| thread.interrupt_for_follow_up(cx));
 
         let workspace = self.workspace.clone();
 

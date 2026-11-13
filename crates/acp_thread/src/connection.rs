@@ -260,6 +260,12 @@ pub trait AgentConnection {
     /// Requests cancellation; success does not establish that execution stopped.
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()>;
 
+    /// Interrupts the active foreground turn for a follow-up prompt without
+    /// canceling background work such as subagents.
+    fn interrupt_for_follow_up(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
+        self.cancel(session_id, cx)
+    }
+
     /// Asks the agent to stop one tool call. Success means the agent accepted the request;
     /// the tool call's own updates report when it stops.
     fn cancel_tool_call(
