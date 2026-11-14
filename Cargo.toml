@@ -227,6 +227,7 @@ members = [
     "crates/time_format",
     "crates/title_bar",
     "crates/toolchain_selector",
+    "crates/typst_render",
     "crates/ui",
     "crates/ui_input",
     "crates/ui_macros",
@@ -501,6 +502,7 @@ theme_settings = { path = "crates/theme_settings" }
 time_format = { path = "crates/time_format" }
 title_bar = { path = "crates/title_bar" }
 toolchain_selector = { path = "crates/toolchain_selector" }
+typst_render = { path = "crates/typst_render" }
 ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
@@ -635,6 +637,7 @@ exec = "0.3.1"
 fancy-regex = "0.19"
 flume = { version = "0.12", default-features = false, features = ["async"] }
 font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", default-features = false }
+fontdb = "0.23.0"
 foreign-types = "0.5"
 fork = "0.4.0"
 futures = "0.3.34"
@@ -700,6 +703,7 @@ mdbook = { version = "=0.4.40", default-features = false, features = ["search"] 
 merman = { version = "=0.9.3", default-features = false }
 mime = "0.3.17"
 minidumper = "0.11"
+mitex = "0.2.4"
 moka = { version = "0.12.10", features = ["sync"] }
 nanoid = "0.4"
 nbformat = "3.0.0"
@@ -967,6 +971,10 @@ tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = { git = "https://github.com/zed-industries/tree-sitter-typescript", rev = "e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899" } # https://github.com/tree-sitter/tree-sitter-typescript/pull/347
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
+typst = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+typst-layout = "0.15.1"
+typst-syntax = "0.15.1"
 unicase = "2.6"
 unicode-bidi = { version = "0.3.18", default-features = false, features = [
     "hardcoded-data",
@@ -1099,6 +1107,7 @@ settings_macros = { opt-level = 3 }
 sqlez_macros = { opt-level = 3, codegen-units = 1 }
 ui_macros = { opt-level = 3 }
 util_macros = { opt-level = 3 }
+typst-macros = { opt-level = 3 }
 quote = { opt-level = 3 }
 syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }

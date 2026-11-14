@@ -398,6 +398,7 @@ impl MarkdownPreviewView {
                         render_mermaid_diagrams: true,
                         parse_heading_slugs: true,
                         render_metadata_blocks: true,
+                        render_typst: true,
                         ..Default::default()
                     },
                     cx,
@@ -482,12 +483,23 @@ impl MarkdownPreviewView {
     }
 
     pub fn is_markdown_path(path: impl AsRef<Path>, languages: &Arc<LanguageRegistry>) -> bool {
+        let path = path.as_ref();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
+        {
+            return true;
+        }
         languages
-            .language_for_file_path(path.as_ref())
+            .language_for_file_path(path)
             .is_some_and(|language_id| {
                 languages
                     .available_language_for_name("Markdown")
                     .is_some_and(|markdown| markdown.id() == language_id)
+                    || languages
+                        .available_language_for_name("Typst")
+                        .is_some_and(|typst| typst.id() == language_id)
             })
     }
 
@@ -524,12 +536,32 @@ impl MarkdownPreviewView {
 
     pub fn is_markdown_file(editor: &Entity<Editor>, cx: &App) -> bool {
         let buffer = editor.read(cx).buffer().read(cx);
-        if let Some(buffer) = buffer.as_singleton()
-            && let Some(language) = buffer.read(cx).language()
-        {
-            return language.name() == "Markdown";
+        if let Some(buffer) = buffer.as_singleton() {
+            let buffer = buffer.read(cx);
+            if let Some(language) = buffer.language() {
+                return matches!(language.name().as_ref(), "Markdown" | "Typst");
+            }
+            if let Some(file) = buffer.file() {
+                return file
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"));
+            }
         }
         false
+    }
+
+    fn is_typst_buffer(buffer: &language::Buffer) -> bool {
+        if let Some(language) = buffer.language()
+            && language.name() == "Typst"
+        {
+            return true;
+        }
+        buffer.file().is_some_and(|file| {
+            file.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
+        })
     }
 
     fn is_markdown_editor(workspace: &Workspace, editor: &Entity<Editor>, cx: &App) -> bool {
@@ -538,16 +570,27 @@ impl MarkdownPreviewView {
         };
         let buffer = buffer.read(cx);
         if let Some(language) = buffer.language() {
-            return language.name() == "Markdown";
+            return matches!(language.name().as_ref(), "Markdown" | "Typst");
         }
         let Some(file) = buffer.file() else {
             return false;
         };
+        if file
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
+        {
+            return true;
+        }
         let languages = workspace.project().read(cx).languages().clone();
-        let Some(markdown) = languages.available_language_for_name("Markdown") else {
-            return false;
-        };
-        languages.language_for_file(file, None, cx) == Some(markdown.id())
+        let file_language = languages.language_for_file(file, None, cx);
+        let is_markdown = languages
+            .available_language_for_name("Markdown")
+            .is_some_and(|markdown| file_language == Some(markdown.id()));
+        let is_typst = languages
+            .available_language_for_name("Typst")
+            .is_some_and(|typst| file_language == Some(typst.id()));
+        is_markdown || is_typst
     }
 
     fn set_editor(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
@@ -691,23 +734,19 @@ impl MarkdownPreviewView {
                 }
 
                 editor.update(cx, |editor, cx| {
-                    let contents = editor
-                        .buffer()
-                        .read(cx)
-                        .as_singleton()?
-                        .read(cx)
-                        .as_rope()
-                        .to_string()
-                        .into();
+                    let buffer = editor.buffer().read(cx).as_singleton()?.read(cx);
+                    let is_typst = Self::is_typst_buffer(buffer);
+                    let contents = buffer.as_rope().to_string().into();
                     let selection_start = Self::selected_source_index(editor, cx)?;
-                    Some((contents, selection_start))
+                    Some((contents, selection_start, is_typst))
                 })
             })?;
 
             view.update(cx, move |view, cx| {
-                if let Some((contents, selection_start)) = update {
+                if let Some((contents, selection_start, is_typst)) = update {
                     view.hovered_url = None;
                     view.markdown.update(cx, |markdown, cx| {
+                        markdown.set_prefer_typst_markup(is_typst, cx);
                         markdown.reset(contents, cx);
                     });
                     view.markdown_parse_pending = view.markdown.read(cx).is_parsing();

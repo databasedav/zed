@@ -2126,6 +2126,39 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
 pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     MigrationNotification::set_global(cx.new(|_| MigrationNotification), cx);
 
+    let typst_config_path = paths::config_dir().join("typst.typ");
+    markdown::set_user_typst_preamble(std::fs::read_to_string(&typst_config_path).ok());
+    cx.spawn({
+        let fs = fs.clone();
+        async move |cx| {
+            let watched_dir = typst_config_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| typst_config_path.clone());
+            let initial = fs.load(&typst_config_path).await.ok();
+            if markdown::set_user_typst_preamble(initial) {
+                cx.update(|cx| cx.refresh_windows());
+            }
+            let (events, _watcher) = fs
+                .watch(&watched_dir, std::time::Duration::from_millis(100))
+                .await;
+            futures::pin_mut!(events);
+            while let Some(batch) = events.next().await {
+                let touched = batch.iter().any(|event| {
+                    event.path == typst_config_path
+                        || event.path.file_name() == typst_config_path.file_name()
+                });
+                if touched {
+                    let updated = fs.load(&typst_config_path).await.ok();
+                    if markdown::set_user_typst_preamble(updated) {
+                        cx.update(|cx| cx.refresh_windows());
+                    }
+                }
+            }
+        }
+    })
+    .detach();
+
     SettingsStore::update_global(cx, move |store, cx| {
         store.watch_settings_files(fs, cx, |settings_file, result, cx| {
             let is_user = matches!(settings_file, SettingsFile::User);
@@ -4501,7 +4534,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
             assert_eq!(
                 workspace
@@ -4553,7 +4586,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt"), path!("/dir3")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
             assert_eq!(
                 workspace
@@ -4605,7 +4638,7 @@ mod tests {
                 ]
                 .into_iter()
                 .map(Path::new)
-                .collect(),
+                .collect::<HashSet<_>>(),
             );
 
             let visible_worktree_roots = workspace
@@ -4617,7 +4650,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt"), path!("/dir3")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
 
             assert_eq!(

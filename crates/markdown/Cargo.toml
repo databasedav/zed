@@ -36,6 +36,7 @@ stacksafe.workspace = true
 sum_tree.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+typst_render.workspace = true
 ui.workspace = true
 util.workspace = true
 

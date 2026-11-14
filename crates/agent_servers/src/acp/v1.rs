@@ -502,6 +502,8 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("terminal-auth".into(), true.into()),
     ]);
 
+    meta.insert("zed_markup_format".into(), "typst".into());
+
     if agent_id.as_ref() == CURSOR_ID {
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
     }
@@ -5748,6 +5750,10 @@ mod tests {
         );
         assert_eq!(meta.get("terminal_output"), Some(&serde_json::json!(true)));
         assert_eq!(meta.get("terminal-auth"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            meta.get("zed_markup_format"),
+            Some(&serde_json::json!("typst"))
+        );
     }
 
     #[test]

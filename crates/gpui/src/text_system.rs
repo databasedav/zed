@@ -231,6 +231,7 @@ impl Drop for MissingGlyphReceiver {
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, CachedFont>>,
+    registered_font_faces: RwLock<FxHashMap<(u64, u32), FontId>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<CharWidthCache>>>,
@@ -257,6 +258,7 @@ impl TextSystem {
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
+            registered_font_faces: RwLock::default(),
             wrapper_pool: Mutex::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
@@ -304,6 +306,29 @@ impl TextSystem {
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// Registers an exact font face by `(cache_key, face_index)` and returns its [`FontId`],
+    /// memoizing repeated lookups across frames without invoking `load_font` on cache hits.
+    pub fn register_font_face(
+        &self,
+        cache_key: u64,
+        face_index: u32,
+        load_font: impl FnOnce() -> (Cow<'static, [u8]>, Font),
+    ) -> Result<FontId> {
+        let key = (cache_key, face_index);
+        if let Some(&font_id) = self.registered_font_faces.read().get(&key) {
+            return Ok(font_id);
+        }
+
+        let (font_data, fallback_descriptor) = load_font();
+        let font_id = self.platform_text_system.register_font_face(
+            font_data,
+            face_index,
+            &fallback_descriptor,
+        )?;
+        self.registered_font_faces.write().insert(key, font_id);
+        Ok(font_id)
     }
 
     /// Takes the receiver for missing-glyph reports.

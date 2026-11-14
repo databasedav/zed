@@ -1,0 +1,38 @@
+[package]
+name = "typst_render"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/typst_render.rs"
+doctest = false
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+fontdb.workspace = true
+gpui.workspace = true
+image.workspace = true
+log.workspace = true
+mitex.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+typst.workspace = true
+typst-assets.workspace = true
+typst-layout.workspace = true
+typst-syntax.workspace = true
+usvg.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+typst_render = { workspace = true, features = ["test-support"] }

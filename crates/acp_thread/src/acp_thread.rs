@@ -1587,7 +1587,16 @@ impl ToolCall {
             if title.is_none() || kind == &acp_v2::ToolKind::Execute {
                 Markdown::new_text(text, cx)
             } else {
-                Markdown::new(text, Some(language_registry), None, cx)
+                Markdown::new_with_options(
+                    text,
+                    Some(language_registry),
+                    None,
+                    MarkdownOptions {
+                        render_typst: true,
+                        ..Default::default()
+                    },
+                    cx,
+                )
             }
         })
     }
@@ -2756,7 +2765,7 @@ impl ContentBlock {
             }
             acp_v2::ContentBlock::ResourceLink(_) => RenderBlock::ResourceLink,
             acp_v2::ContentBlock::Text(text) => RenderBlock::Markdown {
-                markdown: Self::create_markdown(text.text.clone(), language_registry, cx),
+                markdown: Self::create_tool_markdown(text.text.clone(), language_registry, cx),
             },
             acp_v2::ContentBlock::Other(_) => Self::unsupported(block, language_registry, cx),
             _ => Self::unsupported(block, language_registry, cx),
@@ -2890,6 +2899,30 @@ impl ContentBlock {
                 MarkdownOptions {
                     render_mermaid_diagrams: true,
                     render_metadata_blocks: true,
+                    render_typst: true,
+                    prefer_typst_markup: true,
+                    defer_parsing: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+    }
+
+    fn create_tool_markdown(
+        content: String,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Entity<Markdown> {
+        cx.new(|cx| {
+            Markdown::new_with_options(
+                content.into(),
+                Some(language_registry.clone()),
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    render_metadata_blocks: true,
+                    render_typst: true,
                     defer_parsing: true,
                     ..Default::default()
                 },
@@ -3602,7 +3635,21 @@ impl Plan {
             }
             (_, PlanContentUpdate::Markdown { content, path }) => {
                 self.content = PlanContent::Markdown {
-                    markdown: cx.new(|cx| Markdown::new(content.into(), None, None, cx)),
+                    markdown: cx.new(|cx| {
+                        Markdown::new_with_options(
+                            content.into(),
+                            None,
+                            None,
+                            MarkdownOptions {
+                                render_mermaid_diagrams: true,
+                                render_metadata_blocks: true,
+                                render_typst: true,
+                                prefer_typst_markup: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    }),
                     path,
                 };
                 true
@@ -3647,7 +3694,19 @@ pub struct PlanEntry {
 impl PlanEntry {
     fn new(source: acp_v2::PlanEntry, cx: &mut App) -> Self {
         Self {
-            content: cx.new(|cx| Markdown::new(source.content.clone().into(), None, None, cx)),
+            content: cx.new(|cx| {
+                Markdown::new_with_options(
+                    source.content.clone().into(),
+                    None,
+                    None,
+                    MarkdownOptions {
+                        render_typst: true,
+                        prefer_typst_markup: true,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            }),
             source,
         }
     }
@@ -26336,5 +26395,90 @@ mod tests {
             .expect("backend should still be running");
         request.await.expect("turn should complete");
         assert_eq!(cx.active_idle_sleep_preventions(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_assistant_output_renders_native_typst_while_tool_output_stays_markdown(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::ParentElement as _;
+
+        init_test(cx);
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let language_registry = Arc::new(LanguageRegistry::test(cx.background_executor.clone()));
+
+        let (assistant_markdown, tool_markdown) = cx.update(|cx| {
+            let assistant_block = ContentBlock::new_output(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "= Agent Summary\n\nFlow: $ -> \"Mind LLM\" -> $",
+                )),
+                &language_registry,
+                cx,
+            );
+            let tool_block = ContentBlock::new_tool_content(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "raw_tool_identifier_with_underscores and $a \\rightarrow b$",
+                )),
+                &language_registry,
+                cx,
+            );
+            (
+                assistant_block
+                    .markdown()
+                    .expect("assistant markdown")
+                    .clone(),
+                tool_block.markdown().expect("tool markdown").clone(),
+            )
+        });
+
+        let window_cx = cx.add_empty_window();
+        window_cx.draw(
+            gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            gpui::size(gpui::px(640.0), gpui::px(400.0)),
+            |_, _| {
+                gpui::div()
+                    .child(markdown::MarkdownElement::new(
+                        assistant_markdown.clone(),
+                        markdown::MarkdownStyle::default(),
+                    ))
+                    .child(markdown::MarkdownElement::new(
+                        tool_markdown.clone(),
+                        markdown::MarkdownStyle::default(),
+                    ))
+            },
+        );
+        cx.run_until_parked();
+
+        assistant_markdown.read_with(cx, |markdown, _| {
+            assert!(
+                markdown
+                    .parsed_markdown()
+                    .events
+                    .iter()
+                    .any(|(_, event)| matches!(
+                        event,
+                        markdown::parser::MarkdownEvent::TypstSegment(_)
+                    )),
+                "assistant output should parse through native Typst segment pipeline"
+            );
+        });
+
+        tool_markdown.read_with(cx, |markdown, _| {
+            let events = &markdown.parsed_markdown().events;
+            assert!(
+                !events.iter().any(|(_, event)| matches!(
+                    event,
+                    markdown::parser::MarkdownEvent::TypstSegment(_)
+                )),
+                "raw tool text should not interpret prose as Typst markup"
+            );
+            assert!(
+                events.iter().any(|(_, event)| matches!(
+                    event,
+                    markdown::parser::MarkdownEvent::TypstMath { .. }
+                )),
+                "tool markdown should still render inline math formulas via Typst"
+            );
+        });
     }
 }

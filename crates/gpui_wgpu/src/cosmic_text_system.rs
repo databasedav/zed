@@ -64,6 +64,7 @@ struct CosmicTextSystemState {
 struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
+    variations: SmallVec<[swash::Setting<f32>; 1]>,
     is_known_emoji_font: bool,
     /// resolved at load time so `layout_line` shares one chain across faces.
     /// `Arc` keeps clone cheap on the per-run hot path.
@@ -167,6 +168,20 @@ impl CosmicTextSystem {
 impl PlatformTextSystem for CosmicTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
+    }
+
+    fn register_font_face(
+        &self,
+        font_data: Cow<'static, [u8]>,
+        face_index: u32,
+        fallback_descriptor: &Font,
+    ) -> Result<FontId> {
+        self.0.write().register_font_face(
+            font_data,
+            face_index,
+            &fallback_descriptor.features,
+            fallback_descriptor.weight,
+        )
     }
 
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
@@ -335,6 +350,55 @@ impl CosmicTextSystemState {
         Ok(())
     }
 
+    fn register_font_face(
+        &mut self,
+        font_data: Cow<'static, [u8]>,
+        face_index: u32,
+        features: &FontFeatures,
+        weight: gpui::FontWeight,
+    ) -> Result<FontId> {
+        let face_ids = self
+            .font_system
+            .db_mut()
+            .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(font_data)));
+        let (database_id, postscript_name) = face_ids
+            .iter()
+            .find_map(|&id| {
+                let face = self.font_system.db().face(id)?;
+                (face.index == face_index).then(|| (id, face.post_script_name.clone()))
+            })
+            .or_else(|| {
+                let id = *face_ids.first()?;
+                let face = self.font_system.db().face(id)?;
+                Some((id, face.post_script_name.clone()))
+            })
+            .context("Could not find face in font data")?;
+
+        let requested_weight = cosmic_text::Weight(weight.0.clamp(100.0, 900.0).round() as u16);
+        let font = self
+            .font_system
+            .get_font(database_id, requested_weight)
+            .context("Could not load font face")?;
+        let mut variations = SmallVec::new();
+        let wght_tag = swash::tag_from_bytes(b"wght");
+        if font.as_swash().variations().find_by_tag(wght_tag).is_some() {
+            variations.push(swash::Setting {
+                tag: wght_tag,
+                value: weight.0.clamp(100.0, 900.0),
+            });
+        }
+        let cosmic_features = cosmic_font_features(features)?;
+        let font_id = FontId(self.loaded_fonts.len());
+        self.loaded_fonts.push(LoadedFont {
+            font,
+            features: cosmic_features,
+            variations,
+            is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+            user_fallback_chain: Arc::from(Vec::new()),
+        });
+        Ok(font_id)
+    }
+
     #[profiling::function]
     fn load_family(
         &mut self,
@@ -436,6 +500,7 @@ impl CosmicTextSystemState {
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: cosmic_features.clone(),
+                variations: SmallVec::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
@@ -527,6 +592,7 @@ impl CosmicTextSystemState {
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
             .hint(true)
+            .variations(loaded_font.variations.iter().copied())
             .build();
 
         let sources: &[Source] = if params.is_emoji {
@@ -585,6 +651,7 @@ impl CosmicTextSystemState {
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: CosmicFontFeatures::new(),
+                variations: SmallVec::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
                 user_fallback_chain: Arc::from(Vec::new()),
             });
