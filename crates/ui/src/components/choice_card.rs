@@ -18,6 +18,7 @@ pub struct ChoiceCard {
     id: ElementId,
     kind: ChoiceCardKind,
     label: SharedString,
+    label_size: LabelSize,
     description: Option<SharedString>,
     is_selected: bool,
     invalid: bool,
@@ -55,11 +56,18 @@ impl ChoiceCard {
             id: id.into(),
             kind,
             label: label.into(),
+            label_size: LabelSize::Default,
             description: None,
             is_selected,
             invalid: false,
             on_click: None,
         }
+    }
+
+    /// Sets the size of the primary choice label.
+    pub fn label_size(mut self, size: LabelSize) -> Self {
+        self.label_size = size;
+        self
     }
 
     /// Secondary text shown below the label and announced by assistive technology.
@@ -83,13 +91,18 @@ impl ChoiceCard {
         self
     }
 
-    fn render_radio_indicator(is_selected: bool, border_color: Hsla, background: Hsla) -> Div {
+    fn render_radio_indicator(
+        is_selected: bool,
+        border_color: Hsla,
+        background: Hsla,
+        slot_width: Pixels,
+        slot_height: Pixels,
+    ) -> Div {
         // Sharing the checkbox slot size keeps radio and checkbox labels aligned.
-        div()
-            .size(Checkbox::container_size())
+        h_flex()
+            .w(slot_width)
+            .h(slot_height)
             .flex_none()
-            .flex()
-            .items_center()
             .justify_center()
             .child(
                 div().size_3().flex_none().child(
@@ -135,7 +148,7 @@ impl ChoiceCard {
 }
 
 impl RenderOnce for ChoiceCard {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
         let border_color = if self.invalid {
             Color::Error.color(cx)
@@ -159,11 +172,31 @@ impl RenderOnce for ChoiceCard {
             )
         };
 
+        let label_font_size = match self.label_size {
+            LabelSize::Large => TextSize::Large.rems(cx),
+            LabelSize::Default => TextSize::Default.rems(cx),
+            LabelSize::Small => TextSize::Small.rems(cx),
+            LabelSize::XSmall => TextSize::XSmall.rems(cx),
+            LabelSize::Custom(size) => size,
+        };
+        let indicator_width =
+            Checkbox::container_size().max(rems_from_px(20_f32).to_pixels(window.rem_size()));
+        let first_line_height = window
+            .text_style()
+            .line_height
+            .to_pixels(label_font_size.into(), window.rem_size());
+
         let (role, indicator) = match self.kind {
             ChoiceCardKind::Radio => (
                 Role::RadioButton,
-                Self::render_radio_indicator(self.is_selected, border_color, editor_background)
-                    .into_any_element(),
+                Self::render_radio_indicator(
+                    self.is_selected,
+                    border_color,
+                    editor_background,
+                    indicator_width,
+                    first_line_height,
+                )
+                .into_any_element(),
             ),
             ChoiceCardKind::Checkbox => {
                 let checkbox_state = if self.is_selected {
@@ -173,7 +206,11 @@ impl RenderOnce for ChoiceCard {
                 };
                 (
                     Role::CheckBox,
-                    div()
+                    h_flex()
+                        .w(indicator_width)
+                        .h(first_line_height)
+                        .flex_none()
+                        .justify_center()
                         .child(Checkbox::new((self.id.clone(), "checkbox"), checkbox_state))
                         .into_any_element(),
                 )
@@ -213,7 +250,7 @@ impl RenderOnce for ChoiceCard {
                     .min_w_0()
                     .flex_1()
                     .gap_0p5()
-                    .child(Label::new(self.label).size(LabelSize::Small))
+                    .child(Label::new(self.label).size(self.label_size))
                     .when_some(self.description, |this, description| {
                         this.child(
                             Label::new(description)

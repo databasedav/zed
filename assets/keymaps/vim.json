@@ -995,7 +995,7 @@
     },
   },
   {
-    "context": "!Editor && !Terminal",
+    "context": "!Editor && !Terminal && !Elicitation",
     "bindings": {
       ":": "command_palette::Toggle",
       "g /": "pane::DeploySearch",
@@ -1317,6 +1317,14 @@
     "bindings": {
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "Elicitation > Editor && VimControl && !menu",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "tab": "menu::SelectNext",
+      "shift-tab": "menu::SelectPrevious",
     },
   },
 ]
