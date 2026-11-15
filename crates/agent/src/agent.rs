@@ -3543,6 +3543,200 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         Ok(())
     }
 
+    fn supports_subagent_messaging(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
+        self.0.read_with(cx, |agent, cx| {
+            agent
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.thread.read(cx).is_subagent())
+        })
+    }
+
+    fn message_subagent(
+        &self,
+        parent_session_id: &acp_v2::SessionId,
+        subagent_session_id: &acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        cx: &mut App,
+    ) -> Result<()> {
+        let (parent_thread, parent_acp_thread, subagent_thread, subagent_acp_thread) =
+            self.0.update(cx, |agent, _cx| {
+                let parent_session = agent.sessions.get(parent_session_id).ok_or_else(|| {
+                    anyhow!("No parent session found with id {parent_session_id}")
+                })?;
+                let parent_thread = parent_session.thread.clone();
+                let parent_acp_thread = parent_session.acp_thread.clone();
+
+                let subagent_session =
+                    agent.sessions.get(subagent_session_id).ok_or_else(|| {
+                        anyhow!("No subagent session found with id {subagent_session_id}")
+                    })?;
+                let subagent_acp_thread =
+                    subagent_session.acp_thread.upgrade().ok_or_else(|| {
+                        anyhow!("Subagent session {subagent_session_id} was released")
+                    })?;
+                anyhow::Ok((
+                    parent_thread,
+                    parent_acp_thread,
+                    subagent_session.thread.clone(),
+                    subagent_acp_thread,
+                ))
+            })?;
+
+        if subagent_thread.read(cx).parent_thread_id().as_ref() != Some(parent_session_id) {
+            anyhow::bail!("Session {subagent_session_id} is not a subagent of {parent_session_id}");
+        }
+
+        let is_running = subagent_thread.read(cx).is_active_subagent_run()
+            || subagent_acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle;
+        if is_running {
+            subagent_thread.update(cx, |thread, cx| {
+                thread.enqueue_subagent_steer(message, interrupt, cx);
+            });
+            if interrupt {
+                self.0.update(cx, |agent, _cx| {
+                    agent.interrupt_session_for_follow_up(subagent_session_id);
+                });
+            }
+            return Ok(());
+        }
+
+        let existing_card = parent_acp_thread.upgrade().and_then(|parent_acp| {
+            let parent_ref = parent_acp.read(cx);
+            let call = parent_ref.tool_call_for_subagent(subagent_session_id)?;
+            let label_text = call.label.read(cx).source().to_string();
+            let label = if label_text.is_empty() {
+                SharedString::from("Subagent")
+            } else {
+                SharedString::from(label_text)
+            };
+            let model_name = call
+                .subagent_session_info
+                .as_ref()
+                .and_then(|info| info.model_name.clone());
+            Some((call.id.clone(), label, model_name))
+        });
+
+        let subagent_label = existing_card
+            .as_ref()
+            .map(|(_, label, _)| label.clone())
+            .or_else(|| subagent_acp_thread.read(cx).title())
+            .unwrap_or_else(|| SharedString::from("Subagent"));
+
+        let handle = NativeSubagentHandle::new(
+            subagent_session_id.clone(),
+            subagent_thread,
+            subagent_acp_thread,
+            parent_thread.clone(),
+            parent_acp_thread.clone(),
+            self.0.downgrade(),
+        );
+        handle.mark_started(cx);
+
+        let mut session_info = acp_thread::SubagentSessionInfo {
+            session_id: subagent_session_id.clone(),
+            message_start_index: handle.num_entries(cx),
+            message_end_index: None,
+            model_name: existing_card
+                .as_ref()
+                .and_then(|(_, _, model_name)| model_name.clone()),
+        };
+
+        if let Some((tool_call_id, _, _)) = &existing_card {
+            let meta = acp_v2::Meta::from_iter([(
+                acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::json!(&session_info),
+            )]);
+            parent_acp_thread
+                .update(cx, |acp_thread, cx| {
+                    if acp_thread.has_tool_call(tool_call_id) {
+                        acp_thread
+                            .update_tool_call(
+                                acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+                                    .status(acp_v2::ToolCallStatus::InProgress)
+                                    .meta(meta),
+                                cx,
+                            )
+                            .log_err();
+                    }
+                })
+                .ok();
+        }
+
+        let agent_weak = self.0.downgrade();
+        let parent_session_id = parent_session_id.clone();
+        let subagent_session_id = subagent_session_id.clone();
+        cx.spawn(async move |cx| {
+            let send_result = handle.send(message, cx).await;
+            cx.update(|cx| {
+                session_info.message_end_index = Some(handle.num_entries(cx).saturating_sub(1));
+                let meta = acp_v2::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )]);
+                let (status, content, result_status, result_text) = match send_result {
+                    crate::SubagentSendResult::Completed(output) => (
+                        acp_v2::ToolCallStatus::Completed,
+                        Some(output.clone()),
+                        crate::SubagentResultStatus::Completed,
+                        output,
+                    ),
+                    crate::SubagentSendResult::Error(error) => (
+                        acp_v2::ToolCallStatus::Failed,
+                        Some(error.clone()),
+                        crate::SubagentResultStatus::Error,
+                        error,
+                    ),
+                    crate::SubagentSendResult::Canceled => (
+                        acp_v2::ToolCallStatus::Cancelled,
+                        None,
+                        crate::SubagentResultStatus::Canceled,
+                        "Subagent was canceled by the user.".to_string(),
+                    ),
+                };
+
+                if let Some((tool_call_id, _, _)) = existing_card {
+                    parent_acp_thread
+                        .update(cx, |acp_thread, cx| {
+                            if !acp_thread.has_tool_call(&tool_call_id) {
+                                return;
+                            }
+                            let mut update = acp_v2::ToolCallUpdate::new(tool_call_id)
+                                .status(status)
+                                .meta(meta);
+                            if let Some(content) = content {
+                                update = update.content(vec![content.into()]);
+                            }
+                            acp_thread.update_tool_call(update, cx).log_err();
+                        })
+                        .ok();
+                }
+
+                let subagent_result = crate::SubagentResultMessage {
+                    session_id: subagent_session_id,
+                    label: subagent_label,
+                    status: result_status,
+                    output: result_text,
+                };
+                parent_thread.update(cx, |parent_thread, cx| {
+                    parent_thread.enqueue_subagent_result(subagent_result, cx);
+                });
+
+                if result_status != crate::SubagentResultStatus::Canceled {
+                    agent_weak
+                        .update(cx, |agent, cx| {
+                            agent.schedule_subagent_result_delivery(parent_session_id, cx);
+                        })
+                        .ok();
+                }
+            });
+        })
+        .detach();
+
+        Ok(())
+    }
+
     fn truncate(
         &self,
         session_id: &acp_v2::SessionId,

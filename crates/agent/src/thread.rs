@@ -2949,6 +2949,20 @@ impl Thread {
         updated_stored_result
     }
 
+    pub(crate) fn enqueue_subagent_result(
+        &mut self,
+        subagent_result: SubagentResultMessage,
+        cx: &mut Context<Self>,
+    ) {
+        if subagent_result.status == SubagentResultStatus::Canceled {
+            self.pending_canceled_subagent_results.push(subagent_result);
+        } else {
+            self.pending_subagent_results.push(subagent_result);
+        }
+        self.updated_at = Utc::now();
+        cx.notify();
+    }
+
     /// Sending a message results in the model streaming a response, which could include tool calls.
     /// After calling tools, the model will stops and waits for any outstanding tool calls to be completed and their results sent.
     /// The returned channel will report all the occurrences in which the model stops before erroring or ending its turn.

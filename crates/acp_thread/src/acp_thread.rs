@@ -6370,6 +6370,45 @@ impl AcpThread {
         self.subagents
             .values()
             .any(|subagent| subagent.read(cx).status() == ThreadStatus::Generating)
+            || self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    AgentThreadEntry::ToolCall(call)
+                        if call.is_subagent()
+                            && matches!(
+                                call.status(),
+                                ToolCallStatus::Pending
+                                    | ToolCallStatus::WaitingForConfirmation
+                                    | ToolCallStatus::InProgress
+                                    | ToolCallStatus::Paused
+                            )
+                )
+            })
+    }
+
+    pub fn supports_subagent_messaging(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.connection
+            .supports_subagent_messaging(subagent_session_id, cx)
+    }
+
+    pub fn message_subagent(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        cx: &mut App,
+    ) -> Result<()> {
+        self.connection.message_subagent(
+            self.session_id(),
+            subagent_session_id,
+            message,
+            interrupt,
+            cx,
+        )
     }
 
     pub fn update_tool_call(

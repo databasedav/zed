@@ -310,6 +310,23 @@ pub trait AgentConnection {
         Ok(())
     }
 
+    /// Whether this connection supports sending steering or follow-up messages directly to a subagent.
+    fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        false
+    }
+
+    /// Sends a steering or follow-up message directly to a subagent owned by `parent_session_id`.
+    fn message_subagent(
+        &self,
+        _parent_session_id: &acp_v2::SessionId,
+        _subagent_session_id: &acp_v2::SessionId,
+        _message: String,
+        _interrupt: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        anyhow::bail!("Messaging subagents is not supported by this agent")
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.
@@ -1064,6 +1081,9 @@ mod test_support {
         supports_truncate: bool,
         supports_steer_at_boundary: bool,
         steer_at_boundary_calls: Arc<Mutex<Vec<(acp_v2::SessionId, bool)>>>,
+        supports_subagent_messaging: bool,
+        subagent_message_calls:
+            Arc<Mutex<Vec<(acp_v2::SessionId, acp_v2::SessionId, String, bool)>>>,
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
@@ -1117,6 +1137,8 @@ mod test_support {
                 supports_truncate: true,
                 supports_steer_at_boundary: false,
                 steer_at_boundary_calls: Default::default(),
+                supports_subagent_messaging: false,
+                subagent_message_calls: Default::default(),
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
                 prompt_capabilities_rx: watch::Receiver::constant(
@@ -1274,6 +1296,17 @@ mod test_support {
 
         pub fn take_steer_at_boundary_calls(&self) -> Vec<(acp_v2::SessionId, bool)> {
             std::mem::take(&mut *self.steer_at_boundary_calls.lock())
+        }
+
+        pub fn with_subagent_messaging(mut self, enabled: bool) -> Self {
+            self.supports_subagent_messaging = enabled;
+            self
+        }
+
+        pub fn take_subagent_message_calls(
+            &self,
+        ) -> Vec<(acp_v2::SessionId, acp_v2::SessionId, String, bool)> {
+            std::mem::take(&mut *self.subagent_message_calls.lock())
         }
 
         pub fn with_retry(mut self) -> Self {
@@ -1650,6 +1683,30 @@ mod test_support {
             self.steer_at_boundary_calls
                 .lock()
                 .push((session_id.clone(), end_at_boundary));
+            Ok(())
+        }
+
+        fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+            self.supports_subagent_messaging
+        }
+
+        fn message_subagent(
+            &self,
+            parent_session_id: &acp_v2::SessionId,
+            subagent_session_id: &acp_v2::SessionId,
+            message: String,
+            interrupt: bool,
+            _cx: &mut App,
+        ) -> Result<()> {
+            if !self.supports_subagent_messaging {
+                anyhow::bail!("Messaging subagents is not supported by this stub connection");
+            }
+            self.subagent_message_calls.lock().push((
+                parent_session_id.clone(),
+                subagent_session_id.clone(),
+                message,
+                interrupt,
+            ));
             Ok(())
         }
 

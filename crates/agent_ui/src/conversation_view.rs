@@ -306,6 +306,7 @@ impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
         let thread_state = thread.read(cx);
         let session_id = thread_state.session_id().clone();
+        let is_subagent = thread_state.parent_session_id().is_some();
         for request in thread_state.pending_permission_requests() {
             self.add_permission_request(&session_id, &request.id);
         }
@@ -346,16 +347,26 @@ impl Conversation {
                     AcpThreadEvent::NewEntry
                     | AcpThreadEvent::ActivityConfirmedIdle
                     | AcpThreadEvent::StatusChanged
-                    | AcpThreadEvent::SubmissionUpdated(_)
                     | AcpThreadEvent::TitleUpdated
-                    | AcpThreadEvent::TokenUsageUpdated(_)
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
-                    | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::SubagentAssociationUpdated
                     | AcpThreadEvent::Stopped { .. }
-                    | AcpThreadEvent::Error
+                    | AcpThreadEvent::Error => {
+                        if is_subagent
+                            || matches!(
+                                event,
+                                AcpThreadEvent::SubagentSpawned(_)
+                                    | AcpThreadEvent::SubagentAssociationUpdated
+                            )
+                        {
+                            cx.notify();
+                        }
+                    }
+                    AcpThreadEvent::SubmissionUpdated(_)
+                    | AcpThreadEvent::TokenUsageUpdated(_)
+                    | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::ConnectionLost
                     | AcpThreadEvent::LoadError(_)
                     | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -21621,5 +21632,324 @@ pub(crate) mod tests {
             let card = subagent_card::SubagentCardState::from_tool_call(tool_call, cx);
             assert_eq!(card.model_name.as_deref(), Some("Gemini 3 Flash"));
         });
+    }
+    #[gpui::test]
+    async fn test_running_subagents_activity_bar_drawer_and_controls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let first_child_id = acp_v2::SessionId::new("subagent-alpha");
+        let second_child_id = acp_v2::SessionId::new("subagent-beta");
+
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_none(),
+            "running subagents drawer should be hidden when no subagents are running",
+        );
+        assert!(!root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+
+        let first_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: first_child_id,
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Gemini 3.1 Pro".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-alpha", "Audit activity bar")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(first_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)),
+            "has_running_subagents should report true for an active subagent tool call",
+        );
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_some(),
+            "running subagents summary drawer should appear above chat input",
+        );
+        assert!(cx.debug_bounds("running-subagent-summary-steer").is_some());
+        assert!(cx.debug_bounds("running-subagent-summary-stop").is_some());
+
+        // Emit a completed steer tool call targeting the same running subagent:
+        // the original running subagent must remain visible in the drawer!
+        cx.update(|_, cx| {
+            let mut steer_call =
+                acp_v1::ToolCall::new("steer-alpha-1", "Audit activity bar (steer)")
+                    .kind(acp_v1::ToolKind::Other)
+                    .status(acp_v1::ToolCallStatus::Completed);
+            steer_call.meta = Some(first_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(steer_call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_some(),
+            "a completed steer call must not hide a still-running subagent",
+        );
+
+        // Start a second concurrent subagent and expand the drawer
+        let second_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: second_child_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Claude Sonnet 4.6".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-beta", "Verify keybindings")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(second_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let summary_bounds = cx
+            .debug_bounds("running-subagents-summary")
+            .expect("summary bar should be visible");
+        cx.simulate_click(summary_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("running-subagent-row-subagent-alpha")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("running-subagent-row-subagent-beta")
+                .is_some()
+        );
+
+        // Stop `subagent-beta` directly from its drawer row
+        let stop_beta = cx
+            .debug_bounds("drawer-stop-subagent-subagent-beta")
+            .expect("drawer row should show stop button");
+        cx.simulate_click(stop_beta.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(connection.take_cancel_calls(), vec![second_child_id]);
+
+        // Finish both subagent tool calls -> drawer auto-hides!
+        cx.update(|_, cx| {
+            for (call_id, meta) in [("spawn-alpha", first_meta), ("spawn-beta", second_meta)] {
+                let mut done = acp_v1::ToolCallUpdate::new(
+                    call_id,
+                    acp_v1::ToolCallUpdateFields::new().status(acp_v1::ToolCallStatus::Completed),
+                );
+                done.meta = Some(meta);
+                connection.send_update(
+                    root_session_id.clone(),
+                    acp_v1::SessionUpdate::ToolCallUpdate(done),
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("running-subagents-summary").is_none(),
+            "running subagents drawer should auto-hide once all subagents finish",
+        );
+        assert!(!root_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+    }
+
+    #[gpui::test]
+    async fn test_subagent_tile_messaging_steer_interrupt_and_fullscreen(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("subagent-steer");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: None,
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-steer", "Investigate parser")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta.clone());
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // 1. Click quick "Steer" button in the collapsed Running Subagents summary bar,
+        // type a message, and send with default `interrupt = false` (boundary steer).
+        let summary_steer = cx
+            .debug_bounds("running-subagent-summary-steer")
+            .expect("collapsed single-subagent drawer should show quick Steer button");
+        cx.simulate_click(summary_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("drawer-subagent-composer-subagent-steer")
+                .is_some(),
+            "clicking quick Steer should expand drawer and open composer",
+        );
+
+        cx.simulate_input("Check edge cases first");
+        cx.run_until_parked();
+
+        let drawer_send = cx
+            .debug_bounds("drawer-subagent-composer-send-subagent-steer")
+            .expect("drawer composer send button");
+        cx.simulate_click(drawer_send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Check edge cases first".to_string(),
+                false,
+            )],
+        );
+        assert!(
+            cx.debug_bounds("drawer-subagent-composer-subagent-steer")
+                .is_none(),
+            "drawer composer should close after sending",
+        );
+
+        // 2. Open inline subagent card composer (`steer-subagent-0`), toggle `Interrupt` on,
+        // and click Send -> `interrupt = true`.
+        let card_steer = cx
+            .debug_bounds("steer-subagent-0")
+            .expect("inline subagent card should show steer button");
+        cx.simulate_click(card_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("card-subagent-composer-0-subagent-steer")
+                .is_some(),
+        );
+        cx.simulate_input("Abort current grep and read lib.rs");
+        cx.run_until_parked();
+
+        let card_interrupt_toggle = cx
+            .debug_bounds("card-subagent-composer-0-interrupt-subagent-steer")
+            .expect("running inline composer should show Interrupt toggle");
+        cx.simulate_click(card_interrupt_toggle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let card_send = cx
+            .debug_bounds("card-subagent-composer-0-send-subagent-steer")
+            .expect("inline composer send button");
+        cx.simulate_click(card_send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Abort current grep and read lib.rs".to_string(),
+                true,
+            )],
+        );
+
+        // 3. Reopen inline composer and dispatch `SendImmediately` without toggling `Interrupt`:
+        // `SendImmediately` forces `interrupt = true`.
+        let card_steer = cx
+            .debug_bounds("steer-subagent-0")
+            .expect("inline subagent card steer button");
+        cx.simulate_click(card_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.simulate_input("Immediate redirect via action");
+        cx.dispatch_action(crate::SendImmediately);
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id.clone(),
+                child_session_id.clone(),
+                "Immediate redirect via action".to_string(),
+                true,
+            )],
+        );
+
+        // 4. Navigate to fullscreen subagent view and send a message from the fullscreen composer!
+        conversation_view.update(cx, |view, cx| {
+            view.load_subagent_session(child_session_id.clone(), root_session_id.clone(), cx);
+        });
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("fullscreen-subagent-composer-subagent-steer")
+                .is_some(),
+            "fullscreen subagent view should render bottom message composer",
+        );
+        let child_view = active_thread(&conversation_view, cx);
+        child_view.update_in(cx, |view, window, cx| {
+            view.activation_focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("Follow up from fullscreen");
+        cx.dispatch_action(Chat);
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id,
+                child_session_id,
+                "Follow up from fullscreen".to_string(),
+                false,
+            )],
+        );
     }
 }

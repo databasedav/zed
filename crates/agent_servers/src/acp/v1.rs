@@ -88,6 +88,16 @@ struct ZedInterruptForFollowUpNotification {
 struct ZedSubagentContinuationNotification {
     session_id: acp::SessionId,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/message_subagent")]
+#[serde(rename_all = "camelCase")]
+struct ZedMessageSubagentNotification {
+    parent_session_id: acp::SessionId,
+    session_id: acp::SessionId,
+    message: String,
+    interrupt: bool,
+}
 async fn close_session_and_drain(
     connection: &ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
@@ -548,6 +558,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("zed_diagnostics".into(), true.into()),
         ("zed_steer_at_boundary".into(), true.into()),
         ("zed_async_subagents".into(), true.into()),
+        ("zed_subagent_messaging".into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -1832,6 +1843,33 @@ impl AgentConnection for AcpConnection {
         Ok(())
     }
 
+    fn supports_subagent_messaging(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        !self.announces_subagents() && self.supports_load_session()
+    }
+
+    fn message_subagent(
+        &self,
+        parent_session_id: &acp_v2::SessionId,
+        subagent_session_id: &acp_v2::SessionId,
+        message: String,
+        interrupt: bool,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let params = ZedMessageSubagentNotification {
+            parent_session_id: acp::SessionId::new(parent_session_id.0.clone()),
+            session_id: acp::SessionId::new(subagent_session_id.0.clone()),
+            message,
+            interrupt,
+        };
+        self.connection
+            .send_notification(params)
+            .map_err(map_acp_error)?;
+        if let Some(session) = self.sessions.borrow_mut().get_mut(subagent_session_id) {
+            session.suppress_abort_err = true;
+        }
+        Ok(())
+    }
+
     fn session_modes(
         &self,
         session_id: &acp_v2::SessionId,
@@ -2181,6 +2219,27 @@ pub mod test_support {
         ) -> Result<()> {
             self.inner
                 .set_end_turn_at_next_boundary(session_id, end_at_boundary, cx)
+        }
+
+        fn supports_subagent_messaging(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
+            self.inner.supports_subagent_messaging(session_id, cx)
+        }
+
+        fn message_subagent(
+            &self,
+            parent_session_id: &acp_v2::SessionId,
+            subagent_session_id: &acp_v2::SessionId,
+            message: String,
+            interrupt: bool,
+            cx: &mut App,
+        ) -> Result<()> {
+            self.inner.message_subagent(
+                parent_session_id,
+                subagent_session_id,
+                message,
+                interrupt,
+                cx,
+            )
         }
 
         fn truncate(
@@ -10143,6 +10202,10 @@ exit 7
             meta.get("zed_async_subagents"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            meta.get("zed_subagent_messaging"),
+            Some(&serde_json::Value::Bool(true))
+        );
 
         let diag_req = ZedDiagnosticsRequest {
             session_id: acp::SessionId::new("sess-1"),
@@ -10197,6 +10260,25 @@ exit 7
             untyped_cont.params,
             serde_json::json!({
                 "sessionId": "sess-1",
+            })
+        );
+
+        let msg_sub_notif = ZedMessageSubagentNotification {
+            parent_session_id: acp::SessionId::new("parent-1"),
+            session_id: acp::SessionId::new("sub-1"),
+            message: "Focus on crates/agent_ui".to_string(),
+            interrupt: true,
+        };
+        assert_eq!(msg_sub_notif.method(), "_zed/message_subagent");
+        let untyped_msg_sub = msg_sub_notif.to_untyped_message().unwrap();
+        assert_eq!(untyped_msg_sub.method, "_zed/message_subagent");
+        assert_eq!(
+            untyped_msg_sub.params,
+            serde_json::json!({
+                "parentSessionId": "parent-1",
+                "sessionId": "sub-1",
+                "message": "Focus on crates/agent_ui",
+                "interrupt": true,
             })
         );
     }

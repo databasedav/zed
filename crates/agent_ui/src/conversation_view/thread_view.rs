@@ -767,6 +767,8 @@ pub struct ThreadView {
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
+    pub running_subagents_expanded: bool,
+    subagent_composers: HashMap<acp_v2::SessionId, SubagentComposerState>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
@@ -826,11 +828,32 @@ impl Focusable for ThreadView {
 impl ThreadView {
     pub(crate) fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         if self.parent_session_id.is_some() {
+            if let Some(composer) = self.subagent_composers.get(&self.session_id) {
+                return composer.editor.focus_handle(cx);
+            }
             self.focus_handle.clone()
         } else {
             self.active_editor(cx).focus_handle(cx)
         }
     }
+}
+
+struct SubagentComposerState {
+    editor: Entity<Editor>,
+    interrupt: bool,
+    is_open: bool,
+    _subscription: Subscription,
+}
+
+struct RunningSubagentItem {
+    session_id: acp_v2::SessionId,
+    entry_index: usize,
+    title: SharedString,
+    model_name: Option<SharedString>,
+    can_stop: bool,
+    can_message: bool,
+    subagent_thread: Option<Entity<AcpThread>>,
+    subagent_view: Option<Entity<ThreadView>>,
 }
 
 #[derive(Default)]
@@ -1303,6 +1326,8 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            running_subagents_expanded: false,
+            subagent_composers: HashMap::default(),
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
@@ -4124,9 +4149,12 @@ impl ThreadView {
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
+        let has_visible_edits = !changed_buffers.is_empty() && thread.parent_session_id().is_none();
         let plan = thread.plan().filter(|plan| !plan.is_empty(cx));
         let has_plan = plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
+        let running_subagents = self.collect_running_subagents(cx);
+        let has_running_subagents = !running_subagents.is_empty();
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -4144,7 +4172,12 @@ impl ThreadView {
         };
         let has_awaiting_permission = awaiting_permission.is_some();
 
-        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
+        if !has_visible_edits
+            && !has_plan
+            && queue_is_empty
+            && !has_awaiting_permission
+            && !has_running_subagents
+        {
             return None;
         }
 
@@ -4155,6 +4188,7 @@ impl ThreadView {
         // block you from using the panel.
         let pending_edits = false;
 
+        let running_subagents_expanded = self.running_subagents_expanded;
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
@@ -4190,42 +4224,54 @@ impl ThreadView {
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
-                            && (has_plan || !changed_buffers.is_empty() || !queue_is_empty),
+                            && (has_running_subagents
+                                || has_plan
+                                || has_visible_edits
+                                || !queue_is_empty),
                         |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                     )
+                    .when(has_running_subagents, |this| {
+                        this.child(self.render_running_subagents_summary(&running_subagents, cx))
+                            .when(running_subagents_expanded, |parent| {
+                                parent.child(
+                                    self.render_running_subagents_entries(&running_subagents, cx),
+                                )
+                            })
+                            .when(has_plan || has_visible_edits, |this| {
+                                this.child(Divider::horizontal().color(DividerColor::Border))
+                            })
+                    })
                     .when_some(plan, |this, plan| {
                         this.child(self.render_plan_summary(plan, window, cx))
                             .when(plan_expanded, |parent| {
                                 parent.child(self.render_plan_body(plan, window, cx))
                             })
                     })
-                    .when(has_plan && !changed_buffers.is_empty(), |this| {
+                    .when(has_plan && has_visible_edits, |this| {
                         this.child(Divider::horizontal().color(DividerColor::Border))
                     })
-                    .when(
-                        !changed_buffers.is_empty() && thread.parent_session_id().is_none(),
-                        |this| {
-                            this.child(self.render_edits_summary(
+                    .when(has_visible_edits, |this| {
+                        this.child(self.render_edits_summary(
+                            &changed_buffers,
+                            edits_expanded,
+                            pending_edits,
+                            cx,
+                        ))
+                        .when(edits_expanded, |parent| {
+                            parent.child(self.render_edited_files(
+                                action_log,
+                                telemetry.clone(),
                                 &changed_buffers,
-                                edits_expanded,
                                 pending_edits,
                                 cx,
                             ))
-                            .when(edits_expanded, |parent| {
-                                parent.child(self.render_edited_files(
-                                    action_log,
-                                    telemetry.clone(),
-                                    &changed_buffers,
-                                    pending_edits,
-                                    cx,
-                                ))
-                            })
-                        },
-                    )
-                    .when(!queue_is_empty, |this| {
-                        this.when(has_plan || !changed_buffers.is_empty(), |this| {
-                            this.child(Divider::horizontal().color(DividerColor::Border))
                         })
+                    })
+                    .when(!queue_is_empty, |this| {
+                        this.when(
+                            has_running_subagents || has_plan || has_visible_edits,
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
                         .child(self.render_message_queue_summary(window, cx))
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
@@ -4822,6 +4868,966 @@ impl ThreadView {
                 )
                 .into_any(),
         )
+    }
+
+    fn remeasure_all_list_items(&self) {
+        self.list_state
+            .remeasure_items(0..self.list_state.item_count());
+    }
+
+    fn collect_running_subagents(&self, cx: &App) -> Vec<RunningSubagentItem> {
+        let server_view = self.server_view.upgrade();
+        let connected_threads = server_view
+            .as_ref()
+            .and_then(|server_view| server_view.read(cx).as_connected())
+            .map(|connected| &connected.threads);
+
+        let thread = self.thread.read(cx);
+        let mut by_session: IndexMap<acp_v2::SessionId, RunningSubagentItem> = IndexMap::default();
+
+        for (entry_index, entry) in thread.entries().iter().enumerate() {
+            match entry {
+                AgentThreadEntry::ToolCall(tool_call) if tool_call.is_subagent() => {
+                    let Some(info) = tool_call.subagent_session_info.as_ref() else {
+                        continue;
+                    };
+                    let session_id = info.session_id.clone();
+                    let subagent_view = connected_threads
+                        .and_then(|threads| threads.get(&session_id))
+                        .cloned();
+                    let subagent_thread = subagent_view
+                        .as_ref()
+                        .map(|view| view.read(cx).thread.clone())
+                        .or_else(|| thread.subagent(&session_id).cloned());
+                    let state = SubagentCardState::for_subagent_tool_call(
+                        tool_call,
+                        subagent_thread.as_ref().map(|subagent| subagent.read(cx)),
+                        cx,
+                    );
+                    if state.status != SubagentStatus::Running {
+                        continue;
+                    }
+                    let thread_title = subagent_thread
+                        .as_ref()
+                        .and_then(|subagent| subagent.read(cx).title())
+                        .filter(|title| !title.is_empty());
+                    let title = state.title(thread_title);
+                    let model_name = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_model_name(cx))
+                        .or_else(|| state.model_name.clone());
+                    let can_message = thread.supports_subagent_messaging(&session_id, cx);
+                    by_session.insert(
+                        session_id.clone(),
+                        RunningSubagentItem {
+                            session_id,
+                            entry_index,
+                            title,
+                            model_name,
+                            can_stop: state.can_stop,
+                            can_message,
+                            subagent_thread,
+                            subagent_view,
+                        },
+                    );
+                }
+                AgentThreadEntry::SessionMessage(message) => {
+                    let Some(card) = acp_subagent_card(thread, entry_index, message, cx) else {
+                        continue;
+                    };
+                    let subagent_ref = card.subagent.read(cx);
+                    let state = SubagentCardState::from_acp_subagent(subagent_ref, card.entries);
+                    if state.status != SubagentStatus::Running {
+                        continue;
+                    }
+                    let session_id = subagent_ref.session_id().clone();
+                    let subagent_view = connected_threads
+                        .and_then(|threads| threads.get(&session_id))
+                        .cloned();
+                    let thread_title = subagent_ref.title().filter(|title| !title.is_empty());
+                    let title = state.title(thread_title);
+                    let model_name = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_model_name(cx))
+                        .or_else(|| state.model_name.clone());
+                    let can_message = thread.supports_subagent_messaging(&session_id, cx);
+                    by_session.insert(
+                        session_id.clone(),
+                        RunningSubagentItem {
+                            session_id,
+                            entry_index,
+                            title,
+                            model_name,
+                            can_stop: state.can_stop,
+                            can_message,
+                            subagent_thread: Some(card.subagent.clone()),
+                            subagent_view,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        by_session.into_values().collect()
+    }
+
+    fn scroll_icon_for_entry(&self, entry_index: usize) -> IconName {
+        if self.list_state.item_is_below_viewport(entry_index) == Some(true) {
+            IconName::ArrowDown
+        } else {
+            IconName::ArrowUp
+        }
+    }
+
+    fn stop_subagent_by_session(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        subagent_thread: Option<&Entity<AcpThread>>,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!("Subagent Stopped");
+        if let Some(thread) = subagent_thread {
+            self.cancel_thread(thread, cx).detach();
+        } else if let Some(thread) = self.thread.read(cx).subagent(session_id).cloned() {
+            self.cancel_thread(&thread, cx).detach();
+        } else {
+            let connection = self.thread.read(cx).connection().clone();
+            connection.cancel(session_id, cx).log_err();
+        }
+    }
+
+    fn subagent_composer_placeholder(is_running: bool, interrupt: bool) -> &'static str {
+        if is_running {
+            if interrupt {
+                "Interrupt subagent immediately…"
+            } else {
+                "Steer subagent at next step…"
+            }
+        } else {
+            "Send follow-up to resume subagent…"
+        }
+    }
+
+    fn ensure_subagent_composer(
+        &mut self,
+        subagent_session_id: acp_v2::SessionId,
+        is_running: bool,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(existing) = self.subagent_composers.get_mut(&subagent_session_id) {
+            let placeholder = Self::subagent_composer_placeholder(is_running, existing.interrupt);
+            existing.editor.update(cx, |editor, cx| {
+                editor.set_placeholder_text(placeholder, window, cx);
+            });
+            if open {
+                existing.is_open = true;
+            }
+            return existing.editor.clone();
+        }
+
+        let placeholder = Self::subagent_composer_placeholder(is_running, false);
+        let buffer =
+            cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local(String::new(), cx)), cx));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(5),
+                },
+                buffer,
+                None,
+                window,
+                cx,
+            );
+            editor.register_addon(crate::message_editor::MessageEditorAddon::new());
+            editor.set_placeholder_text(placeholder, window, cx);
+            editor
+        });
+        let subscription = cx.observe(&editor, |_, _, cx| cx.notify());
+        self.subagent_composers.insert(
+            subagent_session_id,
+            SubagentComposerState {
+                editor: editor.clone(),
+                interrupt: false,
+                is_open: open,
+                _subscription: subscription,
+            },
+        );
+        editor
+    }
+
+    fn toggle_subagent_composer(
+        &mut self,
+        subagent_session_id: acp_v2::SessionId,
+        is_running: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_open = self
+            .subagent_composers
+            .get(&subagent_session_id)
+            .is_some_and(|composer| composer.is_open);
+        if was_open {
+            if let Some(composer) = self.subagent_composers.get_mut(&subagent_session_id) {
+                composer.is_open = false;
+            }
+        } else {
+            let editor =
+                self.ensure_subagent_composer(subagent_session_id, is_running, true, window, cx);
+            editor.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        self.remeasure_all_list_items();
+        cx.notify();
+    }
+
+    fn set_subagent_composer_interrupt(
+        &mut self,
+        subagent_session_id: &acp_v2::SessionId,
+        interrupt: bool,
+        is_running: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(composer) = self.subagent_composers.get_mut(subagent_session_id) {
+            composer.interrupt = interrupt;
+            let placeholder = Self::subagent_composer_placeholder(is_running, interrupt);
+            composer.editor.update(cx, |editor, cx| {
+                editor.set_placeholder_text(placeholder, window, cx);
+            });
+            cx.notify();
+        }
+    }
+
+    fn submit_subagent_message(
+        &mut self,
+        subagent_session_id: acp_v2::SessionId,
+        force_interrupt: Option<bool>,
+        close_after_send: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((message, interrupt)) =
+            self.subagent_composers
+                .get(&subagent_session_id)
+                .map(|composer| {
+                    (
+                        composer.editor.read(cx).text(cx),
+                        force_interrupt.unwrap_or(composer.interrupt),
+                    )
+                })
+        else {
+            return;
+        };
+
+        if message.trim().is_empty() {
+            return;
+        }
+
+        let send_result = if self.is_subagent() && self.session_id == subagent_session_id {
+            if let Some(parent_id) = self.parent_session_id.clone() {
+                if let Some(parent_thread) =
+                    self.conversation.read(cx).threads.get(&parent_id).cloned()
+                {
+                    parent_thread.update(cx, |parent, cx| {
+                        parent.message_subagent(&subagent_session_id, message, interrupt, cx)
+                    })
+                } else {
+                    let connection = self.thread.read(cx).connection().clone();
+                    connection.message_subagent(
+                        &parent_id,
+                        &subagent_session_id,
+                        message,
+                        interrupt,
+                        cx,
+                    )
+                }
+            } else {
+                Err(anyhow::anyhow!("Subagent thread has no parent session ID"))
+            }
+        } else {
+            self.thread.update(cx, |thread, cx| {
+                thread.message_subagent(&subagent_session_id, message, interrupt, cx)
+            })
+        };
+
+        if let Err(error) = send_result {
+            log::error!("Failed to send message to subagent: {error:#}");
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    let toast = StatusToast::new(
+                        format!("Failed to message subagent: {error}"),
+                        cx,
+                        |toast, _cx| {
+                            toast.icon(
+                                Icon::new(IconName::XCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Error),
+                            )
+                        },
+                    );
+                    workspace.toggle_status_toast(toast, cx);
+                });
+            }
+            return;
+        }
+
+        if let Some(composer) = self.subagent_composers.get_mut(&subagent_session_id) {
+            composer.editor.update(cx, |editor, cx| {
+                editor.clear(window, cx);
+            });
+            composer.interrupt = false;
+            let placeholder = Self::subagent_composer_placeholder(true, false);
+            composer.editor.update(cx, |editor, cx| {
+                editor.set_placeholder_text(placeholder, window, cx);
+            });
+            if close_after_send {
+                composer.is_open = false;
+            }
+        }
+        if close_after_send {
+            self.remeasure_all_list_items();
+        }
+        cx.notify();
+    }
+
+    fn render_subagent_editor_element(&self, editor: &Entity<Editor>, cx: &App) -> EditorElement {
+        let settings = ThemeSettings::get_global(cx);
+        EditorElement::new(
+            editor,
+            EditorStyle {
+                background: cx.theme().colors().editor_background,
+                local_player: cx.theme().players().local(),
+                text: TextStyle {
+                    color: cx.theme().colors().text,
+                    font_family: settings.agent_buffer_font_family().clone(),
+                    font_fallbacks: settings.buffer_font.fallbacks.clone(),
+                    font_features: settings.buffer_font.features.clone(),
+                    font_size: settings.agent_buffer_font_size(cx).into(),
+                    font_weight: settings.buffer_font.weight,
+                    line_height: relative(settings.buffer_line_height.value()),
+                    ..Default::default()
+                },
+                syntax: cx.theme().syntax().clone(),
+                inlay_hints_style: editor::make_inlay_hints_style(cx),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn render_subagent_composer_row(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        is_running: bool,
+        id_prefix: &str,
+        close_after_send: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let composer = self.subagent_composers.get(subagent_session_id)?;
+        if close_after_send && !composer.is_open {
+            return None;
+        }
+
+        let editor = composer.editor.clone();
+        let editor_focus_handle = editor.read(cx).focus_handle(cx);
+        let interrupt_on = composer.interrupt;
+        let is_empty = editor.read(cx).text(cx).trim().is_empty();
+        let selector_id = format!("{id_prefix}-{subagent_session_id}");
+        let interrupt_id = format!("{id_prefix}-interrupt-{subagent_session_id}");
+        let send_id = format!("{id_prefix}-send-{subagent_session_id}");
+        let close_id = format!("{id_prefix}-close-{subagent_session_id}");
+
+        let send_label: SharedString = if is_running && interrupt_on {
+            "Interrupt".into()
+        } else if is_running {
+            "Steer".into()
+        } else {
+            "Send".into()
+        };
+
+        let send_style = if is_running && interrupt_on {
+            ButtonStyle::Tinted(TintColor::Warning)
+        } else {
+            ButtonStyle::Tinted(TintColor::Accent)
+        };
+
+        let session_for_chat = subagent_session_id.clone();
+        let session_for_follow = subagent_session_id.clone();
+        let session_for_confirm = subagent_session_id.clone();
+        let session_for_immediate = subagent_session_id.clone();
+        let session_for_cancel = subagent_session_id.clone();
+        let session_for_menu_cancel = subagent_session_id.clone();
+        let session_for_interrupt = subagent_session_id.clone();
+        let session_for_send = subagent_session_id.clone();
+        let session_for_close = subagent_session_id.clone();
+
+        Some(
+            h_flex()
+                .id(SharedString::from(selector_id.clone()))
+                .debug_selector(move || selector_id)
+                .w_full()
+                .min_w_0()
+                .p_1p5()
+                .pl_2()
+                .gap_1p5()
+                .bg(cx.theme().colors().editor_background)
+                .on_action(cx.listener(move |this, _: &Chat, window, cx| {
+                    this.submit_subagent_message(
+                        session_for_chat.clone(),
+                        None,
+                        close_after_send,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(
+                    cx.listener(move |this, _: &crate::ChatWithFollow, window, cx| {
+                        this.submit_subagent_message(
+                            session_for_follow.clone(),
+                            None,
+                            close_after_send,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                    this.submit_subagent_message(
+                        session_for_confirm.clone(),
+                        None,
+                        close_after_send,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(cx.listener(move |this, _: &SendImmediately, window, cx| {
+                    this.submit_subagent_message(
+                        session_for_immediate.clone(),
+                        Some(true),
+                        close_after_send,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(cx.listener(
+                    move |this, _: &editor::actions::Cancel, window, cx| {
+                        if close_after_send {
+                            if let Some(state) =
+                                this.subagent_composers.get_mut(&session_for_cancel)
+                            {
+                                state.is_open = false;
+                            }
+                            this.remeasure_all_list_items();
+                            this.activation_focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        } else {
+                            this.focus_handle.focus(window, cx);
+                        }
+                    },
+                ))
+                .on_action(cx.listener(move |this, _: &menu::Cancel, window, cx| {
+                    if close_after_send {
+                        if let Some(state) =
+                            this.subagent_composers.get_mut(&session_for_menu_cancel)
+                        {
+                            state.is_open = false;
+                        }
+                        this.remeasure_all_list_items();
+                        this.activation_focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                    } else {
+                        this.focus_handle.focus(window, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_subagent_editor_element(&editor, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_none()
+                        .when(is_running, |row| {
+                            let interrupt_debug = interrupt_id.clone();
+                            let focus_for_tooltip = editor_focus_handle.clone();
+                            row.child(
+                                div()
+                                    .debug_selector(move || interrupt_debug)
+                                    .child(
+                                        Button::new(SharedString::from(interrupt_id), "Interrupt")
+                                            .label_size(LabelSize::Small)
+                                            .toggle_state(interrupt_on)
+                                            .selected_style(ButtonStyle::Tinted(
+                                                TintColor::Warning,
+                                            ))
+                                            .tooltip(move |_window, cx| {
+                                                Tooltip::with_meta_in(
+                                                    "Interrupt Immediately",
+                                                    Some(&SendImmediately),
+                                                    "Abort the subagent's current step immediately instead of steering at its next step boundary.",
+                                                    &focus_for_tooltip,
+                                                    cx,
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.set_subagent_composer_interrupt(
+                                                    &session_for_interrupt,
+                                                    !interrupt_on,
+                                                    is_running,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            )
+                        })
+                        .child({
+                            let send_debug = send_id.clone();
+                            div()
+                                .debug_selector(move || send_debug)
+                                .child(
+                                    Button::new(SharedString::from(send_id), send_label)
+                                        .label_size(LabelSize::Small)
+                                        .style(send_style)
+                                        .disabled(is_empty)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.submit_subagent_message(
+                                                session_for_send.clone(),
+                                                None,
+                                                close_after_send,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                        })
+                        .when(close_after_send, |row| {
+                            let close_debug = close_id.clone();
+                            row.child(
+                                div()
+                                    .debug_selector(move || close_debug)
+                                    .child(
+                                        IconButton::new(
+                                            SharedString::from(close_id),
+                                            IconName::Close,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .shape(ui::IconButtonShape::Square)
+                                        .tooltip(Tooltip::text("Close"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(state) =
+                                                this.subagent_composers.get_mut(&session_for_close)
+                                            {
+                                                state.is_open = false;
+                                            }
+                                            this.remeasure_all_list_items();
+                                            cx.notify();
+                                        })),
+                                    ),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_running_subagents_summary(
+        &self,
+        running_subagents: &[RunningSubagentItem],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let count = running_subagents.len();
+        let expanded = self.running_subagents_expanded;
+        let single_item = (count == 1).then(|| &running_subagents[0]);
+
+        h_flex()
+            .p_1()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .justify_between()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(
+                h_flex()
+                    .id("running-subagents-summary")
+                    .debug_selector(|| "running-subagents-summary".into())
+                    .cursor_pointer()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Disclosure::new("running-subagents-disclosure", expanded))
+                    .child(SpinnerLabel::new().size(LabelSize::Small))
+                    .map(|this| {
+                        if let Some(first) = single_item {
+                            this.child(
+                                Label::new("1 Running Subagent")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new("•")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Disabled),
+                            )
+                            .child(
+                                Label::new(first.title.clone())
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            )
+                        } else {
+                            this.child(
+                                Label::new(format!("{count} Running Subagents"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.running_subagents_expanded = !this.running_subagents_expanded;
+                        cx.notify();
+                    })),
+            )
+            .when(!expanded, |this| {
+                this.when_some(single_item, |this, first| {
+                    let entry_index = first.entry_index;
+                    let scroll_icon = self.scroll_icon_for_entry(entry_index);
+                    let session_for_steer = first.session_id.clone();
+                    let session_for_fullscreen = first.session_id.clone();
+                    let session_for_stop = first.session_id.clone();
+                    let subagent_thread_for_stop = first.subagent_thread.clone();
+                    let has_fullscreen = first.subagent_view.is_some();
+                    let can_message = first.can_message;
+                    let can_stop = first.can_stop;
+
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .flex_none()
+                            .when(can_message, |actions| {
+                                actions.child(
+                                    div()
+                                        .debug_selector(|| "running-subagent-summary-steer".into())
+                                        .child(
+                                            Button::new("running-subagent-summary-steer", "Steer")
+                                                .label_size(LabelSize::Small)
+                                                .tooltip(Tooltip::text(
+                                                    "Steer or Interrupt Subagent",
+                                                ))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.running_subagents_expanded = true;
+                                                        let editor = this.ensure_subagent_composer(
+                                                            session_for_steer.clone(),
+                                                            true,
+                                                            true,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        editor
+                                                            .read(cx)
+                                                            .focus_handle(cx)
+                                                            .focus(window, cx);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .debug_selector(|| "running-subagent-summary-scroll".into())
+                                    .child(
+                                        IconButton::new(
+                                            "running-subagent-summary-scroll",
+                                            scroll_icon,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Scroll to Subagent"))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.list_state.scroll_to(ListOffset {
+                                                    item_ix: entry_index,
+                                                    offset_in_item: px(0.0),
+                                                });
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .when(has_fullscreen, |actions| {
+                                actions.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "running-subagent-summary-fullscreen".into()
+                                        })
+                                        .child(
+                                            IconButton::new(
+                                                "running-subagent-summary-fullscreen",
+                                                IconName::Maximize,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Make Subagent Full Screen"))
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    telemetry::event!("Subagent Maximized");
+                                                    this.server_view
+                                                        .update(cx, |server_view, cx| {
+                                                            server_view.navigate_to_thread(
+                                                                session_for_fullscreen.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            })
+                            .when(can_stop, |actions| {
+                                actions.child(
+                                    div()
+                                        .debug_selector(|| "running-subagent-summary-stop".into())
+                                        .child(
+                                            IconButton::new(
+                                                "running-subagent-summary-stop",
+                                                IconName::Stop,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Error)
+                                            .tooltip(Tooltip::text("Stop Subagent"))
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.stop_subagent_by_session(
+                                                        &session_for_stop,
+                                                        subagent_thread_for_stop.as_ref(),
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            }),
+                    )
+                })
+            })
+            .into_any_element()
+    }
+
+    fn render_running_subagents_entries(
+        &self,
+        running_subagents: &[RunningSubagentItem],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let total = running_subagents.len();
+        let editor_bg_color = cx.theme().colors().editor_background;
+
+        v_flex()
+            .id("running_subagents_list")
+            .max_h_56()
+            .overflow_y_scroll()
+            .children(running_subagents.iter().enumerate().map(|(index, item)| {
+                let is_last = index + 1 == total;
+                let entry_index = item.entry_index;
+                let scroll_icon = self.scroll_icon_for_entry(entry_index);
+                let composer_is_open = self
+                    .subagent_composers
+                    .get(&item.session_id)
+                    .is_some_and(|composer| composer.is_open);
+                let row_selector = format!("running-subagent-row-{}", item.session_id);
+                let steer_selector = format!("drawer-steer-subagent-{}", item.session_id);
+                let scroll_selector = format!("drawer-scroll-subagent-{}", item.session_id);
+                let fullscreen_selector = format!("drawer-fullscreen-subagent-{}", item.session_id);
+                let stop_selector = format!("drawer-stop-subagent-{}", item.session_id);
+
+                let session_for_steer = item.session_id.clone();
+                let session_for_fullscreen = item.session_id.clone();
+                let session_for_stop = item.session_id.clone();
+                let subagent_thread_for_stop = item.subagent_thread.clone();
+                let has_fullscreen = item.subagent_view.is_some();
+                let can_message = item.can_message;
+                let can_stop = item.can_stop;
+
+                let composer_row = if can_message && composer_is_open {
+                    self.render_subagent_composer_row(
+                        &item.session_id,
+                        true,
+                        "drawer-subagent-composer",
+                        true,
+                        cx,
+                    )
+                } else {
+                    None
+                };
+
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .bg(editor_bg_color)
+                    .when(!is_last, |container| {
+                        container
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                    })
+                    .child(
+                        h_flex()
+                            .id(("running-subagent-row", index))
+                            .debug_selector(move || row_selector)
+                            .p_1p5()
+                            .pl_2()
+                            .w_full()
+                            .min_w_0()
+                            .gap_1p5()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .id(("running-subagent-jump", index))
+                                    .cursor_pointer()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .rounded_xs()
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .tooltip(Tooltip::text("Scroll to Subagent"))
+                                    .child(SpinnerLabel::new().size(LabelSize::Small))
+                                    .child(
+                                        Label::new(item.title.clone())
+                                            .size(LabelSize::Small)
+                                            .truncate(),
+                                    )
+                                    .when_some(item.model_name.clone(), |row, model_name| {
+                                        row.child(
+                                            Label::new(format!("· {model_name}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.list_state.scroll_to(ListOffset {
+                                            item_ix: entry_index,
+                                            offset_in_item: px(0.0),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_none()
+                                    .when(can_message, |actions| {
+                                        actions.child(
+                                            div().debug_selector(move || steer_selector).child(
+                                                Button::new(
+                                                    ("drawer-steer-subagent", index),
+                                                    "Steer",
+                                                )
+                                                .label_size(LabelSize::Small)
+                                                .toggle_state(composer_is_open)
+                                                .selected_style(ButtonStyle::Tinted(
+                                                    TintColor::Accent,
+                                                ))
+                                                .tooltip(Tooltip::text(
+                                                    "Steer or Interrupt Subagent",
+                                                ))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.toggle_subagent_composer(
+                                                            session_for_steer.clone(),
+                                                            true,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        div().debug_selector(move || scroll_selector).child(
+                                            IconButton::new(
+                                                ("drawer-scroll-subagent", index),
+                                                scroll_icon,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Scroll to Subagent"))
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.list_state.scroll_to(ListOffset {
+                                                        item_ix: entry_index,
+                                                        offset_in_item: px(0.0),
+                                                    });
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                    )
+                                    .when(has_fullscreen, |actions| {
+                                        actions.child(
+                                            div()
+                                                .debug_selector(move || fullscreen_selector)
+                                                .child(
+                                                    IconButton::new(
+                                                        ("drawer-fullscreen-subagent", index),
+                                                        IconName::Maximize,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text(
+                                                        "Make Subagent Full Screen",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            telemetry::event!("Subagent Maximized");
+                                                            this.server_view
+                                                                .update(cx, |server_view, cx| {
+                                                                    server_view.navigate_to_thread(
+                                                                        session_for_fullscreen
+                                                                            .clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )),
+                                                ),
+                                        )
+                                    })
+                                    .when(can_stop, |actions| {
+                                        actions.child(
+                                            div().debug_selector(move || stop_selector).child(
+                                                IconButton::new(
+                                                    ("drawer-stop-subagent", index),
+                                                    IconName::Stop,
+                                                )
+                                                .icon_size(IconSize::Small)
+                                                .icon_color(Color::Error)
+                                                .tooltip(Tooltip::text("Stop Subagent"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.stop_subagent_by_session(
+                                                        &session_for_stop,
+                                                        subagent_thread_for_stop.as_ref(),
+                                                        cx,
+                                                    );
+                                                })),
+                                            ),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when_some(composer_row, |container, composer_row| {
+                        container
+                            .child(Divider::horizontal().color(DividerColor::BorderVariant))
+                            .child(composer_row)
+                    })
+            }))
+            .into_any_element()
     }
 
     pub(crate) fn render_main_agent_awaiting_permission(
@@ -5680,13 +6686,71 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.is_subagent() {
-            return h_flex()
+            let can_message = self
+                .parent_session_id
+                .as_ref()
+                .and_then(|parent_id| self.conversation.read(cx).threads.get(parent_id))
+                .is_some_and(|parent_thread| {
+                    parent_thread
+                        .read(cx)
+                        .supports_subagent_messaging(&self.session_id, cx)
+                })
+                || self
+                    .thread
+                    .read(cx)
+                    .supports_subagent_messaging(&self.session_id, cx);
+
+            let read_only_config = self
+                .config_options_view
+                .clone()
+                .filter(|view| view.read(cx).is_read_only());
+
+            if !can_message {
+                return h_flex()
+                    .px_2()
+                    .py_1()
+                    .children(read_only_config)
+                    .into_any_element();
+            }
+
+            let (reported_status, _) =
+                SubagentStatus::from_reported_state(self.thread.read(cx).foreground_state());
+            let is_running = self.thread.read(cx).status() == ThreadStatus::Generating
+                || reported_status == SubagentStatus::Running;
+            let session_id = self.session_id.clone();
+            self.ensure_subagent_composer(session_id.clone(), is_running, true, window, cx);
+            let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
+            return v_flex()
+                .w_full()
                 .px_2()
-                .py_1()
-                .children(
-                    self.config_options_view
-                        .clone()
-                        .filter(|view| view.read(cx).is_read_only()),
+                .pb_2()
+                .pt_1()
+                .gap_1()
+                .items_center()
+                .children(read_only_config)
+                .when_some(
+                    self.render_subagent_composer_row(
+                        &session_id,
+                        is_running,
+                        "fullscreen-subagent-composer",
+                        false,
+                        cx,
+                    ),
+                    |this, composer_row| {
+                        this.child(
+                            div()
+                                .when_some(max_content_width, |inner, max_w| {
+                                    inner.max_w(max_w).w_full()
+                                })
+                                .when(max_content_width.is_none(), |inner| inner.w_full())
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .overflow_hidden()
+                                .child(composer_row),
+                        )
+                    },
                 )
                 .into_any_element();
         }
@@ -9392,6 +10456,7 @@ impl ThreadView {
             entry_ix,
             &card.id,
             &SubagentCardState::from_acp_subagent(subagent, card.entries),
+            Some(subagent_session_id),
             subagent_thread_view,
             &self.focus_handle(cx),
             window,
@@ -12479,11 +13544,11 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let subagent_thread_view = subagent_session_id.and_then(|session_id| {
+        let subagent_thread_view = subagent_session_id.as_ref().and_then(|session_id| {
             self.server_view
                 .upgrade()
                 .and_then(|server_view| server_view.read(cx).as_connected())
-                .and_then(|connected| connected.threads.get(&session_id))
+                .and_then(|connected| connected.threads.get(session_id))
         });
 
         let state = SubagentCardState::for_subagent_tool_call(
@@ -12496,6 +13561,7 @@ impl ThreadView {
             entry_ix,
             &SubagentCardId::ToolCall(tool_call.id.clone()),
             &state,
+            subagent_session_id,
             subagent_thread_view,
             focus_handle,
             window,
@@ -12511,6 +13577,7 @@ impl ThreadView {
         entry_ix: usize,
         card_id: &SubagentCardId,
         state: &SubagentCardState,
+        fallback_session_id: Option<acp_v2::SessionId>,
         thread_view: Option<&Entity<ThreadView>>,
         focus_handle: &FocusHandle,
         window: &Window,
@@ -12521,7 +13588,8 @@ impl ThreadView {
             .map(|view| view.read(cx).thread.clone());
         let subagent_session_id = thread
             .as_ref()
-            .map(|thread| thread.read(cx).session_id().clone());
+            .map(|thread| thread.read(cx).session_id().clone())
+            .or(fallback_session_id);
         let action_log = thread.as_ref().map(|thread| thread.read(cx).action_log());
         let changed_buffers = action_log
             .map(|log| log.read(cx).changed_buffers(cx).collect::<Vec<_>>())
@@ -12737,34 +13805,97 @@ impl ThreadView {
                                     }))
                             }),
                     )
-                    .when(state.can_stop && subagent_session_id.is_some(), |buttons| {
-                        buttons.child(
-                            div()
-                                .debug_selector(move || format!("stop-subagent-{entry_ix}"))
-                                .child(
-                                    IconButton::new(
-                                        format!("stop-subagent-{}", entry_ix),
-                                        IconName::Stop,
-                                    )
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(Tooltip::text("Stop Subagent"))
-                                    .when_some(
-                                        thread_view
-                                            .as_ref()
-                                            .map(|view| view.read(cx).thread.clone()),
-                                        |this, thread| {
-                                            this.on_click(cx.listener(
-                                                move |this, _event, _window, cx| {
-                                                    telemetry::event!("Subagent Stopped");
-                                                    this.cancel_thread(&thread, cx).detach();
-                                                },
-                                            ))
-                                        },
+                    .when_some(
+                        subagent_session_id.clone().filter(|session_id| {
+                            self.thread
+                                .read(cx)
+                                .supports_subagent_messaging(session_id, cx)
+                        }),
+                        |buttons, session_id| {
+                            let composer_is_open = self
+                                .subagent_composers
+                                .get(&session_id)
+                                .is_some_and(|composer| composer.is_open);
+                            let tooltip = if is_running {
+                                "Steer or Interrupt Subagent"
+                            } else {
+                                "Send Follow-Up to Subagent"
+                            };
+                            buttons.child(
+                                div()
+                                    .debug_selector(move || format!("steer-subagent-{entry_ix}"))
+                                    .child(
+                                        IconButton::new(
+                                            format!("steer-subagent-{entry_ix}"),
+                                            IconName::ReplyArrowRight,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .toggle_state(composer_is_open)
+                                        .tooltip(Tooltip::text(tooltip))
+                                        .on_click(
+                                            cx.listener(move |this, _event, window, cx| {
+                                                this.toggle_subagent_composer(
+                                                    session_id.clone(),
+                                                    is_running,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
                                     ),
-                                ),
+                            )
+                        },
+                    )
+                    .when_some(
+                        subagent_session_id.clone().filter(|_| state.can_stop),
+                        |buttons, session_id| {
+                            let stop_thread = thread.clone();
+                            buttons.child(
+                                div()
+                                    .debug_selector(move || format!("stop-subagent-{entry_ix}"))
+                                    .child(
+                                        IconButton::new(
+                                            format!("stop-subagent-{}", entry_ix),
+                                            IconName::Stop,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Error)
+                                        .tooltip(Tooltip::text("Stop Subagent"))
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.stop_subagent_by_session(
+                                                    &session_id,
+                                                    stop_thread.as_ref(),
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        },
+                    ),
+            )
+            .when_some(
+                subagent_session_id
+                    .as_ref()
+                    .filter(|session_id| {
+                        self.thread
+                            .read(cx)
+                            .supports_subagent_messaging(session_id, cx)
+                    })
+                    .and_then(|session_id| {
+                        self.render_subagent_composer_row(
+                            session_id,
+                            is_running,
+                            &format!("card-subagent-composer-{entry_ix}"),
+                            true,
+                            cx,
                         )
                     }),
+                |this, composer_row| {
+                    this.child(Divider::horizontal().color(DividerColor::Border))
+                        .child(composer_row)
+                },
             )
             .when_some(thread_view, |this, thread_view| {
                 let thread = &thread_view.read(cx).thread;
