@@ -348,6 +348,24 @@ impl Default for TypstRenderStyle {
     }
 }
 
+const MATH_SYMBOL_COMPAT_PREAMBLE: &str = "\
+#let rightarrow = sym.arrow.r\n\
+#let leftarrow = sym.arrow.l\n\
+#let leftrightarrow = sym.arrow.l.r\n\
+#let Rightarrow = sym.arrow.r.double\n\
+#let Leftarrow = sym.arrow.l.double\n\
+#let Leftrightarrow = sym.arrow.l.r.double\n\
+#let iff = sym.arrow.l.r.double\n\
+#let implies = sym.arrow.r.double\n\
+#let leq = sym.lt.eq\n\
+#let geq = sym.gt.eq\n\
+#let neq = sym.eq.not\n\
+#let pm = sym.plus.minus\n\
+#let mp = sym.minus.plus\n\
+#let infty = sym.infinity\n\
+#let cdot = sym.dot.op\n\
+#let propto = sym.prop\n";
+
 impl TypstRenderStyle {
     pub fn build_builtin_preamble(&self) -> String {
         let width_expr = match self.page_width_pt {
@@ -371,7 +389,8 @@ impl TypstRenderStyle {
 
         if self.tight_bounds {
             return format!(
-                "#set page(width: {width_expr}, height: auto, margin: (x: 0.5pt, y: 1pt), fill: none)\n\
+                "{MATH_SYMBOL_COMPAT_PREAMBLE}\
+                 #set page(width: {width_expr}, height: auto, margin: (x: 0.5pt, y: 1pt), fill: none)\n\
                  #set text(font: ({primary_font}, \"IBM Plex Sans\", \"Libertinus Serif\"), fill: rgb(\"{text_hex}\"), size: {font_size:.2}pt, hyphenate: false)\n"
             );
         }
@@ -386,15 +405,13 @@ impl TypstRenderStyle {
         let list_item_spacing_pt = leading_pt + (font_size * 0.20);
         let list_block_spacing_pt = leading_pt + (font_size * 0.28);
         let [h1_pt, h2_pt, h3_pt, h4_pt, h5_pt, h6_pt] = self.heading_font_sizes_pt;
-        // Typst's built-in `RawElem` show-set applies `size: 0.8em` first:
-        // - Inline code uses `1.25em` (`0.8 * 1.25 = 1.0em`) + `weight: "regular"` + `#highlight(...)`
-        //   to match GPUI's `StyledText` + `RenderedLine::paint_code_chips` in Zed's Markdown renderer.
-        // - Block raw uses `1.25 * (code_size / font_size)` to match fenced code block buffer font size.
-        let block_code_scale = (code_size / font_size).clamp(0.75, 1.05);
-        let block_raw_em = 1.25 * block_code_scale;
+        // Typst's built-in `RawElem` `ShowSet` (`0.8em`) sits outside user `#show raw` rules, so
+        // binding `size` to `pt`-based `zed-ui-size` / `zed-code-size` replaces `0.8em` directly
+        // and avoids multiplicative compounding when `~/.config/zed/typst.typ` overrides `raw`.
 
         format!(
-            "#let zed-text = rgb(\"{text_hex}\")\n\
+            "{MATH_SYMBOL_COMPAT_PREAMBLE}\
+             #let zed-text = rgb(\"{text_hex}\")\n\
              #let zed-muted = rgb(\"{muted_hex}\")\n\
              #let zed-link = rgb(\"{link_hex}\")\n\
              #let zed-link-underline = rgb(\"{link_underline_hex}\")\n\
@@ -429,10 +446,10 @@ impl TypstRenderStyle {
              #set underline(stroke: 1pt + zed-link-underline, offset: 0.19em, evade: true)\n\
              #show link: set text(fill: zed-link)\n\
              #show link: underline\n\
-             #set highlight(fill: zed-code-bg, stroke: none, radius: 4pt, extent: 1.25pt, top-edge: 0.86em, bottom-edge: -0.19em)\n\
-             #show raw.where(block: false): set text(font: (zed-mono-font, \"Lilex\", \"DejaVu Sans Mono\"), size: 1.25em, weight: \"regular\", top-edge: 0.86em, bottom-edge: -0.19em)\n\
+             #set highlight(fill: zed-code-bg, stroke: none, radius: 4pt, extent: 1.5pt, top-edge: 0.85em, bottom-edge: -0.16em)\n\
+             #show raw.where(block: false): set text(font: (zed-mono-font, \"Lilex\", \"DejaVu Sans Mono\"), size: 0.90 * zed-ui-size, weight: \"regular\", top-edge: 0.85em, bottom-edge: -0.16em)\n\
              #show raw.where(block: false): highlight\n\
-             #show raw.where(block: true): set text(font: (zed-mono-font, \"Lilex\", \"DejaVu Sans Mono\"), size: {block_raw_em:.4}em, weight: \"regular\")\n\
+             #show raw.where(block: true): set text(font: (zed-mono-font, \"Lilex\", \"DejaVu Sans Mono\"), size: zed-code-size, weight: \"regular\")\n\
              #show raw.where(block: true): block.with(width: 100%, fill: zed-code-bg, stroke: 0.75pt + zed-border, inset: 8pt, radius: 4pt)\n\
              #set table(stroke: 0.75pt + zed-border, inset: (x: 8pt, y: 6pt), align: horizon, fill: (_, y) => if y == 0 {{ zed-table-head-bg }} else if calc.odd(y) {{ zed-table-stripe-bg }} else {{ none }})\n\
              #show table.cell.where(y: 0): set text(weight: \"semibold\")\n\

@@ -407,8 +407,8 @@ After rule and math $2x + 1 = 5$.";
             .expect("inline code text item");
         let code_pt = code_item.size.to_pt();
         assert!(
-            (code_pt - 22.0).abs() < 0.05,
-            "expected inline code size 22.0pt (1.0em matching surrounding prose like GPUI StyledText), got {code_pt:.3}pt"
+            (code_pt - 19.8).abs() < 0.05,
+            "expected inline code size 19.8pt (0.90 * zed-ui-size), got {code_pt:.3}pt"
         );
 
         let mut shapes = Vec::new();
@@ -427,8 +427,8 @@ After rule and math $2x + 1 = 5$.";
                     "expected 4pt chip corner radius, got {corners:?}"
                 );
                 assert!(
-                    (bounds.size.height - 23.1).abs() < 0.5,
-                    "expected symmetric ~23.1pt chip height at 22pt prose, got {:.2}pt",
+                    (bounds.size.height - 20.0).abs() < 0.5,
+                    "expected symmetric ~20.0pt chip height at 22pt prose, got {:.2}pt",
                     bounds.size.height
                 );
                 extracted_chip_quads += 1;
@@ -471,7 +471,7 @@ After rule and math $2x + 1 = 5$.";
 
         let mut custom_style = base_style.clone();
         custom_style.user_preamble = Some(gpui::SharedString::from(
-            "#set par(spacing: 40pt)\n#set highlight(radius: 2pt, extent: 3pt)\n",
+            "#show raw.where(block: false): set text(size: 0.90 * zed-ui-size)\n#set par(spacing: 40pt)\n#set highlight(radius: 2pt, extent: 3pt)\n",
         ));
         let overridden_layout = segment.layout_for_style(&custom_style);
         assert!(
@@ -488,6 +488,17 @@ After rule and math $2x + 1 = 5$.";
         let custom_doc = typst::compile::<typst_layout::PagedDocument>(&custom_world)
             .output
             .unwrap();
+        let mut custom_text_items = Vec::new();
+        collect_text_items(&custom_doc.pages()[0].frame, &mut custom_text_items);
+        let custom_code_item = custom_text_items
+            .iter()
+            .find(|item| item.text.contains("one_chip"))
+            .expect("inline code item in overridden doc");
+        assert!(
+            (custom_code_item.size.to_pt() - 18.0).abs() < 0.05,
+            "expected user_preamble #show raw size override to resolve cleanly to 18.0pt without multiplying, got {:.3}pt",
+            custom_code_item.size.to_pt()
+        );
         let mut custom_shapes = Vec::new();
         collect_shapes(
             &custom_doc.pages()[0].frame,
@@ -520,5 +531,162 @@ After rule and math $2x + 1 = 5$.";
             recovered_layout.rendered_text()
         );
         assert_eq!(recovered_layout.size(), default_layout.size());
+    }
+
+    #[test]
+    fn unwraps_backticked_typst_links_and_preserves_explicit_line_range_links() {
+        let catalog = TypstFontCatalog::base();
+        let style = TypstRenderStyle {
+            page_width_pt: Some(640.0),
+            ..TypstRenderStyle::default()
+        };
+
+        let source = "\
+#table(
+  columns: 3,
+  [*Artifact / Crate*], [*Capabilities*], [*Gates*],
+  [`#link(\"file:///workspace/crates/crate-wire/src/crate_wire.rs\")[crate-wire]` & #link(\"file:///workspace/crates/crate-crypto/src/crate_crypto.rs#L10-L25\")[`crate_crypto.rs`]],
+  [64 B `#[repr(C)]` Pod header, `$Delta^2 x / Delta t^2$` ($Delta^2 x / Delta t^2$)],
+  [Doc placeholder `#link(\"https://...\")[label]` stays literal code],
+)";
+
+        let crypto_tick_start = source
+            .find("`crate_crypto.rs`")
+            .expect("inline code inside explicit link");
+        let crypto_tick_end = crypto_tick_start + "`crate_crypto.rs`".len();
+
+        let extracted_spans = extract_inline_code_spans(source, 0);
+        assert!(
+            !extracted_spans
+                .iter()
+                .any(|span| span.full_range == (crypto_tick_start..crypto_tick_end)),
+            "expected extract_inline_code_spans to skip inline code already inside #link(...)"
+        );
+
+        let mut inline_code_links: HashMap<Range<usize>, gpui::SharedString> = HashMap::default();
+        inline_code_links.insert(
+            crypto_tick_start..crypto_tick_end,
+            gpui::SharedString::from("file:///workspace/crates/crate-crypto/src/crate_crypto.rs"),
+        );
+
+        let (normalized, _) = preprocess_typst_segment(source, 0, &inline_code_links);
+        let world = ZedTypstWorld::new(&style.build_preamble(), &normalized, catalog.clone())
+            .expect("world creation");
+        assert!(
+            typst::compile::<typst_layout::PagedDocument>(&world)
+                .output
+                .is_ok(),
+            "expected table with unwrapped links and explicit line-range link to compile directly: {normalized}"
+        );
+
+        let segment =
+            PreparedTypstSegment::new(source, 0..source.len(), &inline_code_links, catalog);
+        let layout = segment.layout_for_style(&style);
+        let rendered = layout.rendered_text();
+
+        assert!(
+            !rendered.contains("#link(\"file:///workspace"),
+            "expected backtick-wrapped real #link(...) to unwrap into a clickable link, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("#link(\"https://...\")"),
+            "expected documentation placeholder `#link(\"https://...\")[label]` to remain literal code, got {rendered:?}"
+        );
+
+        let link_urls: Vec<&str> = layout
+            .links()
+            .iter()
+            .map(|region| region.destination_url.as_ref())
+            .collect();
+        assert!(
+            link_urls.contains(&"file:///workspace/crates/crate-wire/src/crate_wire.rs"),
+            "expected unwrapped crate-wire link destination in {link_urls:?}"
+        );
+        assert!(
+            link_urls
+                .contains(&"file:///workspace/crates/crate-crypto/src/crate_crypto.rs#L10-L25"),
+            "expected explicit #L10-L25 link destination to survive without inline_code_links clobbering, got {link_urls:?}"
+        );
+        assert!(
+            !link_urls.contains(&"file:///workspace/crates/crate-crypto/src/crate_crypto.rs"),
+            "expected inline_code_links not to double-wrap `#link(...)[`crate_crypto.rs`]`, got {link_urls:?}"
+        );
+    }
+
+    #[test]
+    fn compiles_all_real_world_llm_typst_syntax_hazards_without_fallback() {
+        let catalog = TypstFontCatalog::base();
+        let style = TypstRenderStyle {
+            page_width_pt: Some(640.0),
+            ..TypstRenderStyle::default()
+        };
+
+        let source = "\
+= Section Intro
+
+#figure([Box], caption: [Flow]) <fig-flow>
+
+See @fig-flow for `<timer_notification>` (<timer_notification>), <2% of headset owners, \"<11 ms reflex\", and <4 px column <-> sync.
+
++ *Mode 1 $leftrightarrow$ 2 & stripped LaTeX symbols:* $x leq y geq z neq 0$, $a pm b propto infty$.
++ *Nested raw ticks:* pretty-printed ` ```json {\"ok\": true} ``` ` code block and `` `double_tick` ``.
++ *Underscores & brackets:* #link(\"file:///workspace/src/parity.py\")[_parity_cancel], __init__, and [unclosed *star inside bracket].
++ * Coding-agent \"Stop-and-Ask\" triggers in `AGENTS.md`*:
+  - Hard-requiring agents to *stop and ask you* before changing schemas.
++ * stationary Datum Rail = ATW Horizon Invariant:* the top horizontal bar *never moves or tilts*—mirroring 2 * 3 and width*height, while JSON * strictly at the outer HTTP edge* stays clean.
++ *Stray backtick math closer & mixed currency:* billing window $<= 5\"m\"`, `+ 90s` grace, $0 egress with $O(1)$ lookup at $0.015/GB ($/GB) and $1,500–$3,000.
++ *URLs & comment tokens:* Visit https://zed.dev/docs or file:///tmp/report.txt and never trip on bare // or /* in prose.
+
+| Gate | Status |
+| :--- | :---: |
+| `crate-wire` | Passed |
+";
+
+        let (normalized, _) = preprocess_typst_segment(source, 0, &HashMap::default());
+        let world = ZedTypstWorld::new(&style.build_preamble(), &normalized, catalog.clone())
+            .expect("world creation");
+        let compiled = typst::compile::<typst_layout::PagedDocument>(&world);
+        assert!(
+            compiled.output.is_ok(),
+            "expected zero Typst compile errors without fallback: {:?}\nnormalized:\n{normalized}",
+            compiled.output.err()
+        );
+
+        let segment =
+            PreparedTypstSegment::new(source, 0..source.len(), &HashMap::default(), catalog);
+        let layout = segment.layout_for_style(&style);
+        let rendered = layout.rendered_text();
+
+        assert!(rendered.contains("<2% of headset owners"));
+        assert!(rendered.contains("<11 ms reflex"));
+        assert!(
+            rendered.contains('↔'),
+            "expected $leftrightarrow$ arrow in {rendered:?}"
+        );
+        assert!(rendered.contains("_parity_cancel"));
+        assert!(rendered.contains("stop and ask you"));
+        assert!(rendered.contains("never moves or tilts"));
+        assert!(rendered.contains("$0 egress"));
+        assert!(rendered.contains("crate-wire"));
+        assert!(rendered.contains("Passed"));
+        assert!(
+            !rendered.contains("| :--- |"),
+            "expected Markdown pipe table to convert to native #table, got {rendered:?}"
+        );
+
+        let escaped = escape_typst_plain_text("file:///tmp/a//b/*c*/");
+        let fallback_world =
+            ZedTypstWorld::new(&style.build_preamble(), &escaped, TypstFontCatalog::base())
+                .expect("fallback world");
+        let fallback_doc = typst::compile::<typst_layout::PagedDocument>(&fallback_world)
+            .output
+            .expect("escaped plain-text fallback compiles");
+        let mut fallback_items = Vec::new();
+        collect_text_items(&fallback_doc.pages()[0].frame, &mut fallback_items);
+        let fallback_rendered: String = fallback_items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        assert_eq!(fallback_rendered, "file:///tmp/a//b/*c*/");
     }
 }
