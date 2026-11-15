@@ -1,6 +1,14 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
+## Personal Fork
+
+This is a personal fork of [Zed](https://github.com/zed-industries/zed) that I update to add the features I want and sync with upstream `main` when convenient.
+
+I will not be shepherding PRs or features from this fork to be upstreamed—if you see a feature here that you would like upstreamed into Zed, please feel free to take the code and shepherd it yourself.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
