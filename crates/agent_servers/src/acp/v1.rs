@@ -51,6 +51,8 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
+const ZED_TRUNCATE_SESSION_META_KEY: &str = "zed_truncate_session";
+const ZED_USER_MESSAGE_ID_META_KEY: &str = "zed_user_message_id";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_zed/diagnostics", response = ZedDiagnosticsResponse)]
@@ -98,6 +100,18 @@ struct ZedMessageSubagentNotification {
     message: String,
     interrupt: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/truncate_session", response = ZedTruncateSessionResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedTruncateSessionRequest {
+    session_id: acp::SessionId,
+    message_id: acp::MessageId,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedTruncateSessionResponse {}
 async fn close_session_and_drain(
     connection: &ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
@@ -559,6 +573,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("zed_steer_at_boundary".into(), true.into()),
         ("zed_async_subagents".into(), true.into()),
         ("zed_subagent_messaging".into(), true.into()),
+        (ZED_TRUNCATE_SESSION_META_KEY.into(), true.into()),
     ]);
 
     meta.insert("zed_markup_format".into(), "typst".into());
@@ -1507,6 +1522,135 @@ fn supports_openable_session_fork(agent_capabilities: &acp::AgentCapabilities) -
             || agent_capabilities.session_capabilities.resume.is_some())
 }
 
+fn supports_zed_session_truncate(agent_capabilities: &acp::AgentCapabilities) -> bool {
+    let has_truncate_flag = |meta: &Option<acp::Meta>| {
+        meta.as_ref()
+            .and_then(|meta| meta.get(ZED_TRUNCATE_SESSION_META_KEY))
+            == Some(&serde_json::Value::Bool(true))
+    };
+    has_truncate_flag(&agent_capabilities.meta)
+        || has_truncate_flag(&agent_capabilities.session_capabilities.meta)
+}
+
+fn send_prompt_request(
+    conn: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    params: acp_v2::PromptRequest,
+    cx: &mut App,
+) -> Task<Result<acp::PromptResponse>> {
+    let session_id = params.session_id.clone();
+    let params = match acp_thread::content::prompt_to_v1(params) {
+        Ok(params) => params,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    cx.foreground_executor().spawn(async move {
+        let result = conn.send_request(params).block_task().await;
+
+        let mut suppress_abort_err = false;
+
+        if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
+            suppress_abort_err = session.suppress_abort_err;
+            session.suppress_abort_err = false;
+        }
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                if err.code != ErrorCode::InternalError {
+                    anyhow::bail!(err)
+                }
+
+                let Some(data) = &err.data else {
+                    anyhow::bail!(err)
+                };
+
+                // Temporary workaround until the following PR is generally available:
+                // https://github.com/google-gemini/gemini-cli/pull/6656
+
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ErrorDetails {
+                    details: Box<str>,
+                }
+
+                match serde_json::from_value(data.clone()) {
+                    Ok(ErrorDetails { details }) => {
+                        if suppress_abort_err
+                            && (details.contains("This operation was aborted")
+                                || details.contains("The user aborted a request"))
+                        {
+                            Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                        } else {
+                            Err(anyhow!(details))
+                        }
+                    }
+                    Err(_) => Err(anyhow!(err)),
+                }
+            }
+        }
+    })
+}
+
+struct AcpSessionClientUserMessageIds {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+}
+
+impl acp_thread::AgentSessionClientUserMessageIds for AcpSessionClientUserMessageIds {
+    fn prompt(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        mut params: acp_v2::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        params.meta.get_or_insert_with(acp_v2::Meta::new).insert(
+            ZED_USER_MESSAGE_ID_META_KEY.into(),
+            client_user_message_id.as_str().into(),
+        );
+        send_prompt_request(self.connection.clone(), self.sessions.clone(), params, cx)
+    }
+}
+
+struct AcpSessionTruncate {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+}
+
+impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
+    fn run(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let thread = self
+            .sessions
+            .borrow()
+            .get(&self.session_id)
+            .and_then(|session| session.thread.upgrade());
+        let cancel_task = thread.map(|thread| thread.update(cx, |thread, cx| thread.cancel(cx)));
+        let connection = self.connection.clone();
+        let session_id = self.session_id.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
+        cx.foreground_executor().spawn(async move {
+            if let Some(cancel_task) = cancel_task {
+                cancel_task.await?;
+            }
+            connection
+                .send_request(ZedTruncateSessionRequest {
+                    session_id: acp::SessionId::new(session_id.0),
+                    message_id: acp::MessageId::new(client_user_message_id.as_str().to_owned()),
+                })
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            drain_foreground_queue(&dispatch_tx).await?;
+            Ok(())
+        })
+    }
+}
+
 impl AgentConnection for AcpConnection {
     fn agent_id(&self) -> AgentId {
         self.id.clone()
@@ -1873,6 +2017,19 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionClientUserMessageIds>> {
+        if !supports_zed_session_truncate(&self.agent_capabilities) {
+            return None;
+        }
+        Some(Rc::new(AcpSessionClientUserMessageIds {
+            connection: self.connection.clone(),
+            sessions: self.sessions.clone(),
+        }) as _)
+    }
+
     fn validate_prompt_content(&self, content: &[acp_v2::ContentBlock]) -> Result<()> {
         acp_thread::content::validate_prompt_content_for_v1(content)
     }
@@ -1882,59 +2039,7 @@ impl AgentConnection for AcpConnection {
         params: acp_v2::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
-        let session_id = params.session_id.clone();
-        let params = match acp_thread::content::prompt_to_v1(params) {
-            Ok(params) => params,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let conn = self.connection.clone();
-        let sessions = self.sessions.clone();
-        cx.foreground_executor().spawn(async move {
-            let result = conn.send_request(params).block_task().await;
-
-            let mut suppress_abort_err = false;
-
-            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
-                suppress_abort_err = session.suppress_abort_err;
-                session.suppress_abort_err = false;
-            }
-
-            match result {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    if err.code != ErrorCode::InternalError {
-                        anyhow::bail!(err)
-                    }
-
-                    let Some(data) = &err.data else {
-                        anyhow::bail!(err)
-                    };
-
-                    // Temporary workaround until the following PR is generally available:
-                    // https://github.com/google-gemini/gemini-cli/pull/6656
-
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct ErrorDetails {
-                        details: Box<str>,
-                    }
-
-                    match serde_json::from_value(data.clone()) {
-                        Ok(ErrorDetails { details }) => {
-                            if suppress_abort_err
-                                && (details.contains("This operation was aborted")
-                                    || details.contains("The user aborted a request"))
-                            {
-                                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-                            } else {
-                                Err(anyhow!(details))
-                            }
-                        }
-                        Err(_) => Err(anyhow!(err)),
-                    }
-                }
-            }
-        })
+        send_prompt_request(self.connection.clone(), self.sessions.clone(), params, cx)
     }
 
     fn cancel(&self, session_id: &acp_v2::SessionId, _cx: &mut App) -> Result<()> {
@@ -2013,6 +2118,22 @@ impl AgentConnection for AcpConnection {
             session.suppress_abort_err = true;
         }
         Ok(())
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        if !supports_zed_session_truncate(&self.agent_capabilities) {
+            return None;
+        }
+        Some(Rc::new(AcpSessionTruncate {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            sessions: self.sessions.clone(),
+            dispatch_tx: self.dispatch_tx.clone(),
+        }) as _)
     }
 
     fn session_modes(
@@ -10435,6 +10556,10 @@ exit 7
             meta.get("zed_subagent_messaging"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            meta.get("zed_truncate_session"),
+            Some(&serde_json::Value::Bool(true))
+        );
 
         let diag_req = ZedDiagnosticsRequest {
             session_id: acp::SessionId::new("sess-1"),
@@ -10510,6 +10635,273 @@ exit 7
                 "interrupt": true,
             })
         );
+
+        let truncate_req = ZedTruncateSessionRequest {
+            session_id: acp::SessionId::new("sess-1"),
+            message_id: acp::MessageId::new("msg-42"),
+        };
+        assert_eq!(truncate_req.method(), "_zed/truncate_session");
+        let untyped_truncate = truncate_req.to_untyped_message().unwrap();
+        assert_eq!(untyped_truncate.method, "_zed/truncate_session");
+        assert_eq!(
+            untyped_truncate.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "messageId": "msg-42",
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_acp_session_truncate_and_client_user_message_ids(cx: &mut gpui::TestAppContext) {
+        let (default_connection, _project, _, _, _, _, _keep_default_alive) =
+            connect_fake_agent(None, cx).await;
+        cx.update(|cx| {
+            assert!(default_connection.client_user_message_ids(cx).is_none());
+            assert!(
+                default_connection
+                    .truncate(&acp_v2::SessionId::new("sess-none"), cx)
+                    .is_none()
+            );
+        });
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let seen_prompt_meta: Arc<std::sync::Mutex<Vec<Option<acp::Meta>>>> = Arc::default();
+        let seen_truncates: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+
+        let agent_future = Agent
+            .v1()
+            .name("fake-truncate-agent")
+            .on_receive_request(
+                async move |req: acp::InitializeRequest, responder, _cx| {
+                    let meta = acp::Meta::from_iter([(
+                        ZED_TRUNCATE_SESSION_META_KEY.into(),
+                        serde_json::Value::Bool(true),
+                    )]);
+                    responder.respond(
+                        acp::InitializeResponse::new(req.protocol_version).agent_capabilities(
+                            acp::AgentCapabilities::default()
+                                .load_session(true)
+                                .meta(meta),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::NewSessionRequest, responder, _cx| {
+                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new(
+                        "live-sess",
+                    )))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let seen_prompt_meta = seen_prompt_meta.clone();
+                    async move |req: acp::PromptRequest, responder, cx| {
+                        seen_prompt_meta
+                            .lock()
+                            .expect("prompt meta lock")
+                            .push(req.meta.clone());
+                        cx.send_notification(acp::SessionNotification::new(
+                            req.session_id,
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                "Reply".into(),
+                            )),
+                        ))?;
+                        responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: acp::LoadSessionRequest, responder, cx| {
+                    for update in [
+                        acp::SessionUpdate::UserMessageChunk(
+                            acp::ContentChunk::new("Turn 1".into()).message_id("step:0"),
+                        ),
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            "Answer 1".into(),
+                        )),
+                        acp::SessionUpdate::UserMessageChunk(
+                            acp::ContentChunk::new("Turn 2".into()).message_id("step:2"),
+                        ),
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            "Answer 2".into(),
+                        )),
+                    ] {
+                        cx.send_notification(acp::SessionNotification::new(
+                            req.session_id.clone(),
+                            update,
+                        ))?;
+                    }
+                    responder.respond(acp::LoadSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let seen_truncates = seen_truncates.clone();
+                    async move |req: ZedTruncateSessionRequest, responder, _cx| {
+                        seen_truncates
+                            .lock()
+                            .expect("truncate lock")
+                            .push((req.session_id.0.to_string(), req.message_id.0.to_string()));
+                        responder.respond(ZedTruncateSessionResponse {})
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |_notif: acp::CancelNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_to(agent_transport);
+
+        let _agent_io_task = cx.background_executor.spawn(async move {
+            agent_future.await.ok();
+        });
+
+        let sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>> =
+            Rc::new(RefCell::new(HashMap::default()));
+        let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
+            Rc::new(RefCell::new(None));
+        let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let client_future = connect_client_future(
+            "zed-truncate-test",
+            client_transport,
+            dispatch_tx.clone(),
+            connection_tx,
+            futures::future::pending(),
+        );
+        let client_io_task = cx.background_executor.spawn(async move {
+            client_future.await.ok();
+        });
+        let client_conn = connection_rx.await.expect("client connection");
+        let init_response = client_conn
+            .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await
+            .expect("initialize");
+
+        let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let dispatch_context = ClientContext {
+            sessions: sessions.clone(),
+            session_list: client_session_list,
+            request_elicitations: request_elicitations.clone(),
+            active_request_scopes: None,
+            pending_session_updates: None,
+            accepts_subagent_updates: false,
+        };
+        let dispatch_task = cx.spawn(async move |mut cx| {
+            use futures::StreamExt as _;
+            while let Some(work) = dispatch_rx.next().await {
+                work.run(&mut cx, &dispatch_context);
+            }
+        });
+        let agent_server_store =
+            project.read_with(cx, |project, _| project.agent_server_store().downgrade());
+        let connection = Rc::new(cx.update(|cx| {
+            AcpConnection::new_for_test(
+                client_conn,
+                sessions,
+                init_response.agent_capabilities,
+                false,
+                request_elicitations,
+                agent_server_store,
+                client_io_task,
+                dispatch_tx,
+                dispatch_task,
+                cx,
+            )
+        }));
+
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+        let live_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), work_dirs.clone(), cx)
+            })
+            .await
+            .expect("new_session");
+
+        live_thread
+            .update(cx, |thread, cx| thread.send_raw("Hello Antigravity", cx))
+            .await
+            .expect("live prompt");
+        cx.run_until_parked();
+
+        let live_client_id = live_thread.read_with(cx, |thread, cx| {
+            let Some(acp_thread::AgentThreadEntry::UserMessage(user_msg)) =
+                thread.entries().first()
+            else {
+                panic!("expected optimistic user message");
+            };
+            assert!(thread.can_rewind_to(user_msg.client_id.as_ref(), cx));
+            user_msg.client_id.clone().expect("live client id")
+        });
+
+        {
+            let metas = seen_prompt_meta.lock().expect("prompt meta lock");
+            assert_eq!(metas.len(), 1);
+            let meta = metas[0].as_ref().expect("prompt _meta sent");
+            assert_eq!(
+                meta.get(ZED_USER_MESSAGE_ID_META_KEY),
+                Some(&serde_json::Value::String(
+                    live_client_id.as_str().to_owned()
+                ))
+            );
+        }
+
+        let loaded_thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("loaded-sess"),
+                    project,
+                    work_dirs,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load_session");
+        cx.run_until_parked();
+
+        let second_turn_id = loaded_thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.entries().len(), 4);
+            let acp_thread::AgentThreadEntry::UserMessage(second_user) = &thread.entries()[2]
+            else {
+                panic!("expected second replayed user message");
+            };
+            assert!(thread.can_rewind_to(second_user.client_id.as_ref(), cx));
+            second_user
+                .client_id
+                .clone()
+                .expect("second replayed client id")
+        });
+
+        loaded_thread
+            .update(cx, |thread, cx| thread.rewind(second_turn_id, cx))
+            .await
+            .expect("rewind loaded session");
+        cx.run_until_parked();
+
+        assert_eq!(
+            *seen_truncates.lock().expect("truncate lock"),
+            vec![("loaded-sess".to_string(), "step:2".to_string())]
+        );
+        loaded_thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.entries().len(), 2);
+            assert_eq!(
+                thread.to_markdown(cx),
+                "## User\n\nTurn 1\n\n## Assistant\n\nAnswer 1\n\n"
+            );
+        });
     }
 
     fn release_dropped_entities(cx: &mut gpui::TestAppContext) {
