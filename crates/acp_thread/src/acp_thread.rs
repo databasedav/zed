@@ -5685,11 +5685,23 @@ impl AcpThread {
         let entry_index = self.entries.len();
         match kind {
             MessageKind::User => {
+                let client_id = self
+                    .supports_truncate(cx)
+                    .then(|| match &identity {
+                        MessageIdentity::Keyed(id) => Some(ClientUserMessageId::from_message_id(
+                            acp_v1::MessageId::new(id.0.clone()),
+                        )),
+                        MessageIdentity::Legacy(id) => id
+                            .as_ref()
+                            .cloned()
+                            .map(ClientUserMessageId::from_message_id),
+                    })
+                    .flatten();
                 self.entries
                     .push(AgentThreadEntry::UserMessage(UserMessage {
                         identity,
                         meta: None,
-                        client_id: None,
+                        client_id,
                         is_optimistic: false,
                         content: MessageContent::default(),
                         indented: false,
@@ -5802,7 +5814,15 @@ impl AcpThread {
         chunk: acp_v2::ContentBlock,
         cx: &mut Context<Self>,
     ) {
-        self.push_user_content_block_with_protocol_id(None, false, id, chunk, false, cx)
+        let client_id = self
+            .supports_truncate(cx)
+            .then(|| {
+                id.as_ref()
+                    .cloned()
+                    .map(ClientUserMessageId::from_message_id)
+            })
+            .flatten();
+        self.push_user_content_block_with_protocol_id(client_id, false, id, chunk, false, cx)
     }
 
     fn push_user_content_block_with_protocol_id(
@@ -7751,7 +7771,9 @@ impl AcpThread {
         for chunk in &request.prompt {
             block.append_prompt(chunk.clone(), &language_registry, path_style, cx);
         }
-        let client_user_message_ids = self.connection.client_user_message_ids(cx);
+        let client_user_message_ids = push_user_message
+            .then(|| self.connection.client_user_message_ids(cx))
+            .flatten();
         let client_id = client_user_message_ids
             .as_ref()
             .map(|client_user_message_ids| client_user_message_ids.new_id());
@@ -27242,6 +27264,145 @@ mod tests {
                 )),
                 "tool markdown should still render inline math formulas via Typst"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replayed_user_message_chunks_populate_client_id_when_truncate_supported(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("test thread");
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UserMessageChunk(
+                        acp_v1::ContentChunk::new("First turn".into()).message_id("step:0"),
+                    ),
+                    cx,
+                )
+                .expect("first replayed user chunk");
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        "First reply".into(),
+                    )),
+                    cx,
+                )
+                .expect("first replayed assistant chunk");
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UserMessageChunk(
+                        acp_v1::ContentChunk::new("Second turn".into()).message_id("step:2"),
+                    ),
+                    cx,
+                )
+                .expect("second replayed user chunk");
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        "Second reply".into(),
+                    )),
+                    cx,
+                )
+                .expect("second replayed assistant chunk");
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk::new(
+                        "Unkeyed chunk".into(),
+                    )),
+                    cx,
+                )
+                .expect("unkeyed user chunk");
+        });
+
+        let second_client_id = thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 5);
+            let AgentThreadEntry::UserMessage(first_user) = &thread.entries[0] else {
+                panic!("expected first user message");
+            };
+            assert_eq!(
+                first_user
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
+                Some("step:0")
+            );
+            assert!(thread.can_rewind_to(first_user.client_id.as_ref(), cx));
+
+            let AgentThreadEntry::UserMessage(second_user) = &thread.entries[2] else {
+                panic!("expected second user message");
+            };
+            assert_eq!(
+                second_user
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
+                Some("step:2")
+            );
+            assert!(thread.can_rewind_to(second_user.client_id.as_ref(), cx));
+
+            let AgentThreadEntry::UserMessage(unkeyed_user) = &thread.entries[4] else {
+                panic!("expected unkeyed user message");
+            };
+            assert_eq!(unkeyed_user.client_id, None);
+            assert!(!thread.can_rewind_to(unkeyed_user.client_id.as_ref(), cx));
+
+            second_user.client_id.clone().expect("second client id")
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_client_id, cx))
+            .await
+            .expect("rewind to replayed user message should succeed");
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries.len(), 2);
+        });
+
+        let no_truncate_conn = Rc::new(FakeAgentConnection::new().without_truncate_support());
+        let no_truncate_thread = cx
+            .update(|cx| {
+                no_truncate_conn.new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("no-truncate thread");
+
+        no_truncate_thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UserMessageChunk(
+                        acp_v1::ContentChunk::new("No truncate turn".into()).message_id("step:0"),
+                    ),
+                    cx,
+                )
+                .expect("replayed chunk without truncate");
+        });
+
+        no_truncate_thread.read_with(cx, |thread, cx| {
+            let AgentThreadEntry::UserMessage(user_msg) = &thread.entries[0] else {
+                panic!("expected user message");
+            };
+            assert_eq!(user_msg.client_id, None);
+            assert!(!thread.can_rewind_to(user_msg.client_id.as_ref(), cx));
         });
     }
 }
