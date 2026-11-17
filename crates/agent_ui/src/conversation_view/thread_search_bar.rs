@@ -1042,6 +1042,8 @@ mod tests {
             summary,
             error: Some(error),
             meta: None,
+            started_at: None,
+            completed_duration: None,
         };
 
         assert!(compaction_markdowns(&compaction, false).next().is_none());

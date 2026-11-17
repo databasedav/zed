@@ -6377,13 +6377,7 @@ impl ThreadEventStream {
         }
         self.sender
             .unbounded_send(Ok(ThreadEvent::ContextCompaction(
-                acp_thread::ContextCompaction {
-                    id,
-                    status,
-                    error: None,
-                    summary: acp_thread::MessageContent::default(),
-                    meta: None,
-                },
+                acp_thread::ContextCompaction::new(id, status),
             )))
             .ok();
     }

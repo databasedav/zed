@@ -811,6 +811,7 @@ pub struct ThreadView {
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
     pub pending_queued_dispatch: Option<(u64, QueueEntry, Task<()>)>,
+    follow_up_cancel_started_at: Option<Instant>,
     next_queued_dispatch_id: u64,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
@@ -819,6 +820,7 @@ pub struct ThreadView {
     pub resumed_without_history: bool,
     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
     pub _cancel_task: Option<Task<()>>,
+    _auxiliary_timer_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
@@ -1414,6 +1416,7 @@ impl ThreadView {
             editing_message: None,
             message_queue: MessageQueue::default(),
             pending_queued_dispatch: None,
+            follow_up_cancel_started_at: None,
             next_queued_dispatch_id: 0,
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -1421,6 +1424,7 @@ impl ThreadView {
             new_server_version_available: None,
             elicitation_form_states: HashMap::default(),
             _cancel_task: None,
+            _auxiliary_timer_task: None,
             _save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
@@ -2781,23 +2785,35 @@ impl ThreadView {
             match thread.update(cx, |thread, cx| thread.interrupt_for_follow_up_or_ready(cx)) {
                 Ok(Some(task)) => task,
                 Ok(None) => {
+                    self.follow_up_cancel_started_at = None;
                     self.send_impl(message_editor, window, cx);
                     return;
                 }
                 Err(error) => {
+                    self.follow_up_cancel_started_at = None;
+                    self.sync_generating_indicator(cx);
                     self.handle_thread_error(error, cx);
                     return;
                 }
             };
 
+        self.follow_up_cancel_started_at = Some(Instant::now());
+        self.sync_generating_indicator(cx);
+        cx.notify();
+
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = cancelled.await {
-                this.update(cx, |this, cx| this.handle_thread_error(error, cx))
-                    .log_err();
+                this.update(cx, |this, cx| {
+                    this.follow_up_cancel_started_at = None;
+                    this.sync_generating_indicator(cx);
+                    this.handle_thread_error(error, cx);
+                })
+                .log_err();
                 return;
             }
 
             this.update_in(cx, |this, window, cx| {
+                this.follow_up_cancel_started_at = None;
                 this.send_impl(message_editor, window, cx);
             })
             .log_err();
@@ -2928,6 +2944,7 @@ impl ThreadView {
         if let Some((_, entry, _task)) = self.pending_queued_dispatch.take() {
             self.message_queue.restore_after_failed_send(entry);
         }
+        self.follow_up_cancel_started_at = None;
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
@@ -3419,6 +3436,8 @@ impl ThreadView {
                             this.message_queue.restore_after_failed_send(entry);
                             this.sync_queue_flag_to_native_thread(cx);
                         }
+                        this.follow_up_cancel_started_at = None;
+                        this.sync_generating_indicator(cx);
                     }
                     this.handle_thread_error(error, cx);
                 })
@@ -3437,6 +3456,8 @@ impl ThreadView {
                 let Some((_, entry, _)) = this.pending_queued_dispatch.take() else {
                     return;
                 };
+                this.follow_up_cancel_started_at = None;
+                this.sync_generating_indicator(cx);
                 if should_be_following {
                     workspace
                         .update(cx, |workspace, cx| {
@@ -3455,7 +3476,9 @@ impl ThreadView {
             .log_err();
         });
 
+        self.follow_up_cancel_started_at = Some(Instant::now());
         self.pending_queued_dispatch = Some((dispatch_id, entry, task));
+        self.sync_generating_indicator(cx);
         cx.notify();
     }
 
@@ -4445,9 +4468,10 @@ impl ThreadView {
                             |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                         )
                         .child(self.render_message_queue_summary(window, cx))
-                        .when(queue_expanded, |parent| {
-                            parent.child(self.render_message_queue_entries(window, cx))
-                        })
+                        .when(
+                            queue_expanded || self.pending_queued_dispatch.is_some(),
+                            |parent| parent.child(self.render_message_queue_entries(window, cx)),
+                        )
                     }),
             )
             .into_any()
@@ -6105,12 +6129,13 @@ impl ThreadView {
         _window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let queue_count =
-            self.message_queue.len() + usize::from(self.pending_queued_dispatch.is_some());
-        let title: SharedString = if queue_count == 1 {
-            "1 Queued Message".into()
-        } else {
-            format!("{} Queued Messages", queue_count).into()
+        let queued_only = self.message_queue.len();
+        let has_pending_dispatch = self.pending_queued_dispatch.is_some();
+        let title: SharedString = match (has_pending_dispatch, queued_only) {
+            (true, 0) => "Sending Message…".into(),
+            (true, remaining) => format!("Sending + {remaining} Queued").into(),
+            (false, 1) => "1 Queued Message".into(),
+            (false, count) => format!("{count} Queued Messages").into(),
         };
 
         h_flex()
@@ -6118,7 +6143,7 @@ impl ThreadView {
             .w_full()
             .gap_1()
             .justify_between()
-            .when(self.queue_expanded, |this| {
+            .when(self.queue_expanded || has_pending_dispatch, |this| {
                 this.border_b_1().border_color(cx.theme().colors().border)
             })
             .child(
@@ -6148,8 +6173,10 @@ impl ThreadView {
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
         self.pending_queued_dispatch.take();
+        self.follow_up_cancel_started_at = None;
         self.message_queue.clear();
         self.sync_queue_flag_to_native_thread(cx);
+        self.sync_generating_indicator(cx);
         cx.notify();
     }
 
@@ -6454,31 +6481,57 @@ impl ThreadView {
         } else {
             IconName::ChevronDown
         };
+        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+        let metrics_label = show_stats
+            .then(|| {
+                let thread = self.thread.read(cx);
+                let live_telemetry = is_compacting.then(|| thread.effective_live_telemetry());
+                let fallback_input_tokens = thread.token_usage().map(|usage| usage.input_tokens);
+                format_compaction_metrics_label(
+                    compaction,
+                    live_telemetry.as_ref(),
+                    fallback_input_tokens,
+                )
+            })
+            .flatten();
         let header = h_flex()
             .gap_1()
             .w_full()
             .child(Divider::horizontal())
             .child(
-                Button::new(id, header_label)
-                    .label_size(LabelSize::Small)
-                    .loading(is_compacting)
-                    .disabled(!has_details)
-                    .start_icon(
-                        Icon::new(IconName::Compact)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                h_flex()
+                    .gap_1p5()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new(id, header_label)
+                            .label_size(LabelSize::Small)
+                            .loading(is_compacting)
+                            .disabled(!has_details)
+                            .start_icon(
+                                Icon::new(IconName::Compact)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .when(has_details, |this| {
+                                this.end_icon(
+                                    Icon::new(chevron_end)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _event: &ClickEvent, window, cx| {
+                                        this.toggle_compaction_expansion(entry_ix, window, cx);
+                                    },
+                                ))
+                            }),
                     )
-                    .when(has_details, |this| {
-                        this.end_icon(
-                            Icon::new(chevron_end)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                    .when_some(metrics_label, |this, text| {
+                        this.child(
+                            Label::new(text)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
                         )
-                        .on_click(cx.listener(
-                            move |this, _event: &ClickEvent, window, cx| {
-                                this.toggle_compaction_expansion(entry_ix, window, cx);
-                            },
-                        ))
                     }),
             )
             .child(Divider::horizontal());
@@ -7192,12 +7245,13 @@ impl ThreadView {
                     this.child(
                         h_flex()
                             .id("pending_queue_entry")
+                            .debug_selector(|| "pending_queue_entry".into())
                             .w_full()
                             .flex_wrap()
                             .p_1p5()
                             .gap_1()
                             .bg(cx.theme().colors().editor_background)
-                            .when(queue_len > 0, |row| {
+                            .when(self.queue_expanded && queue_len > 0, |row| {
                                 row.border_b_1()
                                     .border_color(cx.theme().colors().border_variant)
                             })
@@ -7222,175 +7276,185 @@ impl ThreadView {
                     )
                 },
             )
-            .children(self.message_queue.iter().enumerate().map(|(index, entry)| {
-                let entry_id = entry.id;
-                let editor = &entry.editor;
-                let is_next = index == 0 && !has_pending_dispatch;
-                let (icon_color, tooltip_text) = if is_next {
-                    (Color::Accent, "Next in Queue")
-                } else {
-                    (Color::Muted, "In Queue")
-                };
+            .children(
+                self.queue_expanded
+                    .then(|| self.message_queue.iter().enumerate())
+                    .into_iter()
+                    .flatten()
+                    .map(|(index, entry)| {
+                        let entry_id = entry.id;
+                        let editor = &entry.editor;
+                        let is_next = index == 0 && !has_pending_dispatch;
+                        let (icon_color, tooltip_text) = if is_next {
+                            (Color::Accent, "Next in Queue")
+                        } else {
+                            (Color::Muted, "In Queue")
+                        };
 
-                let editor_focused = editor.focus_handle(cx).is_focused(_window);
-                let keybinding_size = rems_from_px(12_f32);
-                let steer_on = entry.steer;
+                        let editor_focused = editor.focus_handle(cx).is_focused(_window);
+                        let keybinding_size = rems_from_px(12_f32);
+                        let steer_on = entry.steer;
 
-                h_flex()
-                    .group("queue_entry")
-                    .w_full()
-                    .flex_wrap()
-                    .p_1p5()
-                    .gap_1()
-                    .bg(cx.theme().colors().editor_background)
-                    .when(index < queue_len - 1, |this| {
-                        this.border_b_1()
-                            .border_color(cx.theme().colors().border_variant)
-                    })
-                    .child(
-                        div()
-                            .id("next_in_queue")
-                            .flex_none()
-                            .child(
-                                Icon::new(IconName::Circle)
-                                    .size(IconSize::Small)
-                                    .color(icon_color),
-                            )
-                            .tooltip(Tooltip::text(tooltip_text)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(rems_from_px(120_f32))
-                            .child(editor.clone()),
-                    )
-                    .child(if editor_focused {
                         h_flex()
+                            .group("queue_entry")
+                            .w_full()
+                            .flex_wrap()
+                            .p_1p5()
                             .gap_1()
-                            .ml_auto()
-                            .justify_end()
-                            .child(
-                                IconButton::new(("edit", index), IconName::Pencil)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::with_meta(
-                                            "Edit Queued Message",
-                                            None,
-                                            "Type anything to edit",
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.move_queued_message_to_main_editor(
-                                            entry_id, None, None, window, cx,
-                                        );
-                                    })),
-                            )
-                            .when(supports_steer, |row| {
-                                row.child(self.render_queue_steer_button(
-                                    entry_id, index, is_next, steer_on, cx,
-                                ))
+                            .bg(cx.theme().colors().editor_background)
+                            .when(index < queue_len - 1, |this| {
+                                this.border_b_1()
+                                    .border_color(cx.theme().colors().border_variant)
                             })
                             .child(
-                                Button::new(("send_now_focused", index), "Send Now")
-                                    .label_size(LabelSize::Small)
-                                    .style(ButtonStyle::Outlined)
-                                    .key_binding(
-                                        KeyBinding::for_action_in(
-                                            &SendImmediately,
-                                            &editor.focus_handle(cx),
-                                            cx,
-                                        )
-                                        .map(|kb| kb.size(keybinding_size)),
+                                div()
+                                    .id("next_in_queue")
+                                    .flex_none()
+                                    .child(
+                                        Icon::new(IconName::Circle)
+                                            .size(IconSize::Small)
+                                            .color(icon_color),
                                     )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.send_queued_message_now(entry_id, window, cx);
-                                    })),
+                                    .tooltip(Tooltip::text(tooltip_text)),
                             )
-                    } else {
-                        h_flex()
-                            .when(!is_next, |this| this.visible_on_hover("queue_entry"))
-                            .gap_1()
-                            .ml_auto()
-                            .justify_end()
                             .child(
-                                IconButton::new(("delete", index), IconName::Trash)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip({
-                                        let focus_handle = focus_handle.clone();
-                                        move |_window, cx| {
-                                            if is_next {
-                                                Tooltip::for_action_in(
-                                                    "Remove Message from Queue",
-                                                    &RemoveFirstQueuedMessage,
-                                                    &focus_handle,
+                                div()
+                                    .flex_1()
+                                    .min_w(rems_from_px(120_f32))
+                                    .child(editor.clone()),
+                            )
+                            .child(if editor_focused {
+                                h_flex()
+                                    .gap_1()
+                                    .ml_auto()
+                                    .justify_end()
+                                    .child(
+                                        IconButton::new(("edit", index), IconName::Pencil)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(|_window, cx| {
+                                                Tooltip::with_meta(
+                                                    "Edit Queued Message",
+                                                    None,
+                                                    "Type anything to edit",
                                                     cx,
                                                 )
-                                            } else {
-                                                Tooltip::simple("Remove Message from Queue", cx)
-                                            }
-                                        }
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.move_queued_message_to_main_editor(
+                                                    entry_id, None, None, window, cx,
+                                                );
+                                            })),
+                                    )
+                                    .when(supports_steer, |row| {
+                                        row.child(self.render_queue_steer_button(
+                                            entry_id, index, is_next, steer_on, cx,
+                                        ))
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.remove_from_queue(entry_id, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                IconButton::new(("edit", index), IconName::Pencil)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip({
-                                        let focus_handle = focus_handle.clone();
-                                        move |_window, cx| {
-                                            if is_next {
-                                                Tooltip::for_action_in(
-                                                    "Edit",
-                                                    &EditFirstQueuedMessage,
-                                                    &focus_handle,
+                                    .child(
+                                        Button::new(("send_now_focused", index), "Send Now")
+                                            .label_size(LabelSize::Small)
+                                            .style(ButtonStyle::Outlined)
+                                            .key_binding(
+                                                KeyBinding::for_action_in(
+                                                    &SendImmediately,
+                                                    &editor.focus_handle(cx),
                                                     cx,
                                                 )
-                                            } else {
-                                                Tooltip::simple("Edit", cx)
-                                            }
-                                        }
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.move_queued_message_to_main_editor(
-                                            entry_id, None, None, window, cx,
-                                        );
-                                    })),
-                            )
-                            .when(supports_steer, |row| {
-                                row.child(self.render_queue_steer_button(
-                                    entry_id, index, is_next, steer_on, cx,
-                                ))
-                            })
-                            .child(
-                                Button::new(("send_now", index), "Send Now")
-                                    .label_size(LabelSize::Small)
-                                    .when(is_next, |this| this.style(ButtonStyle::Outlined))
-                                    .when(is_next && message_editor.is_empty(cx), |this| {
-                                        let action: Box<dyn gpui::Action> = if can_fast_track {
-                                            Box::new(Chat)
-                                        } else {
-                                            Box::new(SendNextQueuedMessage)
-                                        };
-
-                                        this.key_binding(
-                                            KeyBinding::for_action_in(
-                                                action.as_ref(),
-                                                &focus_handle.clone(),
-                                                cx,
+                                                .map(|kb| kb.size(keybinding_size)),
                                             )
-                                            .map(|kb| kb.size(keybinding_size)),
-                                        )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.send_queued_message_now(entry_id, window, cx);
+                                            })),
+                                    )
+                            } else {
+                                h_flex()
+                                    .when(!is_next, |this| this.visible_on_hover("queue_entry"))
+                                    .gap_1()
+                                    .ml_auto()
+                                    .justify_end()
+                                    .child(
+                                        IconButton::new(("delete", index), IconName::Trash)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip({
+                                                let focus_handle = focus_handle.clone();
+                                                move |_window, cx| {
+                                                    if is_next {
+                                                        Tooltip::for_action_in(
+                                                            "Remove Message from Queue",
+                                                            &RemoveFirstQueuedMessage,
+                                                            &focus_handle,
+                                                            cx,
+                                                        )
+                                                    } else {
+                                                        Tooltip::simple(
+                                                            "Remove Message from Queue",
+                                                            cx,
+                                                        )
+                                                    }
+                                                }
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_from_queue(entry_id, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new(("edit", index), IconName::Pencil)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip({
+                                                let focus_handle = focus_handle.clone();
+                                                move |_window, cx| {
+                                                    if is_next {
+                                                        Tooltip::for_action_in(
+                                                            "Edit",
+                                                            &EditFirstQueuedMessage,
+                                                            &focus_handle,
+                                                            cx,
+                                                        )
+                                                    } else {
+                                                        Tooltip::simple("Edit", cx)
+                                                    }
+                                                }
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.move_queued_message_to_main_editor(
+                                                    entry_id, None, None, window, cx,
+                                                );
+                                            })),
+                                    )
+                                    .when(supports_steer, |row| {
+                                        row.child(self.render_queue_steer_button(
+                                            entry_id, index, is_next, steer_on, cx,
+                                        ))
                                     })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.send_queued_message_now(entry_id, window, cx);
-                                    })),
-                            )
-                    })
-            }))
+                                    .child(
+                                        Button::new(("send_now", index), "Send Now")
+                                            .label_size(LabelSize::Small)
+                                            .when(is_next, |this| this.style(ButtonStyle::Outlined))
+                                            .when(is_next && message_editor.is_empty(cx), |this| {
+                                                let action: Box<dyn gpui::Action> =
+                                                    if can_fast_track {
+                                                        Box::new(Chat)
+                                                    } else {
+                                                        Box::new(SendNextQueuedMessage)
+                                                    };
+
+                                                this.key_binding(
+                                                    KeyBinding::for_action_in(
+                                                        action.as_ref(),
+                                                        &focus_handle.clone(),
+                                                        cx,
+                                                    )
+                                                    .map(|kb| kb.size(keybinding_size)),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.send_queued_message_now(entry_id, window, cx);
+                                            })),
+                                    )
+                            })
+                    }),
+            )
             .into_any_element()
     }
 
@@ -8203,7 +8267,7 @@ impl ThreadView {
         let is_editor_empty = message_editor.is_empty(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        let is_generating = self.is_effectively_generating(cx);
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
 
         if self.is_loading_contents {
@@ -8214,21 +8278,25 @@ impl ThreadView {
                 .child(loading_contents_spinner(IconSize::default()))
                 .into_any_element()
         } else if (is_generating || is_unconfirmed) && is_editor_empty {
-            IconButton::new("stop-generation", IconName::Stop)
-                .icon_color(Color::Error)
-                .style(ButtonStyle::Tinted(TintColor::Error))
-                .tooltip(move |_window, cx| {
-                    Tooltip::for_action(
-                        if is_unconfirmed {
-                            "Request Stop (Activity Unconfirmed)"
-                        } else {
-                            "Stop Generation"
-                        },
-                        &editor::actions::Cancel,
-                        cx,
-                    )
-                })
-                .on_click(cx.listener(|this, _event, _, cx| this.cancel_generation(cx)))
+            div()
+                .debug_selector(|| "stop-generation".into())
+                .child(
+                    IconButton::new("stop-generation", IconName::Stop)
+                        .icon_color(Color::Error)
+                        .style(ButtonStyle::Tinted(TintColor::Error))
+                        .tooltip(move |_window, cx| {
+                            Tooltip::for_action(
+                                if is_unconfirmed {
+                                    "Request Stop (Activity Unconfirmed)"
+                                } else {
+                                    "Stop Generation"
+                                },
+                                &editor::actions::Cancel,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _event, _, cx| this.cancel_generation(cx))),
+                )
                 .into_any_element()
         } else {
             let send_icon = if is_generating {
@@ -8519,6 +8587,146 @@ impl ThreadView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_following(window, cx);
             }))
+    }
+}
+
+pub(crate) fn format_compaction_metrics_label(
+    compaction: &acp_thread::ContextCompaction,
+    live_telemetry: Option<&acp_thread::LiveStreamTelemetry>,
+    fallback_input_tokens: Option<u64>,
+) -> Option<String> {
+    let metrics = compaction.metrics();
+    match compaction.status {
+        acp_thread::ContextCompactionStatus::InProgress => {
+            let mut parts: Vec<String> = Vec::new();
+            let live_compacting = live_telemetry.filter(|telemetry| {
+                telemetry.phase == LiveStreamPhase::Compacting || telemetry.is_compacting
+            });
+            let elapsed_milliseconds = live_compacting
+                .and_then(|telemetry| telemetry.call_elapsed_ms)
+                .or_else(|| {
+                    compaction.started_at.map(|started_at| {
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    })
+                });
+            if let Some(milliseconds) = elapsed_milliseconds.filter(|&ms| ms >= 200) {
+                parts.push(format_latency_milliseconds(milliseconds));
+            }
+            let pre_tokens = metrics
+                .as_ref()
+                .and_then(|metrics| metrics.pre_tokens)
+                .or_else(|| live_compacting.and_then(|telemetry| telemetry.input_tokens))
+                .or(fallback_input_tokens)
+                .filter(|&tokens| tokens > 0);
+            if let Some(tokens) = pre_tokens {
+                parts.push(format!("{} in", crate::humanize_token_count(tokens)));
+            }
+            if let Some(telemetry) = live_compacting {
+                if let Some(ttft_milliseconds) = metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.ttft_ms)
+                    .or(telemetry.ttft_ms)
+                    .filter(|&ms| ms > 0)
+                {
+                    if let Some(gap_milliseconds) = telemetry.chunk_gap_ms.filter(|&ms| ms >= 5_000)
+                    {
+                        parts.push(format!(
+                            "TTFT {} · wait {}",
+                            format_latency_milliseconds(ttft_milliseconds),
+                            format_latency_milliseconds(gap_milliseconds),
+                        ));
+                    } else {
+                        parts.push(format!(
+                            "TTFT {}",
+                            format_latency_milliseconds(ttft_milliseconds),
+                        ));
+                    }
+                } else if elapsed_milliseconds.unwrap_or(0) >= 500 {
+                    parts.push(String::from("awaiting first token"));
+                }
+                if let Some(step_tokens) = telemetry.step_output_tokens.filter(|&tokens| tokens > 0)
+                {
+                    if let Some(rate) = telemetry.output_tokens_per_sec.filter(|&rate| rate > 0.0) {
+                        parts.push(format!(
+                            "↓ {} ({})",
+                            crate::humanize_token_count(step_tokens),
+                            format_tokens_per_second(rate),
+                        ));
+                    } else {
+                        parts.push(format!("↓ {}", crate::humanize_token_count(step_tokens)));
+                    }
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        }
+        acp_thread::ContextCompactionStatus::Completed => {
+            let mut parts: Vec<String> = Vec::new();
+            let pre_tokens = metrics
+                .as_ref()
+                .and_then(|metrics| metrics.pre_tokens)
+                .filter(|&tokens| tokens > 0);
+            let post_tokens = metrics
+                .as_ref()
+                .and_then(|metrics| metrics.post_tokens)
+                .filter(|&tokens| tokens > 0);
+            let summary_tokens = metrics
+                .as_ref()
+                .and_then(|metrics| metrics.summary_tokens)
+                .filter(|&tokens| tokens > 0);
+            match (pre_tokens, post_tokens) {
+                (Some(pre), Some(post)) => {
+                    if post < pre {
+                        let reduction_percent = (((pre - post) as f64 / pre as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0)
+                            as u32;
+                        parts.push(format!(
+                            "{} → {} (-{reduction_percent}%)",
+                            crate::humanize_token_count(pre),
+                            crate::humanize_token_count(post),
+                        ));
+                    } else {
+                        parts.push(format!(
+                            "{} → {}",
+                            crate::humanize_token_count(pre),
+                            crate::humanize_token_count(post),
+                        ));
+                    }
+                }
+                (Some(pre), None) => {
+                    if let Some(summary) = summary_tokens {
+                        parts.push(format!(
+                            "{} → {} summary",
+                            crate::humanize_token_count(pre),
+                            crate::humanize_token_count(summary),
+                        ));
+                    } else {
+                        parts.push(format!("{} in", crate::humanize_token_count(pre)));
+                    }
+                }
+                (None, Some(post)) => {
+                    parts.push(format!("→ {}", crate::humanize_token_count(post)));
+                }
+                (None, None) => {}
+            }
+            let duration_milliseconds = metrics
+                .as_ref()
+                .and_then(|metrics| metrics.duration_ms)
+                .filter(|&ms| ms > 0)
+                .or_else(|| {
+                    compaction
+                        .completed_duration
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                        .filter(|&ms| ms >= 100)
+                });
+            if let Some(milliseconds) = duration_milliseconds {
+                parts.push(format_latency_milliseconds(milliseconds));
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        }
+        acp_thread::ContextCompactionStatus::Failed
+        | acp_thread::ContextCompactionStatus::Canceled
+        | acp_thread::ContextCompactionStatus::Other(_) => None,
     }
 }
 
@@ -10755,20 +10963,57 @@ impl ThreadView {
     }
 
     /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
-    pub(crate) fn sync_generating_indicator(&mut self, cx: &App) {
-        let thread = self.thread.read(cx);
-
-        let is_generating =
-            matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
+    pub(crate) fn sync_generating_indicator(&mut self, cx: &mut Context<Self>) {
+        let (is_compacting, has_follow_up_interrupt, entries_count) = {
+            let thread = self.thread.read(cx);
+            (
+                thread.is_compacting(),
+                thread.has_follow_up_interrupt_in_flight(),
+                thread.entries().len(),
+            )
+        };
+        let is_generating = self.is_effectively_generating(cx) && !is_compacting;
 
         if is_generating && !self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
             self.list_state.splice(entries_count..entries_count, 1);
             self.generating_indicator_in_list = true;
         } else if !is_generating && self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
             self.list_state.splice(entries_count..entries_count + 1, 0);
             self.generating_indicator_in_list = false;
+        }
+
+        let needs_auxiliary_timer =
+            is_compacting || self.pending_queued_dispatch.is_some() || has_follow_up_interrupt;
+        if needs_auxiliary_timer {
+            if self.turn_fields._turn_timer_task.is_none() && self._auxiliary_timer_task.is_none() {
+                self._auxiliary_timer_task = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(LIVE_METRICS_TICK_INTERVAL)
+                            .await;
+                        let keep_running = this
+                            .update(cx, |this, cx| {
+                                let thread = this.thread.read(cx);
+                                let still_active = thread.is_compacting()
+                                    || this.pending_queued_dispatch.is_some()
+                                    || thread.has_follow_up_interrupt_in_flight();
+                                if still_active {
+                                    cx.notify();
+                                    true
+                                } else {
+                                    this._auxiliary_timer_task = None;
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                        if !keep_running {
+                            break;
+                        }
+                    }
+                }));
+            }
+        } else {
+            self._auxiliary_timer_task = None;
         }
     }
 
@@ -10776,11 +11021,18 @@ impl ThreadView {
         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
         let is_blocked_on_terminal_command =
             !confirmation && self.is_blocked_on_terminal_command(cx);
+        let is_cancelling_for_follow_up = !confirmation
+            && self.thread.read(cx).status() != ThreadStatus::Generating
+            && (self.pending_queued_dispatch.is_some()
+                || self.thread.read(cx).has_follow_up_interrupt_in_flight());
 
-        let telemetry = show_stats.then(|| self.thread.read(cx).effective_live_telemetry());
+        let telemetry = (!is_cancelling_for_follow_up && show_stats)
+            .then(|| self.thread.read(cx).effective_live_telemetry());
 
         let phase_label = if confirmation || is_blocked_on_terminal_command {
             None
+        } else if is_cancelling_for_follow_up {
+            Some(SharedString::from("Cancelling…"))
         } else {
             telemetry
                 .as_ref()
@@ -10814,20 +11066,27 @@ impl ThreadView {
                         Some(SharedString::from(label))
                     }
                     LiveStreamPhase::ExecutingTools => Some(SharedString::from("Running tool")),
+                    LiveStreamPhase::Compacting => Some(SharedString::from("Compacting context")),
                     LiveStreamPhase::Idle | LiveStreamPhase::Unknown => None,
                 })
         };
 
+        let elapsed_started_at = if is_cancelling_for_follow_up {
+            self.follow_up_cancel_started_at
+                .or(self.turn_fields.turn_started_at)
+        } else {
+            self.turn_fields.turn_started_at
+        };
         let elapsed_label = show_stats
             .then(|| {
-                self.turn_fields.turn_started_at.and_then(|started_at| {
+                elapsed_started_at.and_then(|started_at| {
                     let elapsed = started_at.elapsed();
                     (elapsed >= STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
                 })
             })
             .flatten();
 
-        let latency_label = if confirmation {
+        let latency_label = if confirmation || is_cancelling_for_follow_up {
             None
         } else {
             telemetry.as_ref().and_then(|telemetry| {
@@ -11807,6 +12066,7 @@ impl ThreadView {
                     | LiveStreamPhase::StreamingResponse
                     | LiveStreamPhase::StreamingToolCall
                     | LiveStreamPhase::BufferingToolCall
+                    | LiveStreamPhase::Compacting
             )
         {
             return false;

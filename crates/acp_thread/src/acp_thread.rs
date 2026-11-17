@@ -966,6 +966,22 @@ impl From<acp_v2::CompactionStatus> for ContextCompactionStatus {
     }
 }
 
+pub const COMPACTION_METRICS_META_KEY: &str = "compaction_metrics";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CompactionMetrics {
+    #[serde(default)]
+    pub pre_tokens: Option<u64>,
+    #[serde(default)]
+    pub post_tokens: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
+    #[serde(default)]
+    pub summary_tokens: Option<u64>,
+}
+
 /// A point in the thread where the conversation history was compacted to free
 /// up room in the model's context window. The summary can be expanded to inspect
 /// what the model retained.
@@ -976,11 +992,31 @@ pub struct ContextCompaction {
     pub error: Option<Entity<Markdown>>,
     pub summary: MessageContent,
     pub meta: Option<acp_v2::Meta>,
+    pub started_at: Option<Instant>,
+    pub completed_duration: Option<Duration>,
 }
 
 impl ContextCompaction {
+    pub fn new(id: ContextCompactionId, status: ContextCompactionStatus) -> Self {
+        let started_at = (status == ContextCompactionStatus::InProgress).then(Instant::now);
+        Self {
+            id,
+            status,
+            error: None,
+            summary: MessageContent::default(),
+            meta: None,
+            started_at,
+            completed_duration: None,
+        }
+    }
+
     pub fn is_in_progress(&self) -> bool {
         self.status == ContextCompactionStatus::InProgress
+    }
+
+    pub fn metrics(&self) -> Option<CompactionMetrics> {
+        let value = self.meta.as_ref()?.get(COMPACTION_METRICS_META_KEY)?;
+        serde_json::from_value(value.clone()).ok()
     }
 
     fn apply_update(
@@ -990,7 +1026,15 @@ impl ContextCompaction {
         language_registry: &Arc<LanguageRegistry>,
         cx: &mut App,
     ) {
-        self.status = update.status.into();
+        let next_status: ContextCompactionStatus = update.status.into();
+        if next_status == ContextCompactionStatus::InProgress {
+            self.started_at.get_or_insert_with(Instant::now);
+        } else if self.completed_duration.is_none()
+            && let Some(started_at) = self.started_at
+        {
+            self.completed_duration = Some(started_at.elapsed());
+        }
+        self.status = next_status;
         match update.summary {
             MaybeUndefined::Undefined => {}
             MaybeUndefined::Null => self.summary = MessageContent::default(),
@@ -3828,6 +3872,7 @@ pub enum LiveStreamPhase {
     StreamingToolCall,
     BufferingToolCall,
     ExecutingTools,
+    Compacting,
     #[default]
     Idle,
     #[serde(other)]
@@ -3838,6 +3883,8 @@ pub enum LiveStreamPhase {
 pub struct LiveStreamTelemetry {
     #[serde(default)]
     pub phase: LiveStreamPhase,
+    #[serde(default)]
+    pub is_compacting: bool,
     #[serde(default)]
     pub call_elapsed_ms: Option<u64>,
     #[serde(default)]
@@ -3866,7 +3913,18 @@ pub struct LiveStreamTelemetry {
 
 pub fn live_telemetry_from_meta(meta: &Option<acp_v2::Meta>) -> Option<LiveStreamTelemetry> {
     let value = meta.as_ref()?.get(LIVE_TELEMETRY_META_KEY)?;
-    serde_json::from_value(value.clone()).ok()
+    let mut telemetry: LiveStreamTelemetry = serde_json::from_value(value.clone()).ok()?;
+    if telemetry.is_compacting
+        && matches!(
+            telemetry.phase,
+            LiveStreamPhase::Idle | LiveStreamPhase::Unknown
+        )
+    {
+        telemetry.phase = LiveStreamPhase::Compacting;
+    } else if telemetry.phase == LiveStreamPhase::Compacting {
+        telemetry.is_compacting = true;
+    }
+    Some(telemetry)
 }
 
 #[derive(Default)]
@@ -4903,7 +4961,8 @@ impl AcpThread {
     }
 
     pub fn effective_live_telemetry(&self) -> LiveStreamTelemetry {
-        let is_generating = self.status() == ThreadStatus::Generating;
+        let is_compacting = self.is_compacting();
+        let is_generating = self.status() == ThreadStatus::Generating || is_compacting;
         let has_active_tools = is_generating && self.has_in_progress_tool_calls();
 
         if let Some((mut telemetry, reported_at)) = self.reported_live_telemetry.clone() {
@@ -4911,6 +4970,7 @@ impl AcpThread {
                 u64::try_from(reported_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             if !is_generating {
                 telemetry.phase = LiveStreamPhase::Idle;
+                telemetry.is_compacting = false;
             } else {
                 match telemetry.phase {
                     LiveStreamPhase::AwaitingTtft => {
@@ -4918,6 +4978,14 @@ impl AcpThread {
                         let advanced = base_elapsed.saturating_add(delta_milliseconds);
                         telemetry.call_elapsed_ms = Some(advanced);
                         telemetry.chunk_gap_ms = Some(advanced);
+                    }
+                    LiveStreamPhase::Compacting => {
+                        telemetry.is_compacting = true;
+                        let base_elapsed = telemetry.call_elapsed_ms.unwrap_or(0);
+                        telemetry.call_elapsed_ms =
+                            Some(base_elapsed.saturating_add(delta_milliseconds));
+                        let base_gap = telemetry.chunk_gap_ms.unwrap_or(0);
+                        telemetry.chunk_gap_ms = Some(base_gap.saturating_add(delta_milliseconds));
                     }
                     LiveStreamPhase::StreamingThought
                     | LiveStreamPhase::StreamingResponse
@@ -4970,6 +5038,8 @@ impl AcpThread {
 
         let phase = if !is_generating {
             LiveStreamPhase::Idle
+        } else if is_compacting {
+            LiveStreamPhase::Compacting
         } else if has_active_tools {
             LiveStreamPhase::ExecutingTools
         } else if self.local_stream_tracker.first_chunk_at.is_none() {
@@ -5011,6 +5081,7 @@ impl AcpThread {
 
         LiveStreamTelemetry {
             phase,
+            is_compacting,
             call_elapsed_ms,
             chunk_gap_ms,
             ttft_ms,
@@ -6617,22 +6688,34 @@ impl AcpThread {
 
     pub fn push_context_compaction(
         &mut self,
-        compaction: ContextCompaction,
+        mut compaction: ContextCompaction,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ix) =
-            self.entries
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(ix, entry)| match entry {
-                    AgentThreadEntry::ContextCompaction(c) if &c.id == &compaction.id => Some(ix),
-                    _ => None,
-                })
+        if let Some((ix, previous_started_at, previous_duration)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, entry)| match entry {
+                AgentThreadEntry::ContextCompaction(c) if &c.id == &compaction.id => {
+                    Some((ix, c.started_at, c.completed_duration))
+                }
+                _ => None,
+            })
         {
+            compaction.started_at = compaction.started_at.or(previous_started_at);
+            if !compaction.is_in_progress() {
+                compaction.completed_duration = compaction
+                    .completed_duration
+                    .or(previous_duration)
+                    .or_else(|| compaction.started_at.map(|started| started.elapsed()));
+            }
             self.entries[ix] = AgentThreadEntry::ContextCompaction(compaction);
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
         } else {
+            if compaction.is_in_progress() {
+                compaction.started_at.get_or_insert_with(Instant::now);
+            }
             self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
         }
     }
@@ -6672,13 +6755,7 @@ impl AcpThread {
             return;
         }
 
-        let mut compaction = ContextCompaction {
-            id,
-            status: update.status.clone().into(),
-            error: None,
-            summary: MessageContent::default(),
-            meta: None,
-        };
+        let mut compaction = ContextCompaction::new(id, update.status.clone().into());
         compaction.apply_update(update, metadata, &language_registry, cx);
         self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
     }
@@ -6708,13 +6785,10 @@ impl AcpThread {
             cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
             return;
         }
-        let mut compaction = ContextCompaction {
-            id: ContextCompactionId(chunk.compaction_id.0),
-            status: ContextCompactionStatus::InProgress,
-            error: None,
-            summary: MessageContent::default(),
-            meta: None,
-        };
+        let mut compaction = ContextCompaction::new(
+            ContextCompactionId(chunk.compaction_id.0),
+            ContextCompactionStatus::InProgress,
+        );
         compaction.append_summary(chunk.content, &language_registry, cx);
         self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
     }
@@ -6747,6 +6821,13 @@ impl AcpThread {
         }
 
         if let Some(status) = update.status {
+            if status == ContextCompactionStatus::InProgress {
+                compaction.started_at.get_or_insert_with(Instant::now);
+            } else if compaction.completed_duration.is_none()
+                && let Some(started_at) = compaction.started_at
+            {
+                compaction.completed_duration = Some(started_at.elapsed());
+            }
             compaction.status = status;
         }
 
@@ -8564,21 +8645,31 @@ impl AcpThread {
             return Ok(None);
         };
         self.follow_up_interrupts_in_flight += 1;
+        cx.emit(AcpThreadEvent::StatusChanged);
+        cx.notify();
         Ok(Some(cx.spawn(async move |this, cx| {
-            let res = task.await;
-            this.update(cx, |this, cx| {
-                this.follow_up_interrupts_in_flight =
-                    this.follow_up_interrupts_in_flight.saturating_sub(1);
-                if this.follow_up_interrupts_in_flight == 0
-                    && this.pending_subagent_continuation
-                    && this.status() == ThreadStatus::Idle
-                    && !this.has_unsettled_submissions()
-                {
-                    this.request_subagent_continuation(cx);
+            let _decrement_guard = util::defer({
+                let this = this.clone();
+                let mut cx = cx.clone();
+                move || {
+                    this.update(&mut cx, |this, cx| {
+                        this.follow_up_interrupts_in_flight =
+                            this.follow_up_interrupts_in_flight.saturating_sub(1);
+                        if this.follow_up_interrupts_in_flight == 0 {
+                            if this.pending_subagent_continuation
+                                && this.status() == ThreadStatus::Idle
+                                && !this.has_unsettled_submissions()
+                            {
+                                this.request_subagent_continuation(cx);
+                            }
+                            cx.emit(AcpThreadEvent::StatusChanged);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
                 }
-            })
-            .ok();
-            res
+            });
+            task.await
         })))
     }
 
@@ -8753,10 +8844,14 @@ impl AcpThread {
                 Ok(())
             })));
         }
-        if cancel_subagents {
-            self.cancelling_follow_up_task = None;
-        }
-        if self.running_turn.is_some() {
+        let cancelled_follow_up_shared = if cancel_subagents {
+            self.cancelling_follow_up_task
+                .take()
+                .map(|(_, shared)| shared)
+        } else {
+            None
+        };
+        if self.running_turn.is_some() || cancelled_follow_up_shared.is_some() {
             if cancel_subagents {
                 self.connection.cancel(self.session_id(), cx)?;
             } else {
@@ -8768,6 +8863,7 @@ impl AcpThread {
 
         let Some(turn) = self.running_turn.take() else {
             if self.parent_session_id.is_some()
+                && cancelled_follow_up_shared.is_none()
                 && matches!(permission_outcome, RequestPermissionOutcome::Cancelled)
             {
                 self.connection.cancel(self.session_id(), cx)?;
@@ -8775,6 +8871,14 @@ impl AcpThread {
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);
+            }
+            if let Some(shared) = cancelled_follow_up_shared {
+                cx.emit(AcpThreadEvent::StatusChanged);
+                cx.notify();
+                return Ok(Some(cx.background_spawn(async move {
+                    shared.await;
+                    Ok(())
+                })));
             }
             if reuse_follow_up_task
                 && !cancel_subagents
@@ -8804,13 +8908,15 @@ impl AcpThread {
             let cleanup_shared = shared.clone();
             cx.spawn(async move |this, cx| {
                 cleanup_shared.await;
-                this.update(cx, |this, _| {
+                this.update(cx, |this, cx| {
                     if this
                         .cancelling_follow_up_task
                         .as_ref()
                         .is_some_and(|(id, _)| *id == turn_id)
                     {
                         this.cancelling_follow_up_task = None;
+                        cx.emit(AcpThreadEvent::StatusChanged);
+                        cx.notify();
                     }
                 })
                 .ok();
@@ -8951,6 +9057,11 @@ impl AcpThread {
                 AgentThreadEntry::ContextCompaction(compaction) => {
                     if compaction.status == ContextCompactionStatus::InProgress {
                         canceled_any = true;
+                        if compaction.completed_duration.is_none()
+                            && let Some(started_at) = compaction.started_at
+                        {
+                            compaction.completed_duration = Some(started_at.elapsed());
+                        }
                         compaction.status = ContextCompactionStatus::Canceled;
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
                     }
@@ -16888,13 +16999,10 @@ mod tests {
                     // (here a compaction) rather than echoing a user message.
                     thread.update(&mut cx, |thread, cx| {
                         thread.push_context_compaction(
-                            ContextCompaction {
-                                id: ContextCompactionId("c1".into()),
-                                status: ContextCompactionStatus::Completed,
-                                error: None,
-                                summary: MessageContent::default(),
-                                meta: None,
-                            },
+                            ContextCompaction::new(
+                                ContextCompactionId("c1".into()),
+                                ContextCompactionStatus::Completed,
+                            ),
                             cx,
                         );
                     })?;
@@ -20116,13 +20224,10 @@ mod tests {
                 "interrupted",
             ),
         ] {
-            let entry = AgentThreadEntry::ContextCompaction(ContextCompaction {
-                id: ContextCompactionId("compaction".into()),
-                status: status.into(),
-                error: None,
-                summary: MessageContent::default(),
-                meta: None,
-            });
+            let entry = AgentThreadEntry::ContextCompaction(ContextCompaction::new(
+                ContextCompactionId("compaction".into()),
+                status.into(),
+            ));
             assert_eq!(
                 entry.to_markdown(cx),
                 format!("## Context Compaction ({expected_label})\n\n")
@@ -23549,13 +23654,10 @@ mod tests {
 
                         thread.update(&mut cx, |thread, cx| {
                             thread.push_context_compaction(
-                                ContextCompaction {
-                                    id: compaction_id,
-                                    status: ContextCompactionStatus::InProgress,
-                                    error: None,
-                                    summary: MessageContent::default(),
-                                    meta: None,
-                                },
+                                ContextCompaction::new(
+                                    compaction_id,
+                                    ContextCompactionStatus::InProgress,
+                                ),
                                 cx,
                             );
                         })?;
@@ -24199,13 +24301,10 @@ mod tests {
                 .unwrap();
 
             thread.push_context_compaction(
-                ContextCompaction {
-                    id: ContextCompactionId("compaction-1".into()),
-                    status: ContextCompactionStatus::InProgress,
-                    error: None,
-                    summary: MessageContent::default(),
-                    meta: None,
-                },
+                ContextCompaction::new(
+                    ContextCompactionId("compaction-1".into()),
+                    ContextCompactionStatus::InProgress,
+                ),
                 cx,
             );
         });
@@ -28030,6 +28129,149 @@ mod tests {
                 thread.entries[0],
                 AgentThreadEntry::UserMessage(_)
             ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_metrics_and_live_compacting_phase(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("session");
+
+        let compaction_id = acp_v2::CompactionId::new("comp-live-1");
+        let mut initial_meta = acp_v2::Meta::new();
+        initial_meta.insert(
+            COMPACTION_METRICS_META_KEY.to_string(),
+            serde_json::json!({
+                "pre_tokens": 255_576_u64,
+            }),
+        );
+        thread.update(cx, |thread, cx| {
+            thread.upsert_context_compaction_update(
+                acp_v2::CompactionUpdate::new(
+                    compaction_id.clone(),
+                    acp_v2::CompactionStatus::InProgress,
+                )
+                .meta(initial_meta),
+                cx,
+            );
+            let mut usage_meta = acp_v1::Meta::new();
+            usage_meta.insert(
+                LIVE_TELEMETRY_META_KEY.to_string(),
+                serde_json::json!({
+                    "phase": "compacting",
+                    "is_compacting": true,
+                    "call_elapsed_ms": 14_200_u64,
+                    "ttft_ms": 3_150_u64,
+                    "input_tokens": 255_576_u64,
+                    "step_output_tokens": 480_u64,
+                    "output_tokens_per_sec": 42.5_f64,
+                }),
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(
+                        acp_v1::UsageUpdate::new(255_576, 1_000_000).meta(usage_meta),
+                    ),
+                    cx,
+                )
+                .expect("usage update");
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_compacting());
+            let live = thread.effective_live_telemetry();
+            assert_eq!(live.phase, LiveStreamPhase::Compacting);
+            assert!(live.is_compacting);
+            assert!(live.call_elapsed_ms.unwrap_or(0) >= 14_200);
+            assert_eq!(live.ttft_ms, Some(3_150));
+
+            let Some(AgentThreadEntry::ContextCompaction(compaction)) = thread.entries.first()
+            else {
+                panic!("expected ContextCompaction entry");
+            };
+            assert!(compaction.started_at.is_some());
+            assert_eq!(
+                compaction.metrics(),
+                Some(CompactionMetrics {
+                    pre_tokens: Some(255_576),
+                    post_tokens: None,
+                    duration_ms: None,
+                    ttft_ms: None,
+                    summary_tokens: None,
+                })
+            );
+        });
+
+        // Complete compaction with summary_tokens + duration_ms, then enrich post_tokens.
+        let mut completed_meta = acp_v2::Meta::new();
+        completed_meta.insert(
+            COMPACTION_METRICS_META_KEY.to_string(),
+            serde_json::json!({
+                "pre_tokens": 255_576_u64,
+                "duration_ms": 79_600_u64,
+                "ttft_ms": 3_150_u64,
+                "summary_tokens": 3_210_u64,
+            }),
+        );
+        thread.update(cx, |thread, cx| {
+            thread.upsert_context_compaction_update(
+                acp_v2::CompactionUpdate::new(
+                    compaction_id.clone(),
+                    acp_v2::CompactionStatus::Completed,
+                )
+                .summary(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "Compacted summary",
+                ))])
+                .meta(completed_meta),
+                cx,
+            );
+        });
+
+        let mut enriched_meta = acp_v2::Meta::new();
+        enriched_meta.insert(
+            COMPACTION_METRICS_META_KEY.to_string(),
+            serde_json::json!({
+                "pre_tokens": 255_576_u64,
+                "post_tokens": 31_600_u64,
+                "duration_ms": 79_600_u64,
+                "ttft_ms": 3_150_u64,
+                "summary_tokens": 3_210_u64,
+            }),
+        );
+        thread.update(cx, |thread, cx| {
+            thread.upsert_context_compaction_update(
+                acp_v2::CompactionUpdate::new(compaction_id, acp_v2::CompactionStatus::Completed)
+                    .meta(enriched_meta),
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_compacting());
+            let Some(AgentThreadEntry::ContextCompaction(compaction)) = thread.entries.first()
+            else {
+                panic!("expected ContextCompaction entry");
+            };
+            assert!(compaction.completed_duration.is_some());
+            assert_eq!(compaction.summary.blocks().len(), 1);
+            assert_eq!(
+                compaction.metrics(),
+                Some(CompactionMetrics {
+                    pre_tokens: Some(255_576),
+                    post_tokens: Some(31_600),
+                    duration_ms: Some(79_600),
+                    ttft_ms: Some(3_150),
+                    summary_tokens: Some(3_210),
+                })
+            );
         });
     }
 }

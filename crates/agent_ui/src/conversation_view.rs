@@ -22490,4 +22490,140 @@ pub(crate) mod tests {
             )],
         );
     }
+
+    #[gpui::test]
+    async fn test_send_now_keeps_pending_card_visible_when_collapsed_and_keeps_stop_active(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Queue a message, collapse the queue, and trigger "Send Now" while Turn 1 unwinds.
+        let queued_id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["queued while collapsed".into()], vec![], window, cx);
+            view.queue_expanded = false;
+            cx.notify();
+            view.message_queue.first_id().expect("queued entry")
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(queued_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(!view.queue_expanded);
+            assert!(view.pending_queued_dispatch.is_some());
+            assert!(
+                view.generating_indicator_in_list,
+                "bottom generating/cancelling indicator should remain active while Send Now unwinds"
+            );
+        });
+        assert!(
+            cx.debug_bounds("pending_queue_entry").is_some(),
+            "pending 'Sending…' card must remain visible even when queue_expanded is false"
+        );
+        assert!(
+            cx.debug_bounds("stop-generation").is_some(),
+            "Stop button must remain active while Send Now cancellation is in flight"
+        );
+
+        // Clicking Stop while Send Now is unwinding restores the message to the paused queue.
+        thread_view.update_in(cx, |view, _window, cx| {
+            view.cancel_generation(cx);
+        });
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("first turn unwind still pending");
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.pending_queued_dispatch.is_none());
+            assert!(!view.generating_indicator_in_list);
+            assert_eq!(view.message_queue.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_metrics_label_formatting_in_progress_and_completed(
+        _cx: &mut TestAppContext,
+    ) {
+        let mut in_progress = acp_thread::ContextCompaction::new(
+            acp_thread::ContextCompactionId("comp-1".into()),
+            acp_thread::ContextCompactionStatus::InProgress,
+        );
+        let mut meta = acp_v2::Meta::new();
+        meta.insert(
+            acp_thread::COMPACTION_METRICS_META_KEY.to_string(),
+            serde_json::json!({ "pre_tokens": 255_576_u64 }),
+        );
+        in_progress.meta = Some(meta);
+
+        let awaiting_live = acp_thread::LiveStreamTelemetry {
+            phase: acp_thread::LiveStreamPhase::Compacting,
+            is_compacting: true,
+            call_elapsed_ms: Some(5_400),
+            input_tokens: Some(255_576),
+            ..Default::default()
+        };
+        assert_eq!(
+            thread_view::format_compaction_metrics_label(&in_progress, Some(&awaiting_live), None,)
+                .as_deref(),
+            Some("5.4s · 256k in · awaiting first token"),
+        );
+
+        let streaming_live = acp_thread::LiveStreamTelemetry {
+            phase: acp_thread::LiveStreamPhase::Compacting,
+            is_compacting: true,
+            call_elapsed_ms: Some(14_200),
+            ttft_ms: Some(3_150),
+            input_tokens: Some(255_576),
+            step_output_tokens: Some(480),
+            output_tokens_per_sec: Some(42.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            thread_view::format_compaction_metrics_label(
+                &in_progress,
+                Some(&streaming_live),
+                None,
+            )
+            .as_deref(),
+            Some("14.2s · 256k in · TTFT 3.1s · ↓ 480 (42.5/s)"),
+        );
+
+        let mut completed = acp_thread::ContextCompaction::new(
+            acp_thread::ContextCompactionId("comp-1".into()),
+            acp_thread::ContextCompactionStatus::Completed,
+        );
+        let mut completed_meta = acp_v2::Meta::new();
+        completed_meta.insert(
+            acp_thread::COMPACTION_METRICS_META_KEY.to_string(),
+            serde_json::json!({
+                "pre_tokens": 255_576_u64,
+                "post_tokens": 31_600_u64,
+                "duration_ms": 79_600_u64,
+                "summary_tokens": 3_210_u64,
+            }),
+        );
+        completed.meta = Some(completed_meta);
+        assert_eq!(
+            thread_view::format_compaction_metrics_label(&completed, None, None).as_deref(),
+            Some("256k → 32k (-88%) · 1m 19s"),
+        );
+    }
 }
