@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use settings::{Settings, SettingsStore};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Formatter, Write};
 use std::ops::Range;
@@ -3814,6 +3814,187 @@ pub fn refusal_fallback_model_from_meta(meta: &Option<acp_v2::Meta>) -> Option<S
         .map(|s| SharedString::from(s.to_owned()))
 }
 
+pub const LIVE_TELEMETRY_META_KEY: &str = "live_telemetry";
+
+const LOCAL_RATE_WINDOW: Duration = Duration::from_secs(3);
+const SERVER_BUFFER_GAP_THRESHOLD_MS: u64 = 2_500;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveStreamPhase {
+    AwaitingTtft,
+    StreamingThought,
+    StreamingResponse,
+    StreamingToolCall,
+    BufferingToolCall,
+    ExecutingTools,
+    #[default]
+    Idle,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LiveStreamTelemetry {
+    #[serde(default)]
+    pub phase: LiveStreamPhase,
+    #[serde(default)]
+    pub call_elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub chunk_gap_ms: Option<u64>,
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub turn_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub step_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub streamed_bytes: Option<u64>,
+    #[serde(default)]
+    pub input_tokens_per_sec: Option<f64>,
+    #[serde(default)]
+    pub output_tokens_per_sec: Option<f64>,
+    #[serde(default)]
+    pub active_tool_name: Option<SharedString>,
+    #[serde(default)]
+    pub compaction_threshold_tokens: Option<u64>,
+}
+
+pub fn live_telemetry_from_meta(meta: &Option<acp_v2::Meta>) -> Option<LiveStreamTelemetry> {
+    let value = meta.as_ref()?.get(LIVE_TELEMETRY_META_KEY)?;
+    serde_json::from_value(value.clone()).ok()
+}
+
+#[derive(Default)]
+struct LocalStreamTracker {
+    request_started_at: Option<Instant>,
+    first_chunk_at: Option<Instant>,
+    last_chunk_at: Option<Instant>,
+    last_ttft_ms: Option<u64>,
+    last_input_tokens_per_sec: Option<f64>,
+    last_output_tokens_per_sec: Option<f64>,
+    current_phase: LiveStreamPhase,
+    step_streamed_bytes: u64,
+    turn_streamed_bytes: u64,
+    cached_read_tokens: Option<u64>,
+    rate_samples: VecDeque<(Instant, u64)>,
+}
+
+impl LocalStreamTracker {
+    fn on_generation_started(&mut self, now: Instant) {
+        self.request_started_at = Some(now);
+        self.first_chunk_at = None;
+        self.last_chunk_at = None;
+        self.last_ttft_ms = None;
+        self.last_input_tokens_per_sec = None;
+        self.last_output_tokens_per_sec = None;
+        self.step_streamed_bytes = 0;
+        self.turn_streamed_bytes = 0;
+        self.current_phase = LiveStreamPhase::AwaitingTtft;
+        self.rate_samples.clear();
+    }
+
+    fn on_chunk(&mut self, chunk_byte_length: usize, is_thought: bool, now: Instant) {
+        if self.request_started_at.is_none() {
+            self.request_started_at = Some(now);
+        }
+        if self.first_chunk_at.is_none() {
+            self.first_chunk_at = Some(now);
+            if let Some(started_at) = self.request_started_at {
+                let elapsed_milliseconds = now.saturating_duration_since(started_at).as_millis();
+                let clamped = u64::try_from(elapsed_milliseconds)
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.last_ttft_ms = Some(clamped);
+            }
+        }
+        self.last_chunk_at = Some(now);
+        self.step_streamed_bytes = self
+            .step_streamed_bytes
+            .saturating_add(chunk_byte_length as u64);
+        self.turn_streamed_bytes = self
+            .turn_streamed_bytes
+            .saturating_add(chunk_byte_length as u64);
+        self.current_phase = if is_thought {
+            LiveStreamPhase::StreamingThought
+        } else {
+            LiveStreamPhase::StreamingResponse
+        };
+
+        let estimated_tokens = self.turn_streamed_bytes.saturating_add(3) / 4;
+        self.rate_samples.push_back((now, estimated_tokens));
+        while self.rate_samples.len() > 2 {
+            let Some((oldest_timestamp, _)) = self.rate_samples.front() else {
+                break;
+            };
+            if now.saturating_duration_since(*oldest_timestamp) > LOCAL_RATE_WINDOW {
+                self.rate_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if let (Some((start_timestamp, start_tokens)), Some((end_timestamp, end_tokens))) =
+            (self.rate_samples.front(), self.rate_samples.back())
+        {
+            let duration_seconds = end_timestamp
+                .saturating_duration_since(*start_timestamp)
+                .as_secs_f64();
+            if duration_seconds >= 0.08 && end_tokens > start_tokens {
+                self.last_output_tokens_per_sec =
+                    Some((end_tokens - start_tokens) as f64 / duration_seconds);
+            }
+        }
+    }
+
+    fn on_tool_call_active(&mut self) {
+        self.current_phase = LiveStreamPhase::ExecutingTools;
+    }
+
+    fn on_all_tool_calls_settled(&mut self, now: Instant) {
+        self.request_started_at = Some(now);
+        self.first_chunk_at = None;
+        self.last_chunk_at = None;
+        self.step_streamed_bytes = 0;
+        self.current_phase = LiveStreamPhase::AwaitingTtft;
+        self.rate_samples.clear();
+    }
+
+    fn on_token_usage_updated(&mut self, usage: Option<&TokenUsage>, now: Instant) {
+        let Some(usage) = usage else {
+            self.cached_read_tokens = None;
+            return;
+        };
+        if usage.input_tokens > 0
+            && let Some(ttft_milliseconds) =
+                self.last_ttft_ms.filter(|&milliseconds| milliseconds > 0)
+        {
+            self.last_input_tokens_per_sec =
+                Some(usage.input_tokens as f64 / (ttft_milliseconds as f64 / 1_000.0));
+        }
+        if usage.output_tokens > 0
+            && let Some(first_chunk_at) = self.first_chunk_at
+        {
+            let decode_seconds = now
+                .saturating_duration_since(first_chunk_at)
+                .as_secs_f64()
+                .max(0.05);
+            self.last_output_tokens_per_sec = Some(usage.output_tokens as f64 / decode_seconds);
+        }
+    }
+
+    fn on_generation_stopped(&mut self) {
+        self.current_phase = LiveStreamPhase::Idle;
+        self.request_started_at = None;
+        self.first_chunk_at = None;
+        self.last_chunk_at = None;
+    }
+}
+
 struct RunningTurn {
     id: u32,
     first_entry_index: usize,
@@ -3864,6 +4045,8 @@ pub struct AcpThread {
     /// message to it after it has received later ones.
     subagent_outcomes: Vec<(usize, acp_v2::StateUpdate)>,
     reported_usage: Option<ReportedTokenUsage>,
+    reported_live_telemetry: Option<(LiveStreamTelemetry, Instant)>,
+    local_stream_tracker: LocalStreamTracker,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp_v2::PromptCapabilities,
@@ -4230,6 +4413,8 @@ impl AcpThread {
             received_session_state: false,
             subagent_outcomes: Vec::new(),
             reported_usage: None,
+            reported_live_telemetry: None,
+            local_stream_tracker: LocalStreamTracker::default(),
             connection,
             token_usage: None,
             cost: None,
@@ -4709,6 +4894,160 @@ impl AcpThread {
         self.token_usage.as_ref()
     }
 
+    pub fn has_reported_live_telemetry(&self) -> bool {
+        self.reported_live_telemetry.is_some()
+    }
+
+    pub fn set_local_cached_read_tokens(&mut self, cached_read_tokens: Option<u64>) {
+        self.local_stream_tracker.cached_read_tokens = cached_read_tokens;
+    }
+
+    pub fn effective_live_telemetry(&self) -> LiveStreamTelemetry {
+        let is_generating = self.status() == ThreadStatus::Generating;
+        let has_active_tools = is_generating && self.has_in_progress_tool_calls();
+
+        if let Some((mut telemetry, reported_at)) = self.reported_live_telemetry.clone() {
+            let delta_milliseconds =
+                u64::try_from(reported_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if !is_generating {
+                telemetry.phase = LiveStreamPhase::Idle;
+            } else {
+                match telemetry.phase {
+                    LiveStreamPhase::AwaitingTtft => {
+                        let base_elapsed = telemetry.call_elapsed_ms.unwrap_or(0);
+                        let advanced = base_elapsed.saturating_add(delta_milliseconds);
+                        telemetry.call_elapsed_ms = Some(advanced);
+                        telemetry.chunk_gap_ms = Some(advanced);
+                    }
+                    LiveStreamPhase::StreamingThought
+                    | LiveStreamPhase::StreamingResponse
+                    | LiveStreamPhase::StreamingToolCall
+                    | LiveStreamPhase::BufferingToolCall => {
+                        if let Some(base_elapsed) = telemetry.call_elapsed_ms {
+                            telemetry.call_elapsed_ms =
+                                Some(base_elapsed.saturating_add(delta_milliseconds));
+                        }
+                        let base_gap = telemetry.chunk_gap_ms.unwrap_or(0);
+                        let advanced_gap = base_gap.saturating_add(delta_milliseconds);
+                        telemetry.chunk_gap_ms = Some(advanced_gap);
+                        if advanced_gap >= SERVER_BUFFER_GAP_THRESHOLD_MS
+                            && matches!(
+                                telemetry.phase,
+                                LiveStreamPhase::StreamingThought
+                                    | LiveStreamPhase::StreamingToolCall
+                            )
+                        {
+                            telemetry.phase = LiveStreamPhase::BufferingToolCall;
+                        }
+                    }
+                    LiveStreamPhase::Idle | LiveStreamPhase::Unknown if has_active_tools => {
+                        telemetry.phase = LiveStreamPhase::ExecutingTools;
+                    }
+                    LiveStreamPhase::ExecutingTools
+                    | LiveStreamPhase::Idle
+                    | LiveStreamPhase::Unknown => {}
+                }
+            }
+            return telemetry;
+        }
+
+        let now = Instant::now();
+        let call_elapsed_ms = self
+            .local_stream_tracker
+            .request_started_at
+            .map(|started_at| {
+                u64::try_from(now.saturating_duration_since(started_at).as_millis())
+                    .unwrap_or(u64::MAX)
+            });
+        let chunk_gap_ms = self
+            .local_stream_tracker
+            .last_chunk_at
+            .map(|last_chunk_at| {
+                u64::try_from(now.saturating_duration_since(last_chunk_at).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+            .or(call_elapsed_ms);
+
+        let phase = if !is_generating {
+            LiveStreamPhase::Idle
+        } else if has_active_tools {
+            LiveStreamPhase::ExecutingTools
+        } else if self.local_stream_tracker.first_chunk_at.is_none() {
+            LiveStreamPhase::AwaitingTtft
+        } else if chunk_gap_ms.unwrap_or(0) >= SERVER_BUFFER_GAP_THRESHOLD_MS
+            && self.local_stream_tracker.current_phase == LiveStreamPhase::StreamingThought
+        {
+            LiveStreamPhase::BufferingToolCall
+        } else {
+            self.local_stream_tracker.current_phase
+        };
+
+        let ttft_ms = if phase == LiveStreamPhase::AwaitingTtft {
+            None
+        } else {
+            self.local_stream_tracker.last_ttft_ms
+        };
+        let estimated_turn_tokens =
+            (self.local_stream_tracker.turn_streamed_bytes > 0).then(|| {
+                self.local_stream_tracker
+                    .turn_streamed_bytes
+                    .saturating_add(3)
+                    / 4
+            });
+        let input_tokens = self
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.input_tokens)
+            .filter(|&tokens| tokens > 0);
+        let turn_output_tokens = self
+            .reported_activity_output_tokens()
+            .or(estimated_turn_tokens)
+            .or_else(|| {
+                self.token_usage
+                    .as_ref()
+                    .map(|usage| usage.output_tokens)
+                    .filter(|&tokens| tokens > 0)
+            });
+
+        LiveStreamTelemetry {
+            phase,
+            call_elapsed_ms,
+            chunk_gap_ms,
+            ttft_ms,
+            input_tokens,
+            cached_read_tokens: self.local_stream_tracker.cached_read_tokens,
+            turn_output_tokens,
+            step_output_tokens: (self.local_stream_tracker.step_streamed_bytes > 0).then(|| {
+                self.local_stream_tracker
+                    .step_streamed_bytes
+                    .saturating_add(3)
+                    / 4
+            }),
+            streamed_bytes: (self.local_stream_tracker.step_streamed_bytes > 0)
+                .then_some(self.local_stream_tracker.step_streamed_bytes),
+            input_tokens_per_sec: if phase == LiveStreamPhase::AwaitingTtft {
+                None
+            } else {
+                self.local_stream_tracker.last_input_tokens_per_sec
+            },
+            output_tokens_per_sec: self.local_stream_tracker.last_output_tokens_per_sec,
+            active_tool_name: None,
+            compaction_threshold_tokens: None,
+        }
+    }
+
+    fn sync_local_stream_tracker_with_tools(&mut self) {
+        if self.status() != ThreadStatus::Generating {
+            return;
+        }
+        if self.has_in_progress_tool_calls() {
+            self.local_stream_tracker.on_tool_call_active();
+        } else if self.local_stream_tracker.current_phase == LiveStreamPhase::ExecutingTools {
+            self.local_stream_tracker
+                .on_all_tool_calls_settled(Instant::now());
+        }
+    }
+
     pub fn submission(&self, id: SubmissionId) -> Option<&SubmissionRecord> {
         self.submissions.get(id)
     }
@@ -4942,11 +5281,35 @@ impl AcpThread {
 
     fn set_foreground_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
         let previous_generation = self.activity.generation();
+        let was_active = self.foreground_activity().is_active();
         self.activity
             .update(state, self.entries.len().saturating_sub(1));
+        let now_active = self.foreground_activity().is_active();
         if self.activity.generation() != previous_generation {
             self.had_error = false;
             self.local_execution_error = None;
+            if now_active {
+                let now = Instant::now();
+                self.local_stream_tracker.on_generation_started(now);
+                if let Some((telemetry, reported_at)) = &mut self.reported_live_telemetry {
+                    telemetry.phase = LiveStreamPhase::AwaitingTtft;
+                    telemetry.call_elapsed_ms = Some(0);
+                    telemetry.chunk_gap_ms = Some(0);
+                    telemetry.ttft_ms = None;
+                    telemetry.turn_output_tokens = Some(0);
+                    telemetry.step_output_tokens = Some(0);
+                    telemetry.streamed_bytes = Some(0);
+                    telemetry.input_tokens_per_sec = None;
+                    telemetry.output_tokens_per_sec = None;
+                    telemetry.active_tool_name = None;
+                    *reported_at = now;
+                }
+            }
+        } else if was_active && self.foreground_activity() == ForegroundActivity::Idle {
+            self.local_stream_tracker.on_generation_stopped();
+            if let Some((telemetry, _)) = &mut self.reported_live_telemetry {
+                telemetry.phase = LiveStreamPhase::Idle;
+            }
         }
         cx.notify();
     }
@@ -5591,6 +5954,16 @@ impl AcpThread {
         previous_entry_count: usize,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if matches!(kind, MessageKind::Assistant | MessageKind::Thought)
+            && let acp_v2::ContentBlock::Text(text) = &content
+            && !text.text.is_empty()
+        {
+            self.local_stream_tracker.on_chunk(
+                text.text.len(),
+                kind == MessageKind::Thought,
+                Instant::now(),
+            );
+        }
         let content = match content {
             acp_v2::ContentBlock::Text(text) => {
                 let (content, _) = location
@@ -5963,6 +6336,12 @@ impl AcpThread {
         indented: bool,
         cx: &mut Context<Self>,
     ) {
+        if let acp_v2::ContentBlock::Text(text) = &chunk
+            && !text.text.is_empty()
+        {
+            self.local_stream_tracker
+                .on_chunk(text.text.len(), is_thought, Instant::now());
+        }
         let path_style = self.project.read(cx).path_style(cx);
 
         // For text chunks going to an existing Markdown block, buffer for smooth
@@ -6448,7 +6827,10 @@ impl AcpThread {
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
         if usage.is_none() {
             self.cost = None;
+            self.reported_live_telemetry = None;
         }
+        self.local_stream_tracker
+            .on_token_usage_updated(usage.as_ref(), Instant::now());
         let output = usage
             .as_ref()
             .map_or(OutputTokensUpdate::Unchanged, |usage| {
@@ -6462,9 +6844,22 @@ impl AcpThread {
     }
 
     pub fn update_usage(&mut self, update: acp_v2::UsageUpdate, cx: &mut Context<Self>) {
+        let live_telemetry = live_telemetry_from_meta(&update.meta);
         let usage = self.token_usage.get_or_insert_with(Default::default);
         usage.max_tokens = update.size;
         usage.used_tokens = update.used;
+        if let Some(telemetry) = &live_telemetry {
+            if let Some(input_tokens) = telemetry.input_tokens.filter(|&tokens| tokens > 0) {
+                usage.input_tokens = input_tokens;
+            }
+            if let Some(output_tokens) = telemetry
+                .turn_output_tokens
+                .or(telemetry.step_output_tokens)
+                .filter(|&tokens| tokens > 0)
+            {
+                usage.output_tokens = output_tokens;
+            }
+        }
         match update.cost {
             MaybeUndefined::Undefined => {}
             MaybeUndefined::Null => self.cost = None,
@@ -6476,9 +6871,26 @@ impl AcpThread {
                 });
             }
         }
-        cx.emit(AcpThreadEvent::TokenUsageUpdated(
-            OutputTokensUpdate::Unchanged,
-        ));
+        let mut output_update = OutputTokensUpdate::Unchanged;
+        if let Some(telemetry) = live_telemetry {
+            if let Some(turn_output_tokens) =
+                telemetry.turn_output_tokens.filter(|&tokens| tokens > 0)
+            {
+                let activity_generation = self.activity.generation();
+                self.reported_usage = Some(ReportedTokenUsage {
+                    activity_generation,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: turn_output_tokens,
+                });
+                output_update = OutputTokensUpdate::Snapshot {
+                    activity_generation,
+                    output_tokens: turn_output_tokens,
+                };
+            }
+            self.reported_live_telemetry = Some((telemetry, Instant::now()));
+        }
+        cx.emit(AcpThreadEvent::TokenUsageUpdated(output_update));
+        cx.notify();
     }
 
     pub fn update_retry_status(&mut self, status: RetryStatus, cx: &mut Context<Self>) {
@@ -6581,6 +6993,7 @@ impl AcpThread {
                 if location_updated {
                     self.resolve_locations(id, cx);
                 }
+                self.sync_local_stream_tracker_with_tools();
                 cx.emit(AcpThreadEvent::EntryUpdated(index));
                 if settled_at_boundary
                     && self.end_turn_at_next_boundary
@@ -6756,6 +7169,7 @@ impl AcpThread {
         };
 
         self.resolve_locations(id, cx);
+        self.sync_local_stream_tracker_with_tools();
         Ok(())
     }
 
@@ -6822,6 +7236,7 @@ impl AcpThread {
         if locations_changed {
             self.resolve_locations(id, cx);
         }
+        self.sync_local_stream_tracker_with_tools();
         Ok(())
     }
 
@@ -23957,6 +24372,91 @@ mod tests {
                 "cost should be cleared when token usage is cleared"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_live_telemetry_populates_rates_latency_and_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let observed_updates = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update({
+            let observed_updates = observed_updates.clone();
+            let thread = thread.clone();
+            move |cx| {
+                cx.subscribe(&thread, move |_, event, _| {
+                    if let AcpThreadEvent::TokenUsageUpdated(update) = event {
+                        observed_updates.borrow_mut().push(*update);
+                    }
+                })
+                .detach();
+            }
+        });
+
+        thread.update(cx, |thread, cx| {
+            let mut meta = acp_v1::Meta::new();
+            meta.insert(
+                LIVE_TELEMETRY_META_KEY.to_string(),
+                serde_json::json!({
+                    "phase": "streaming_thought",
+                    "call_elapsed_ms": 11_400,
+                    "chunk_gap_ms": 120,
+                    "ttft_ms": 6_850,
+                    "input_tokens": 164_120,
+                    "cached_read_tokens": 159_800,
+                    "turn_output_tokens": 1_880,
+                    "step_output_tokens": 1_880,
+                    "streamed_bytes": 7_520,
+                    "input_tokens_per_sec": 23_959.1,
+                    "output_tokens_per_sec": 102.4,
+                    "compaction_threshold_tokens": 256_000
+                }),
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(
+                        acp_v1::UsageUpdate::new(166_000, 1_048_576).meta(meta),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.used_tokens, 166_000);
+            assert_eq!(usage.max_tokens, 1_048_576);
+            assert_eq!(usage.input_tokens, 164_120);
+            assert_eq!(usage.output_tokens, 1_880);
+            assert!(thread.has_reported_live_telemetry());
+
+            let telemetry = thread.effective_live_telemetry();
+            assert_eq!(telemetry.phase, LiveStreamPhase::Idle);
+            assert_eq!(telemetry.ttft_ms, Some(6_850));
+            assert_eq!(telemetry.cached_read_tokens, Some(159_800));
+            assert_eq!(telemetry.turn_output_tokens, Some(1_880));
+            assert_eq!(telemetry.compaction_threshold_tokens, Some(256_000));
+            assert_eq!(telemetry.output_tokens_per_sec, Some(102.4));
+        });
+
+        assert_eq!(
+            observed_updates.borrow().as_slice(),
+            &[OutputTokensUpdate::Snapshot {
+                activity_generation: 0,
+                output_tokens: 1_880,
+            }]
+        );
     }
 
     /// Regression test: if the inner send_task is cancelled before it can

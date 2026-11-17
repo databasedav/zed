@@ -106,8 +106,8 @@ use crate::{
     ToggleThinkingMode, UndoLastReject,
 };
 
-const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
-const TOKEN_THRESHOLD: u64 = 250;
+const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(1);
+const LIVE_METRICS_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -5842,6 +5842,133 @@ pub(crate) mod tests {
             view.read_with(cx, |view, _| view.turn_fields.last_turn_tokens),
             Some(8)
         );
+    }
+
+    #[gpui::test]
+    async fn test_live_telemetry_usage_updates_drive_legacy_turn_metrics(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let complete = connection.defer_next_prompt_response();
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("live telemetry prompt", window, cx);
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            let mut meta = acp_v2::Meta::new();
+            meta.insert(
+                acp_thread::LIVE_TELEMETRY_META_KEY.to_string(),
+                serde_json::json!({
+                    "phase": "streaming_thought",
+                    "call_elapsed_ms": 8_500,
+                    "chunk_gap_ms": 90,
+                    "ttft_ms": 4_200,
+                    "input_tokens": 164_000,
+                    "cached_read_tokens": 160_000,
+                    "turn_output_tokens": 1_880,
+                    "step_output_tokens": 1_880,
+                    "input_tokens_per_sec": 39_047.6,
+                    "output_tokens_per_sec": 98.5,
+                    "compaction_threshold_tokens": 256_000
+                }),
+            );
+            thread.update_usage(acp_v2::UsageUpdate::new(165_880, 1_048_576).meta(meta), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.turn_fields.turn_tokens),
+            Some(1_880)
+        );
+        thread.read_with(cx, |thread, _| {
+            let live = thread.effective_live_telemetry();
+            assert_eq!(live.phase, acp_thread::LiveStreamPhase::StreamingThought);
+            assert_eq!(live.ttft_ms, Some(4_200));
+            assert_eq!(live.output_tokens_per_sec, Some(98.5));
+        });
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("legacy completion");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.turn_fields.last_turn_tokens, Some(1_880));
+            let final_telemetry = view
+                .turn_fields
+                .last_turn_telemetry
+                .as_ref()
+                .expect("last_turn_telemetry should be preserved");
+            assert_eq!(final_telemetry.phase, acp_thread::LiveStreamPhase::Idle);
+            assert_eq!(final_telemetry.ttft_ms, Some(4_200));
+            assert_eq!(final_telemetry.input_tokens, Some(164_000));
+            assert_eq!(final_telemetry.cached_read_tokens, Some(160_000));
+            assert_eq!(final_telemetry.output_tokens_per_sec, Some(98.5));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_terminal_command_does_not_suppress_generating_spinner_after_new_messages(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let complete = connection.defer_next_prompt_response();
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("run command in background", window, cx);
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("bg-exec-1", "Running server")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+                .expect("insert in-progress terminal tool call");
+        });
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, app_cx| view
+                .is_blocked_on_terminal_command(app_cx)),
+            "active trailing Execute tool call should report blocked on terminal"
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                        "Continuing analysis while background process runs.".into(),
+                    )),
+                    cx,
+                )
+                .expect("append thought chunk after background terminal");
+        });
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |view, app_cx| view
+                .is_blocked_on_terminal_command(app_cx)),
+            "subsequent assistant thought/message must unhide the generating spinner"
+        );
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("complete turn");
+        cx.run_until_parked();
     }
 
     #[gpui::test]

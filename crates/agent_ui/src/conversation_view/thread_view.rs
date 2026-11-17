@@ -13,10 +13,10 @@ use std::{
 };
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
-    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    SessionMessageSide, SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation,
-    decode_path_escapes,
+    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, LiveStreamPhase,
+    LiveStreamTelemetry, OutputTokensUpdate, SandboxAuthorizationDetails,
+    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, SessionMessageSide, SubmissionId,
+    SubmissionResponse, SubmissionState, ToolCallLocation, decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -895,6 +895,7 @@ pub struct TurnFields {
     pub _turn_timer_task: Option<Task<()>>,
     pub last_turn_duration: Option<Duration>,
     pub last_turn_tokens: Option<u64>,
+    pub last_turn_telemetry: Option<LiveStreamTelemetry>,
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
@@ -1841,10 +1842,13 @@ impl ThreadView {
         self.turn_fields.turn_started_at = Some(Instant::now());
         self.turn_fields.last_turn_duration = None;
         self.turn_fields.last_turn_tokens = None;
+        self.turn_fields.last_turn_telemetry = None;
         self.turn_fields.turn_tokens = Some(0);
         self.turn_fields._turn_timer_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(LIVE_METRICS_TICK_INTERVAL)
+                    .await;
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
@@ -1853,7 +1857,7 @@ impl ThreadView {
         generation
     }
 
-    pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
+    pub fn stop_turn(&mut self, generation: usize, cx: &mut Context<Self>) {
         if self.turn_fields.turn_generation != generation {
             return;
         }
@@ -1863,19 +1867,35 @@ impl ThreadView {
             .take()
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
+        self.turn_fields.last_turn_telemetry =
+            Some(self.thread.read(cx).effective_live_telemetry());
         self.turn_fields._turn_timer_task = None;
     }
 
     pub(crate) fn sync_reported_activity(&mut self, cx: &mut Context<Self>) {
-        let thread = self.thread.read(cx);
-        if !thread.uses_reported_activity() {
+        let (
+            uses_reported_activity,
+            activity,
+            activity_generation,
+            started_at,
+            duration,
+            output_tokens,
+            live_telemetry,
+        ) = {
+            let thread = self.thread.read(cx);
+            (
+                thread.uses_reported_activity(),
+                thread.foreground_activity(),
+                thread.activity_generation(),
+                thread.activity_started_at(),
+                thread.activity_duration(),
+                thread.reported_activity_output_tokens(),
+                thread.effective_live_telemetry(),
+            )
+        };
+        if !uses_reported_activity {
             return;
         }
-        let activity = thread.foreground_activity();
-        let activity_generation = thread.activity_generation();
-        let started_at = thread.activity_started_at();
-        let duration = thread.activity_duration();
-        let output_tokens = thread.reported_activity_output_tokens();
 
         match activity {
             ForegroundActivity::Unconfirmed => {
@@ -1889,6 +1909,9 @@ impl ThreadView {
                     self.turn_fields.turn_started_at = started_at;
                     self.turn_fields.reported_activity_generation = Some(activity_generation);
                 }
+                if let Some(output_tokens) = output_tokens {
+                    self.turn_fields.turn_tokens = Some(output_tokens);
+                }
             }
             ForegroundActivity::Idle => {
                 if self.turn_fields.turn_started_at.is_some() {
@@ -1896,12 +1919,14 @@ impl ThreadView {
                 }
                 if self.turn_fields.reported_activity_generation != Some(activity_generation) {
                     self.turn_fields.last_turn_tokens = None;
+                    self.turn_fields.last_turn_telemetry = None;
                 }
                 self.turn_fields.reported_activity_generation = Some(activity_generation);
                 self.turn_fields.last_turn_duration = duration;
                 if let Some(output_tokens) = output_tokens {
                     self.turn_fields.last_turn_tokens = Some(output_tokens);
                 }
+                self.turn_fields.last_turn_telemetry = Some(live_telemetry);
             }
         }
         cx.notify();
@@ -2229,7 +2254,23 @@ impl ThreadView {
 
     pub fn update_turn_tokens(&mut self, update: OutputTokensUpdate, cx: &mut Context<Self>) {
         match update {
-            OutputTokensUpdate::Unchanged => {}
+            OutputTokensUpdate::Unchanged => {
+                let (uses_reported_activity, has_reported_live_telemetry, live_telemetry) = {
+                    let thread = self.thread.read(cx);
+                    (
+                        thread.uses_reported_activity(),
+                        thread.has_reported_live_telemetry(),
+                        thread.effective_live_telemetry(),
+                    )
+                };
+                if !uses_reported_activity
+                    && self.turn_fields.turn_started_at.is_none()
+                    && has_reported_live_telemetry
+                {
+                    self.turn_fields.last_turn_telemetry = Some(live_telemetry);
+                }
+                cx.notify();
+            }
             OutputTokensUpdate::LegacyAdd {
                 activity_generation,
                 output_tokens,
@@ -2243,15 +2284,27 @@ impl ThreadView {
                 if let Some(tokens) = &mut self.turn_fields.turn_tokens {
                     *tokens += output_tokens;
                 }
+                cx.notify();
             }
             OutputTokensUpdate::Snapshot {
                 activity_generation,
-                ..
+                output_tokens,
             } => {
                 if self.thread.read(cx).activity_generation() != activity_generation {
                     return;
                 }
-                self.sync_reported_activity(cx);
+                if self.thread.read(cx).uses_reported_activity() {
+                    self.sync_reported_activity(cx);
+                } else {
+                    if self.turn_fields.turn_started_at.is_some() {
+                        self.turn_fields.turn_tokens = Some(output_tokens);
+                    } else if output_tokens > 0 {
+                        self.turn_fields.last_turn_tokens = Some(output_tokens);
+                        self.turn_fields.last_turn_telemetry =
+                            Some(self.thread.read(cx).effective_live_telemetry());
+                    }
+                    cx.notify();
+                }
             }
         }
         self.emit_token_limit_telemetry_if_needed(cx);
@@ -7424,6 +7477,61 @@ impl ThreadView {
         let input_max_label = crate::humanize_token_count(max_input_tokens);
         let output_max_label = crate::humanize_token_count(max_output_tokens);
 
+        let live_telemetry = self.thread.read(cx).effective_live_telemetry();
+        let compaction_threshold_label = live_telemetry
+            .compaction_threshold_tokens
+            .filter(|&threshold| {
+                threshold > 0 && (usage.max_tokens == 0 || threshold < usage.max_tokens)
+            })
+            .map(|threshold| {
+                format!(
+                    "Auto-compacts at {}",
+                    crate::humanize_token_count(threshold)
+                )
+            });
+        let cache_summary_label = live_telemetry
+            .cached_read_tokens
+            .filter(|&cached_tokens| cached_tokens > 0)
+            .map(|cached_tokens| {
+                let reference_input = live_telemetry.input_tokens.unwrap_or(usage.input_tokens);
+                if reference_input > 0 {
+                    let cache_percent = ((cached_tokens as f64 / reference_input as f64) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u32;
+                    format!(
+                        "{} cached ({cache_percent}%)",
+                        crate::humanize_token_count(cached_tokens)
+                    )
+                } else {
+                    format!("{} cached", crate::humanize_token_count(cached_tokens))
+                }
+            });
+        let latency_and_rates_label = {
+            let mut segments = Vec::new();
+            if let Some(ttft_milliseconds) = live_telemetry
+                .ttft_ms
+                .filter(|&milliseconds| milliseconds > 0)
+            {
+                segments.push(format!(
+                    "TTFT {}",
+                    format_latency_milliseconds(ttft_milliseconds)
+                ));
+            }
+            if let Some(input_rate) = live_telemetry
+                .input_tokens_per_sec
+                .filter(|&rate| rate > 0.0)
+            {
+                segments.push(format!("↑ {}", format_tokens_per_second(input_rate)));
+            }
+            if let Some(output_rate) = live_telemetry
+                .output_tokens_per_sec
+                .filter(|&rate| rate > 0.0)
+            {
+                segments.push(format!("↓ {}", format_tokens_per_second(output_rate)));
+            }
+            (!segments.is_empty()).then(|| segments.join(" • "))
+        };
+
         let build_tooltip = {
             move |_window: &mut Window, cx: &mut App| {
                 let percentage = percentage.clone();
@@ -7436,6 +7544,9 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let compaction_threshold_label = compaction_threshold_label.clone();
+                let cache_summary_label = cache_summary_label.clone();
+                let latency_and_rates_label = latency_and_rates_label.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -7446,6 +7557,9 @@ impl ThreadView {
                     output_max: output_max_label,
                     show_split,
                     cost_label,
+                    compaction_threshold_label,
+                    cache_summary_label,
+                    latency_and_rates_label,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
                     project_rules_count,
@@ -8408,6 +8522,41 @@ impl ThreadView {
     }
 }
 
+fn format_latency_milliseconds(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds}ms")
+    } else if milliseconds < 60_000 {
+        format!("{:.1}s", milliseconds as f64 / 1_000.0)
+    } else {
+        let minutes = milliseconds / 60_000;
+        let seconds = (milliseconds % 60_000) / 1_000;
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn format_tokens_per_second(tokens_per_second: f64) -> String {
+    if tokens_per_second >= 1_000.0 {
+        format!(
+            "{}/s",
+            crate::humanize_token_count(tokens_per_second.round() as u64)
+        )
+    } else if tokens_per_second >= 100.0 {
+        format!("{:.0}/s", tokens_per_second)
+    } else {
+        format!("{:.1}/s", tokens_per_second)
+    }
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.1} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 struct TokenUsageTooltip {
     percentage: String,
     used: String,
@@ -8418,6 +8567,9 @@ struct TokenUsageTooltip {
     output_max: String,
     show_split: bool,
     cost_label: Option<String>,
+    compaction_threshold_label: Option<String>,
+    cache_summary_label: Option<String>,
+    latency_and_rates_label: Option<String>,
     separator_color: Color,
     global_agents_md_loaded: bool,
     project_rules_count: usize,
@@ -8437,6 +8589,9 @@ impl Render for TokenUsageTooltip {
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
         let cost_label = self.cost_label.clone();
+        let compaction_threshold_label = self.compaction_threshold_label.clone();
+        let cache_summary_label = self.cache_summary_label.clone();
+        let latency_and_rates_label = self.latency_and_rates_label.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
         let project_entry_ids = self.project_entry_ids.clone();
@@ -8481,6 +8636,36 @@ impl Render for TokenUsageTooltip {
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(output_max).color(Color::Muted)),
                             ),
+                    )
+                })
+                .when_some(compaction_threshold_label, |this, threshold_label| {
+                    this.child(
+                        Label::new(threshold_label)
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                })
+                .when_some(cache_summary_label, |this, cache_label| {
+                    this.child(
+                        Label::new(cache_label)
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                })
+                .when_some(latency_and_rates_label, |this, metrics_label| {
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Latest Step")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(Label::new(metrics_label).size(LabelSize::Small)),
                     )
                 })
                 .when_some(cost_label, |this, cost_label| {
@@ -9647,28 +9832,64 @@ impl ThreadView {
         });
 
         let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
+        let last_turn_telemetry = show_stats
+            .then(|| self.turn_fields.last_turn_telemetry.as_ref())
+            .flatten();
+
+        let last_turn_input_label = last_turn_telemetry.and_then(|telemetry| {
+            let input_tokens = telemetry.input_tokens.filter(|&tokens| tokens > 0)?;
+            let mut text = format!("↑ {}", crate::humanize_token_count(input_tokens));
+            if let Some(cached_tokens) = telemetry
+                .cached_read_tokens
+                .filter(|&cached_tokens| cached_tokens > 0)
+            {
+                let cache_percent = ((cached_tokens as f64 / input_tokens as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as u32;
+                text.push_str(&format!(" ({cache_percent}% cached)"));
+            }
+            Some(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+        });
+
+        let last_turn_tokens_label = show_stats
+            .then(|| {
+                let output_tokens = self
+                    .turn_fields
+                    .last_turn_tokens
+                    .or_else(|| {
+                        last_turn_telemetry.and_then(|telemetry| telemetry.turn_output_tokens)
+                    })
+                    .filter(|&tokens| tokens > 0)?;
+                let mut text = format!("↓ {}", crate::humanize_token_count(output_tokens));
+                if let Some(output_rate) = last_turn_telemetry
+                    .and_then(|telemetry| telemetry.output_tokens_per_sec)
+                    .filter(|&rate| rate > 0.0)
+                {
+                    text.push_str(&format!(" · {}", format_tokens_per_second(output_rate)));
+                }
+                Some(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+            })
+            .flatten();
+
+        let last_turn_latency_label = last_turn_telemetry.and_then(|telemetry| {
+            let ttft_milliseconds = telemetry.ttft_ms.filter(|&milliseconds| milliseconds > 0)?;
+            Some(
+                Label::new(format!(
+                    "TTFT {}",
+                    format_latency_milliseconds(ttft_milliseconds)
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+        });
 
         let last_turn_clock = show_stats
             .then(|| {
                 self.turn_fields
                     .last_turn_duration
-                    .filter(|&duration| duration > STOPWATCH_THRESHOLD)
+                    .filter(|&duration| duration >= STOPWATCH_THRESHOLD)
                     .map(|duration| {
                         Label::new(duration_alt_display(duration))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                    })
-            })
-            .flatten();
-
-        let last_turn_tokens_label = last_turn_clock
-            .is_some()
-            .then(|| {
-                self.turn_fields
-                    .last_turn_tokens
-                    .filter(|&tokens| tokens > TOKEN_THRESHOLD)
-                    .map(|tokens| {
-                        Label::new(format!("{} tokens", crate::humanize_token_count(tokens)))
                             .size(LabelSize::Small)
                             .color(Color::Muted)
                     })
@@ -9740,29 +9961,39 @@ impl ThreadView {
                 .alpha(0.5)
         };
 
+        let has_turn_stats = last_turn_input_label.is_some()
+            || last_turn_tokens_label.is_some()
+            || last_turn_latency_label.is_some()
+            || last_turn_clock.is_some();
+
         h_flex()
             .w_full()
+            .flex_wrap()
             .py_1p5()
             .px_4()
             .justify_end()
-            .opacity(0.4)
+            .opacity(0.45)
             .hover(|s| s.opacity(1.))
-            .when(
-                last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
-                |this| {
-                    this.child(
-                        h_flex()
-                            .px_1()
-                            .gap_1()
-                            .when_some(last_turn_tokens_label, |this, label| {
-                                this.child(label).child(separator_dots())
-                            })
-                            .when_some(last_turn_clock, |this, label| {
-                                this.child(label).child(separator_dots())
-                            }),
-                    )
-                },
-            )
+            .when(has_turn_stats, |this| {
+                this.child(
+                    h_flex()
+                        .flex_wrap()
+                        .px_1()
+                        .gap_1()
+                        .when_some(last_turn_input_label, |this, label| {
+                            this.child(label).child(separator_dots())
+                        })
+                        .when_some(last_turn_tokens_label, |this, label| {
+                            this.child(label).child(separator_dots())
+                        })
+                        .when_some(last_turn_latency_label, |this, label| {
+                            this.child(label).child(separator_dots())
+                        })
+                        .when_some(last_turn_clock, |this, label| {
+                            this.child(label).child(separator_dots())
+                        }),
+                )
+            })
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(markdown_source_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
@@ -10543,40 +10774,229 @@ impl ThreadView {
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+        let is_blocked_on_terminal_command =
+            !confirmation && self.is_blocked_on_terminal_command(cx);
+
+        let telemetry = show_stats.then(|| self.thread.read(cx).effective_live_telemetry());
+
+        let phase_label = if confirmation || is_blocked_on_terminal_command {
+            None
+        } else {
+            telemetry
+                .as_ref()
+                .and_then(|telemetry| match telemetry.phase {
+                    LiveStreamPhase::AwaitingTtft => {
+                        Some(SharedString::from("Waiting for first token"))
+                    }
+                    LiveStreamPhase::StreamingThought => Some(SharedString::from("Thinking")),
+                    LiveStreamPhase::StreamingResponse => Some(SharedString::from("Responding")),
+                    LiveStreamPhase::StreamingToolCall => {
+                        let label = match (
+                            telemetry.active_tool_name.as_ref(),
+                            telemetry.streamed_bytes.filter(|&bytes| bytes >= 1_024),
+                        ) {
+                            (Some(tool_name), Some(bytes)) => {
+                                format!("Generating {tool_name} ({})", format_byte_size(bytes))
+                            }
+                            (Some(tool_name), None) => format!("Generating {tool_name}"),
+                            (None, Some(bytes)) => {
+                                format!("Generating tool call ({})", format_byte_size(bytes))
+                            }
+                            (None, None) => String::from("Generating tool call"),
+                        };
+                        Some(SharedString::from(label))
+                    }
+                    LiveStreamPhase::BufferingToolCall => {
+                        let label = match telemetry.active_tool_name.as_ref() {
+                            Some(tool_name) => format!("Buffering {tool_name}"),
+                            None => String::from("Buffering tool call"),
+                        };
+                        Some(SharedString::from(label))
+                    }
+                    LiveStreamPhase::ExecutingTools => Some(SharedString::from("Running tool")),
+                    LiveStreamPhase::Idle | LiveStreamPhase::Unknown => None,
+                })
+        };
+
         let elapsed_label = show_stats
             .then(|| {
                 self.turn_fields.turn_started_at.and_then(|started_at| {
                     let elapsed = started_at.elapsed();
-                    (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
+                    (elapsed >= STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
                 })
             })
             .flatten();
 
-        let is_blocked_on_terminal_command =
-            !confirmation && self.is_blocked_on_terminal_command(cx);
-        let is_waiting = confirmation || self.thread.read(cx).has_in_progress_tool_calls();
-
-        let turn_tokens_label = elapsed_label
-            .is_some()
-            .then(|| {
-                self.turn_fields
-                    .turn_tokens
-                    .filter(|&tokens| tokens > TOKEN_THRESHOLD)
-                    .map(|tokens| crate::humanize_token_count(tokens))
-            })
-            .flatten();
-
-        let arrow_icon = if is_waiting {
-            IconName::ArrowUp
+        let latency_label = if confirmation {
+            None
         } else {
-            IconName::ArrowDown
+            telemetry.as_ref().and_then(|telemetry| {
+                if telemetry.phase == LiveStreamPhase::AwaitingTtft {
+                    let wait_milliseconds = telemetry.call_elapsed_ms.or_else(|| {
+                        self.turn_fields.turn_started_at.map(|started_at| {
+                            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        })
+                    })?;
+                    (wait_milliseconds >= 100)
+                        .then(|| format!("TTFT {}", format_latency_milliseconds(wait_milliseconds)))
+                } else if let Some(ttft_milliseconds) =
+                    telemetry.ttft_ms.filter(|&milliseconds| milliseconds > 0)
+                {
+                    if telemetry.phase == LiveStreamPhase::BufferingToolCall
+                        && let Some(gap_milliseconds) = telemetry
+                            .chunk_gap_ms
+                            .filter(|&milliseconds| milliseconds >= 2_500)
+                    {
+                        Some(format!(
+                            "TTFT {} · wait {}",
+                            format_latency_milliseconds(ttft_milliseconds),
+                            format_latency_milliseconds(gap_milliseconds)
+                        ))
+                    } else {
+                        Some(format!(
+                            "TTFT {}",
+                            format_latency_milliseconds(ttft_milliseconds)
+                        ))
+                    }
+                } else {
+                    None
+                }
+            })
         };
+
+        let input_metrics_label = if confirmation {
+            None
+        } else {
+            telemetry.as_ref().and_then(|telemetry| {
+                let input_tokens = telemetry
+                    .input_tokens
+                    .or_else(|| {
+                        self.thread
+                            .read(cx)
+                            .token_usage()
+                            .map(|usage| usage.input_tokens)
+                    })
+                    .filter(|&tokens| tokens > 0)?;
+                let mut text = crate::humanize_token_count(input_tokens);
+                if telemetry.phase != LiveStreamPhase::AwaitingTtft
+                    && let Some(input_rate) =
+                        telemetry.input_tokens_per_sec.filter(|&rate| rate > 0.0)
+                {
+                    text.push_str(&format!(" · {}", format_tokens_per_second(input_rate)));
+                }
+                if let Some(cached_tokens) = telemetry
+                    .cached_read_tokens
+                    .filter(|&cached_tokens| cached_tokens > 0)
+                {
+                    let cache_percent = ((cached_tokens as f64 / input_tokens as f64) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u32;
+                    text.push_str(&format!(" ({cache_percent}% cached)"));
+                }
+                Some(text)
+            })
+        };
+
+        let output_metrics_label = if confirmation {
+            None
+        } else {
+            telemetry.as_ref().and_then(|telemetry| {
+                let output_tokens = telemetry
+                    .turn_output_tokens
+                    .or(self.turn_fields.turn_tokens)
+                    .filter(|&tokens| tokens > 0)?;
+                let mut text = crate::humanize_token_count(output_tokens);
+                let is_actively_streaming = matches!(
+                    telemetry.phase,
+                    LiveStreamPhase::StreamingThought
+                        | LiveStreamPhase::StreamingResponse
+                        | LiveStreamPhase::StreamingToolCall
+                );
+                if is_actively_streaming
+                    && let Some(output_rate) =
+                        telemetry.output_tokens_per_sec.filter(|&rate| rate > 0.0)
+                {
+                    text.push_str(&format!(" · {}", format_tokens_per_second(output_rate)));
+                }
+                Some(text)
+            })
+        };
+
+        let separator_dot = || {
+            Label::new("•")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .alpha(0.45)
+        };
+
+        let mut metric_pills: Vec<AnyElement> = Vec::new();
+        if let Some(phase_text) = phase_label {
+            metric_pills.push(
+                Label::new(phase_text)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+        if let Some(elapsed_text) = elapsed_label {
+            metric_pills.push(
+                Label::new(elapsed_text)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+        if let Some(latency_text) = latency_label {
+            metric_pills.push(
+                Label::new(latency_text)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+        if let Some(input_text) = input_metrics_label {
+            metric_pills.push(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(IconName::ArrowUp)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(input_text)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(output_text) = output_metrics_label {
+            metric_pills.push(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(IconName::ArrowDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(output_text)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         h_flex()
             .id("generating-spinner")
+            .w_full()
+            .flex_wrap()
             .py_2()
             .px(rems_from_px(22_f32))
-            .gap_2()
+            .gap_x_1p5()
+            .gap_y_1()
             .map(|this| {
                 if confirmation {
                     this.child(
@@ -10604,28 +11024,14 @@ impl ThreadView {
                     )
                 }
             })
-            .when_some(elapsed_label, |this, elapsed| {
-                this.child(
-                    Label::new(elapsed)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
-            .when_some(turn_tokens_label, |this, tokens| {
-                this.child(
-                    h_flex()
-                        .gap_0p5()
-                        .child(
-                            Icon::new(arrow_icon)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(format!("{} tokens", tokens))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
+            .map(|mut this| {
+                for (index, pill) in metric_pills.into_iter().enumerate() {
+                    if index > 0 {
+                        this = this.child(separator_dot());
+                    }
+                    this = this.child(pill);
+                }
+                this
             })
             .into_any_element()
     }
@@ -11388,9 +11794,21 @@ impl ThreadView {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    fn is_blocked_on_terminal_command(&self, cx: &App) -> bool {
+    pub(crate) fn is_blocked_on_terminal_command(&self, cx: &App) -> bool {
         let thread = self.thread.read(cx);
         if !matches!(thread.status(), ThreadStatus::Generating) {
+            return false;
+        }
+        if thread.has_reported_live_telemetry()
+            && matches!(
+                thread.effective_live_telemetry().phase,
+                LiveStreamPhase::AwaitingTtft
+                    | LiveStreamPhase::StreamingThought
+                    | LiveStreamPhase::StreamingResponse
+                    | LiveStreamPhase::StreamingToolCall
+                    | LiveStreamPhase::BufferingToolCall
+            )
+        {
             return false;
         }
 
@@ -11399,6 +11817,11 @@ impl ThreadView {
         for entry in thread.entries().iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(_) => break,
+                AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ContextCompaction(_)
+                    if !has_running_terminal_call =>
+                {
+                    return false;
+                }
                 AgentThreadEntry::ToolCall(tool_call)
                     if matches!(
                         tool_call.status(),

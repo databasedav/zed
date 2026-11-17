@@ -1671,12 +1671,19 @@ impl NativeAgent {
         usage: &TokenUsageUpdated,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.sessions.get(thread.read(cx).id()) else {
-            return;
+        let (session_acp_thread, cached_read_tokens) = {
+            let thread_ref = thread.read(cx);
+            let Some(session) = self.sessions.get(thread_ref.id()) else {
+                return;
+            };
+            let cached_read_tokens = thread_ref
+                .latest_request_token_usage()
+                .map(|request_usage| request_usage.cache_read_input_tokens);
+            (session.acp_thread.clone(), cached_read_tokens)
         };
-        session
-            .acp_thread
+        session_acp_thread
             .update(cx, |acp_thread, cx| {
+                acp_thread.set_local_cached_read_tokens(cached_read_tokens);
                 acp_thread.update_token_usage(usage.0.clone(), cx);
             })
             .ok();
