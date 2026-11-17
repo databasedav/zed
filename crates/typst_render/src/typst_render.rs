@@ -826,4 +826,128 @@ Trailing #link(\"file:///tmp/trailing.rs\")[`trailing.rs`] and *bold status* sti
                 .contains("unclosed fenced code block")
         );
     }
+
+    #[test]
+    fn renders_truncated_thinking_traces_math_backticks_and_markdown_lists_cleanly() {
+        let catalog = TypstFontCatalog::base();
+        let style = TypstRenderStyle {
+            page_width_pt: Some(640.0),
+            ..TypstRenderStyle::default()
+        };
+
+        // 1) Screenshot #1 (`STEP 8535`): LaTeX `$$ ... \text{fg_mask} ... $$` immediately
+        //    followed by indented Markdown bullets + `**Step 2.2...**` without blank line.
+        let step_8535 = "\
+$$ \\min_{Z(u, v)} \\sum_{(u, v) \\in \\text{fg_mask}} || \\nabla Z(u, v) - n(u, v) ||^2 + \\lambda || Z(u, v) - d(u, v) ||^2 $$
+     - where:
+       - `Z(u, v)` is the final *metric* 3D surface depth to be solved
+       - `\\lambda` is the data weight (e.g. `\\lambda = 100`, for `depth` data *much* more reliable than the normals)
+     - **Step 2.2 — Screened Depth-Map & Normal Fusion:**
+       - The **front view depth map is reliable only in visible pixels** that are *not* obscured by clothing.";
+
+        let (norm_8535, _) = preprocess_typst_segment(step_8535, 0, &HashMap::default());
+        let world_8535 = ZedTypstWorld::new(&style.build_preamble(), &norm_8535, catalog.clone())
+            .expect("world 8535");
+        assert!(
+            typst::compile::<typst_layout::PagedDocument>(&world_8535)
+                .output
+                .is_ok(),
+            "expected STEP 8535 math + list to compile cleanly without fallback:\n{norm_8535}"
+        );
+        let seg_8535 = PreparedTypstSegment::new(
+            step_8535,
+            0..step_8535.len(),
+            &HashMap::default(),
+            catalog.clone(),
+        );
+        let layout_8535 = seg_8535.layout_for_style(&style);
+        let rendered_8535 = layout_8535.rendered_text();
+        assert!(
+            !rendered_8535.contains("$$"),
+            "expected display math instead of raw $$, got {rendered_8535:?}"
+        );
+        assert!(
+            !rendered_8535.contains("**Step 2.2"),
+            "expected **Step 2.2...** to render as bold rather than literal **, got {rendered_8535:?}"
+        );
+        assert!(
+            !rendered_8535.contains("`Z(u, v)`"),
+            "expected `Z(u, v)` to render as inline code rather than literal backticks, got {rendered_8535:?}"
+        );
+
+        // 2) Screenshot #2 (`STEP 8551`): Truncated orphan backticks must never invert
+        //    inline code vs prose or leak across paragraph breaks.
+        let step_8551 = "\
+` and `tracks` directly into the function call at `L4867`. No unnecessary data movement, no extra memory allocations. Clean and efficient.
+
+Initial hypothesis: The data flow to `solve_reprojection_locked_trajectory` is optimized by passing only the necessary data.
+
+The data flow confirmation reveals that `_frames=work_frames` and `all_fg_masks=[...]` are passed directly into the function call.
+
+Marcus` and `Elena`
+-46d7-4638-b784-0a612574e073`) with `cargo test`
+3`** for `Hair`
+sessionId=1612716183908852358` (`match_fnv=True`)
+`capsules: Vec<SandboxedCapsule`.`";
+
+        let spans_8551 = extract_inline_code_spans(step_8551, 0);
+        let span_texts: Vec<&str> = spans_8551.iter().map(|s| s.text.as_ref()).collect();
+        assert!(
+            span_texts.contains(&"tracks")
+                && span_texts.contains(&"L4867")
+                && span_texts.contains(&"solve_reprojection_locked_trajectory")
+                && span_texts.contains(&"_frames=work_frames")
+                && span_texts.contains(&"all_fg_masks=[...]")
+                && span_texts.contains(&"Elena")
+                && span_texts.contains(&"cargo test")
+                && span_texts.contains(&"Hair")
+                && span_texts.contains(&"match_fnv=True")
+                && span_texts.contains(&"capsules: Vec<SandboxedCapsule"),
+            "expected true code identifiers (not inverted prose!) in extracted inline code spans, got {span_texts:?}"
+        );
+        assert!(
+            !span_texts
+                .iter()
+                .any(|txt| txt.contains("directly into the function call")),
+            "prose between `tracks` and `L4867` must NOT flip into inline code: {span_texts:?}"
+        );
+
+        let (norm_8551, _) = preprocess_typst_segment(step_8551, 0, &HashMap::default());
+        let world_8551 = ZedTypstWorld::new(&style.build_preamble(), &norm_8551, catalog.clone())
+            .expect("world 8551");
+        assert!(
+            typst::compile::<typst_layout::PagedDocument>(&world_8551)
+                .output
+                .is_ok(),
+            "expected STEP 8551 to compile cleanly:\n{norm_8551}"
+        );
+
+        // 3) Screenshot #3 (`STEP 8563`): Truncated trailing `**` (`\`full_res_seg\`):**`)
+        //    and Markdown `* *italic*` / `* **bold**` bullets.
+        let step_8563 = "\
+`full_res_seg`):**
+  - Each `part_surfel` observes a color from `full_res_rgb` that is strongly biased by the observed mode of `full_res_seg`.
+  - **Source 2 — `Zero123++` Multi-View & Multi-Frame (`tiles_rgb`):**
+    - Each `part_surfel` observes a color from the `Zero123++` tiles across all viewpoints.
+      * *This preserves details like stripes, logos, ties, florals, bangs, and laces across frames in the model.*
+      * **Fast path:** tiles handle cross-frame texture consistency.";
+
+        let (norm_8563, _) = preprocess_typst_segment(step_8563, 0, &HashMap::default());
+        let world_8563 = ZedTypstWorld::new(&style.build_preamble(), &norm_8563, catalog.clone())
+            .expect("world 8563");
+        assert!(
+            typst::compile::<typst_layout::PagedDocument>(&world_8563)
+                .output
+                .is_ok(),
+            "expected STEP 8563 unmatched ** + nested bullets to compile cleanly:\n{norm_8563}"
+        );
+        let seg_8563 =
+            PreparedTypstSegment::new(step_8563, 0..step_8563.len(), &HashMap::default(), catalog);
+        let layout_8563 = seg_8563.layout_for_style(&style);
+        let rendered_8563 = layout_8563.rendered_text();
+        assert!(
+            !rendered_8563.contains("**Source 2") && !rendered_8563.contains("`part_surfel`"),
+            "expected rich Typst rendering instead of plain-text fallback on STEP 8563, got {rendered_8563:?}"
+        );
+    }
 }

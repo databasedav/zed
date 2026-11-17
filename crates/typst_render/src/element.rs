@@ -731,34 +731,88 @@ fn try_salvage_typst_blocks(
                 pieces.push(SalvagedPiece::ValidNormalized(block_range));
             }
             Some(err_byte_in_block) => {
-                if let Some(split_rel) = block_slice
-                    .get(..err_byte_in_block)
+                let clamped_err = err_byte_in_block.min(block_slice.len());
+                let err_line_start = block_slice
+                    .get(..clamped_err)
                     .and_then(|prefix| prefix.rfind('\n'))
-                {
-                    let prefix_slice = &block_slice[..split_rel];
-                    if !prefix_slice.trim().is_empty()
+                    .map_or(0, |newline_idx| newline_idx + 1);
+                let err_line_end = block_slice
+                    .get(clamped_err..)
+                    .and_then(|suffix| suffix.find('\n'))
+                    .map_or(block_slice.len(), |rel_idx| clamped_err + rel_idx);
+
+                let valid_prefix_end = if err_line_start > 0 {
+                    let prefix_end = err_line_start - 1;
+                    let prefix_slice = &block_slice[..prefix_end];
+                    (!prefix_slice.trim().is_empty()
                         && !has_unclosed_typst_delimiters(prefix_slice)
                         && compile_snippet_first_error(preamble, prefix_slice, &font_catalog)
-                            .is_none()
-                    {
-                        any_valid_typst = true;
+                            .is_none())
+                    .then_some(prefix_end)
+                } else {
+                    None
+                };
+
+                let valid_suffix_start = if err_line_end < block_slice.len() {
+                    let suffix_start = err_line_end + 1;
+                    let suffix_slice = &block_slice[suffix_start..];
+                    (!suffix_slice.trim().is_empty()
+                        && !has_unclosed_typst_delimiters(suffix_slice)
+                        && compile_snippet_first_error(preamble, suffix_slice, &font_catalog)
+                            .is_none())
+                    .then_some(suffix_start)
+                } else {
+                    None
+                };
+
+                if (err_line_start == 0 || valid_prefix_end.is_some())
+                    && let Some(suffix_start) = valid_suffix_start
+                {
+                    any_valid_typst = true;
+                    if let Some(prefix_end) = valid_prefix_end {
                         pieces.push(SalvagedPiece::ValidNormalized(
-                            block_range.start..(block_range.start + split_rel),
+                            block_range.start..(block_range.start + prefix_end),
                         ));
-                        let tail_norm_range = (block_range.start + split_rel + 1)..block_range.end;
-                        let raw_tail = map_norm_range_to_raw_slice(
-                            &tail_norm_range,
-                            normalized_typst,
-                            raw_fallback_text,
-                            offset_map,
-                            &source_range,
-                        );
-                        pieces.push(SalvagedPiece::EscapedPlain(escape_typst_plain_text(
-                            raw_tail,
-                        )));
-                        continue;
                     }
+                    let bad_line_norm_range =
+                        (block_range.start + err_line_start)..(block_range.start + err_line_end);
+                    let raw_bad_line = map_norm_range_to_raw_slice(
+                        &bad_line_norm_range,
+                        normalized_typst,
+                        raw_fallback_text,
+                        offset_map,
+                        &source_range,
+                    );
+                    if !raw_bad_line.trim().is_empty() {
+                        pieces.push(SalvagedPiece::EscapedPlain(escape_typst_plain_text(
+                            raw_bad_line,
+                        )));
+                    }
+                    pieces.push(SalvagedPiece::ValidNormalized(
+                        (block_range.start + suffix_start)..block_range.end,
+                    ));
+                    continue;
                 }
+
+                if let Some(prefix_end) = valid_prefix_end {
+                    any_valid_typst = true;
+                    pieces.push(SalvagedPiece::ValidNormalized(
+                        block_range.start..(block_range.start + prefix_end),
+                    ));
+                    let tail_norm_range = (block_range.start + prefix_end + 1)..block_range.end;
+                    let raw_tail = map_norm_range_to_raw_slice(
+                        &tail_norm_range,
+                        normalized_typst,
+                        raw_fallback_text,
+                        offset_map,
+                        &source_range,
+                    );
+                    pieces.push(SalvagedPiece::EscapedPlain(escape_typst_plain_text(
+                        raw_tail,
+                    )));
+                    continue;
+                }
+
                 let raw_block = map_norm_range_to_raw_slice(
                     &block_range,
                     normalized_typst,
@@ -898,6 +952,9 @@ fn has_unclosed_typst_delimiters(text: &str) -> bool {
             index += ticks;
             let mut closed = false;
             while index < bytes.len() {
+                if ticks < 3 && is_blank_line_break_at(bytes, index) {
+                    break;
+                }
                 if bytes[index] == b'`' {
                     let mut close_ticks = 0usize;
                     while index + close_ticks < bytes.len() && bytes[index + close_ticks] == b'`' {
@@ -931,6 +988,21 @@ fn has_unclosed_typst_delimiters(text: &str) -> bool {
     }
 
     in_string || paren_depth > 0 || brace_depth > 0 || bracket_depth > 0
+}
+
+fn is_blank_line_break_at(bytes: &[u8], newline_pos: usize) -> bool {
+    if bytes.get(newline_pos) != Some(&b'\n') {
+        return false;
+    }
+    let mut scan = newline_pos + 1;
+    while scan < bytes.len() {
+        match bytes[scan] {
+            b' ' | b'\t' | b'\r' => scan += 1,
+            b'\n' => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn split_top_level_typst_blocks(text: &str, require_zero_depth: bool) -> Vec<Range<usize>> {
@@ -968,6 +1040,9 @@ fn split_top_level_typst_blocks(text: &str, require_zero_depth: bool) -> Vec<Ran
             }
             index += ticks;
             while index < len {
+                if ticks < 3 && is_blank_line_break_at(bytes, index) {
+                    break;
+                }
                 if bytes[index] == b'`' {
                     let mut close_ticks = 0usize;
                     while index + close_ticks < len && bytes[index + close_ticks] == b'`' {

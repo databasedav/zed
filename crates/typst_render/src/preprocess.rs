@@ -449,6 +449,11 @@ pub fn extract_inline_code_spans(
                 while index + tick_count < len && bytes[index + tick_count] == b'`' {
                     tick_count += 1;
                 }
+                if in_markup && tick_count == 1 && is_orphan_single_backtick_at(segment_text, start)
+                {
+                    index = start + 1;
+                    continue;
+                }
                 let (raw_end, closed) = scan_inline_backticks(bytes, start);
                 if closed {
                     let content_start = start + tick_count;
@@ -470,8 +475,12 @@ pub fn extract_inline_code_spans(
                             text: SharedString::from(inner.to_string()),
                         });
                     }
+                    index = raw_end;
+                } else if in_markup && raw_end < len {
+                    index = start + tick_count;
+                } else {
+                    index = raw_end;
                 }
-                index = raw_end;
             }
             byte if !in_markup => {
                 match byte {
@@ -570,20 +579,121 @@ pub fn convert_math_to_typst(math_content: &str, display_mode: bool) -> String {
         };
     }
 
-    let body = if looks_like_latex_math(trimmed) {
-        match mitex::convert_math(trimmed, None) {
-            Ok(converted) => converted.trim().to_string(),
-            Err(_) => escape_typst_math_fallback(trimmed),
+    if looks_like_latex_math(trimmed) {
+        let sanitized = sanitize_latex_text_underscores(trimmed);
+        if let Ok(converted) = mitex::convert_math(&sanitized, None) {
+            let candidate_body = converted.trim();
+            let candidate = if display_mode {
+                format!("$ {candidate_body} $")
+            } else {
+                format!("${candidate_body}$")
+            };
+            if typst_math_snippet_compiles(&candidate) {
+                return candidate;
+            }
         }
-    } else {
-        trimmed.to_string()
-    };
+        let fallback_body = escape_typst_math_fallback(trimmed);
+        return if display_mode {
+            format!("$ {fallback_body} $")
+        } else {
+            format!("${fallback_body}$")
+        };
+    }
 
     if display_mode {
-        format!("$ {body} $")
+        format!("$ {trimmed} $")
     } else {
-        format!("${body}$")
+        format!("${trimmed}$")
     }
+}
+
+fn sanitize_latex_text_underscores(latex: &str) -> String {
+    const TEXT_COMMANDS: &[&str] = &[
+        "text",
+        "textbf",
+        "textit",
+        "textrm",
+        "texttt",
+        "textsf",
+        "mathrm",
+        "mathbf",
+        "mathit",
+        "mathsf",
+        "mathtt",
+        "operatorname",
+    ];
+    let bytes = latex.as_bytes();
+    let mut out = String::with_capacity(latex.len() + 8);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let cmd_start = index + 1;
+            let mut cmd_end = cmd_start;
+            while cmd_end < bytes.len() && bytes[cmd_end].is_ascii_alphabetic() {
+                cmd_end += 1;
+            }
+            let cmd_name = &latex[cmd_start..cmd_end];
+            if TEXT_COMMANDS.contains(&cmd_name) {
+                let mut brace_pos = cmd_end;
+                while brace_pos < bytes.len() && matches!(bytes[brace_pos], b' ' | b'\t' | b'*') {
+                    brace_pos += 1;
+                }
+                if bytes.get(brace_pos) == Some(&b'{') {
+                    out.push_str(&latex[index..=brace_pos]);
+                    index = brace_pos + 1;
+                    let mut depth = 1usize;
+                    while index < bytes.len() && depth > 0 {
+                        match bytes[index] {
+                            b'\\' => {
+                                let step = next_escaped_step(latex, index);
+                                out.push_str(&latex[index..(index + step)]);
+                                index += step;
+                            }
+                            b'{' => {
+                                depth += 1;
+                                out.push('{');
+                                index += 1;
+                            }
+                            b'}' => {
+                                depth -= 1;
+                                out.push('}');
+                                index += 1;
+                            }
+                            b'_' => {
+                                out.push_str("\\_");
+                                index += 1;
+                            }
+                            _ => {
+                                let step = latex[index..].chars().next().map_or(1, char::len_utf8);
+                                out.push_str(&latex[index..(index + step)]);
+                                index += step;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            let step = next_escaped_step(latex, index);
+            out.push_str(&latex[index..(index + step)]);
+            index += step;
+            continue;
+        }
+        let step = latex[index..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&latex[index..(index + step)]);
+        index += step;
+    }
+    out
+}
+
+fn typst_math_snippet_compiles(snippet: &str) -> bool {
+    let Ok(world) =
+        crate::world::ZedTypstWorld::new("", snippet, crate::world::TypstFontCatalog::base())
+    else {
+        return false;
+    };
+    typst::compile::<typst_layout::PagedDocument>(&world)
+        .output
+        .is_ok()
 }
 
 fn escape_typst_math_fallback(raw: &str) -> String {
@@ -720,6 +830,12 @@ fn preprocess_typst_segment_inner(
             while cursor + tick_count < len && bytes[cursor + tick_count] == b'`' {
                 tick_count += 1;
             }
+            if in_markup && tick_count == 1 && is_orphan_single_backtick_at(segment_text, cursor) {
+                builder.push_replaced("\\`", cursor..(cursor + 1));
+                cursor += 1;
+                at_line_start = false;
+                continue;
+            }
             let (raw_end, closed) = scan_inline_backticks(bytes, cursor);
             let global_range = (base_offset + cursor)..(base_offset + raw_end);
             if in_markup && closed {
@@ -793,6 +909,13 @@ fn preprocess_typst_segment_inner(
                     at_line_start = false;
                     continue;
                 }
+            }
+            if in_markup && !closed && raw_end < len {
+                let escaped_ticks = "\\`".repeat(tick_count);
+                builder.push_replaced(&escaped_ticks, cursor..(cursor + tick_count));
+                cursor += tick_count;
+                at_line_start = false;
+                continue;
             }
             builder.push_passthrough(&segment_text[cursor..raw_end], cursor);
             if !closed && apply_streaming_tail {
@@ -944,6 +1067,27 @@ fn preprocess_typst_segment_inner(
                     at_line_start = false;
                     continue;
                 }
+                let prev_char = segment_text[..cursor].chars().next_back();
+                let next_byte = bytes.get(cursor + 2).copied();
+                let can_stream_open = apply_streaming_tail
+                    && !segment_text[(cursor + 2)..].contains('\n')
+                    && next_byte.is_some_and(|byte| !byte.is_ascii_whitespace() && byte != b'*')
+                    && !prev_char.is_some_and(is_typst_word_char)
+                    && !matches!(prev_char, Some('`' | ')' | ']' | '}'));
+                if can_stream_open {
+                    let strong_open = current_strong_open(&mut mode_stack, &mut root_strong_open);
+                    if !*strong_open {
+                        *strong_open = true;
+                        builder.push_replaced("*", cursor..(cursor + 2));
+                        cursor += 2;
+                        at_line_start = false;
+                        continue;
+                    }
+                }
+                builder.push_replaced("\\*\\*", cursor..(cursor + 2));
+                cursor += 2;
+                at_line_start = false;
+                continue;
             } else {
                 let prev_char = segment_text[..cursor].chars().next_back();
                 let next_char = segment_text
@@ -1035,6 +1179,10 @@ fn preprocess_typst_segment_inner(
                     at_line_start = false;
                     continue;
                 }
+                builder.push_replaced("\\~\\~", cursor..(cursor + 2));
+                cursor += 2;
+                at_line_start = false;
+                continue;
             }
             // In Typst markup, bare `~` is a non-breaking space (`\u{00A0}`), which
             // unexpectedly swallows approximate tildes like `~$8.50` or `~5ms`.
@@ -1295,7 +1443,7 @@ fn try_normalize_markdown_line_prefix(text: &str, line_start: usize) -> Option<(
 
     if let Some(after_star) = after_indent.strip_prefix("* ") {
         let line_end = after_star.find('\n').unwrap_or(after_star.len());
-        if !after_star[..line_end].contains('*') {
+        if markdown_star_bullet_body_is_self_contained(&after_star[..line_end]) {
             return Some((indent + 2, format!("{indent_str}- ")));
         }
     }
@@ -2050,12 +2198,58 @@ fn try_parse_markdown_link(
     ))
 }
 
+fn markdown_star_bullet_body_is_self_contained(line: &str) -> bool {
+    if !line.contains('*') || line.starts_with('*') {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut single_stars = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += next_escaped_step(line, index);
+            }
+            b'`' => {
+                let (end, closed) = scan_inline_backticks(bytes, index);
+                if closed {
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            b'*' => {
+                let mut run = 0usize;
+                while index + run < bytes.len() && bytes[index + run] == b'*' {
+                    run += 1;
+                }
+                if run == 1 {
+                    let prev_char = line[..index].chars().next_back();
+                    let next_char = line.get((index + 1)..).and_then(|rest| rest.chars().next());
+                    if !is_typst_in_word(prev_char, next_char) {
+                        single_stars += 1;
+                    }
+                }
+                index += run;
+            }
+            _ => {
+                index += line[index..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    single_stars.is_multiple_of(2)
+}
+
 fn find_markdown_double_delimiter_end(text: &str, start: usize, delim: u8) -> Option<usize> {
     let bytes = text.as_bytes();
-    if bytes
-        .get(start)
-        .copied()
-        .is_none_or(|byte| byte.is_ascii_whitespace() || byte == delim)
+    let first_byte = bytes.get(start).copied()?;
+    if first_byte.is_ascii_whitespace() || first_byte == delim {
+        return None;
+    }
+    if start >= 3
+        && (bytes[start - 3].is_ascii_alphanumeric()
+            || matches!(bytes[start - 3], b'`' | b')' | b']'))
+        && matches!(first_byte, b':' | b';' | b',' | b'.' | b')' | b']')
     {
         return None;
     }
@@ -2067,14 +2261,38 @@ fn find_markdown_double_delimiter_end(text: &str, start: usize, delim: u8) -> Op
                 continue;
             }
             b'`' => {
-                let (end, _) = scan_inline_backticks(bytes, cursor);
-                cursor = end;
+                let (end, closed) = scan_inline_backticks(bytes, cursor);
+                if closed {
+                    cursor = end;
+                } else {
+                    cursor += 1;
+                }
                 continue;
             }
-            b'\n' if bytes.get(cursor + 1) == Some(&b'\n') => return None,
+            b'\n' => {
+                if is_parbreak_at(bytes, cursor) {
+                    return None;
+                }
+                let next_trimmed = text[(cursor + 1)..].trim_start_matches([' ', '\t']);
+                if next_trimmed.starts_with("- ")
+                    || next_trimmed.starts_with("* ")
+                    || next_trimmed.starts_with("+ ")
+                    || next_trimmed.starts_with('#')
+                {
+                    return None;
+                }
+            }
             byte if byte == delim && bytes.get(cursor + 1) == Some(&delim) => {
                 if cursor > start && !bytes[cursor - 1].is_ascii_whitespace() {
                     return Some(cursor);
+                }
+                if cursor > start
+                    && bytes[cursor - 1].is_ascii_whitespace()
+                    && bytes
+                        .get(cursor + 2)
+                        .is_some_and(|after| !after.is_ascii_whitespace() && *after != delim)
+                {
+                    return None;
                 }
             }
             _ => {}
@@ -2301,6 +2519,9 @@ fn scan_inline_backticks(bytes: &[u8], start: usize) -> (usize, bool) {
     }
     let mut cursor = start + tick_count;
     while cursor < len {
+        if tick_count < 3 && bytes[cursor] == b'\n' && is_parbreak_at(bytes, cursor) {
+            return (cursor, false);
+        }
         if bytes[cursor] == b'`' {
             let mut close_count = 0;
             while cursor + close_count < len && bytes[cursor + close_count] == b'`' {
@@ -2315,6 +2536,112 @@ fn scan_inline_backticks(bytes: &[u8], start: usize) -> (usize, bool) {
         }
     }
     (len, false)
+}
+
+fn is_orphan_single_backtick_at(text: &str, tick_pos: usize) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.get(tick_pos) != Some(&b'`')
+        || (tick_pos > 0 && bytes[tick_pos - 1] == b'`')
+        || bytes.get(tick_pos + 1) == Some(&b'`')
+    {
+        return false;
+    }
+
+    let line_start = text[..tick_pos].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = find_line_end(bytes, tick_pos);
+
+    let mut single_ticks: Vec<usize> = Vec::new();
+    let mut scan = line_start;
+    while scan < line_end {
+        match bytes[scan] {
+            b'\\' => {
+                scan = (scan + next_escaped_step(text, scan)).min(line_end);
+            }
+            b'$' if !is_prose_currency_dollar(text, scan) => {
+                let (math_end, _, _, _) = scan_dollar_math(bytes, scan);
+                scan = math_end.max(scan + 1);
+            }
+            b'`' => {
+                let mut run = 0usize;
+                while scan + run < line_end && bytes[scan + run] == b'`' {
+                    run += 1;
+                }
+                if run == 1 {
+                    single_ticks.push(scan);
+                    scan += 1;
+                } else {
+                    let (raw_end, closed) = scan_inline_backticks(&bytes[..line_end], scan);
+                    if closed && raw_end > scan {
+                        scan = raw_end;
+                    } else {
+                        scan += run;
+                    }
+                }
+            }
+            _ => {
+                scan += text[scan..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+
+    if single_ticks.len().is_multiple_of(2) {
+        return false;
+    }
+    let Some(target_idx) = single_ticks.iter().position(|&pos| pos == tick_pos) else {
+        return false;
+    };
+    if !target_idx.is_multiple_of(2) {
+        return false;
+    }
+
+    for cand_idx in (0..single_ticks.len()).step_by(2) {
+        let cand_pos = single_ticks[cand_idx];
+        if single_tick_has_open_polarity(text, cand_pos) {
+            continue;
+        }
+        // Preserve a brand-new trailing backtick right at the end of a streaming chunk
+        // (e.g. "Check `") while still catching trailing orphans attached to words/punctuation
+        // (e.g. "`Foo`.`").
+        if cand_pos + 1 == text.len() {
+            let prev = text[..cand_pos].chars().next_back();
+            if prev.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '(' | '[' | ':' | '-' | ','))
+            {
+                continue;
+            }
+        }
+        let mut pairs_valid = true;
+        let mut pair_iter = single_ticks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &pos)| (idx != cand_idx).then_some(pos));
+        while let (Some(open_pos), Some(close_pos)) = (pair_iter.next(), pair_iter.next()) {
+            if !single_tick_has_open_polarity(text, open_pos)
+                || !single_tick_has_close_polarity(text, close_pos)
+            {
+                pairs_valid = false;
+                break;
+            }
+        }
+        if pairs_valid {
+            return target_idx == cand_idx;
+        }
+    }
+
+    false
+}
+
+fn single_tick_has_open_polarity(text: &str, pos: usize) -> bool {
+    let prev = text[..pos].chars().next_back();
+    let next = text.get((pos + 1)..).and_then(|rest| rest.chars().next());
+    next.is_some_and(|ch| !ch.is_whitespace())
+        && !prev.is_some_and(|ch| ch.is_alphanumeric())
+        && !matches!(prev, Some(')' | ']' | '}' | '`'))
+}
+
+fn single_tick_has_close_polarity(text: &str, pos: usize) -> bool {
+    let prev = text[..pos].chars().next_back();
+    let next = text.get((pos + 1)..).and_then(|rest| rest.chars().next());
+    prev.is_some_and(|ch| !ch.is_whitespace()) && !next.is_some_and(|ch| ch.is_alphanumeric())
 }
 
 fn scan_typst_string(bytes: &[u8], start: usize) -> (usize, bool) {
