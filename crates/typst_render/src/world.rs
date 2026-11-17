@@ -47,6 +47,10 @@ pub fn user_typst_preamble() -> Option<SharedString> {
     USER_TYPST_PREAMBLE.read().clone()
 }
 
+pub fn is_library_math_symbol(word: &str) -> bool {
+    SHARED_LIBRARY.math.scope().get(word).is_some()
+}
+
 struct GlobalTypstFontCatalog(Arc<TypstFontCatalog>);
 
 impl Global for GlobalTypstFontCatalog {}

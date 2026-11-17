@@ -418,10 +418,10 @@ impl AcpV2Connection {
                 acp::ClientAuthCapabilities::new().terminal(acp::TerminalAuthCapabilities::new()),
             );
         }
-        capabilities = capabilities.meta(acp::Meta::from_iter([(
-            "zed_markup_format".into(),
-            "typst".into(),
-        )]));
+        capabilities = capabilities.meta(acp::Meta::from_iter([
+            ("zed_markup_format".into(), "typst".into()),
+            ("zed_validate_typst".into(), true.into()),
+        ]));
         let initialize_request =
             acp::InitializeRequest::new(ProtocolVersion::V2, info).capabilities(capabilities);
         let initialize_response = match connection

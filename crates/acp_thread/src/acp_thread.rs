@@ -5917,6 +5917,44 @@ impl AcpThread {
         self.push_assistant_content_block_with_message_id(None, chunk, is_thought, indented, cx)
     }
 
+    /// Removes visible `Message` chunks from the trailing assistant response so a
+    /// self-repaired replacement can stream in place without leaving a broken
+    /// duplicate draft in the transcript (preserving any earlier `Thought` chunks).
+    pub fn discard_last_assistant_response(&mut self, cx: &mut Context<Self>) -> bool {
+        self.flush_streaming_text(cx);
+        self.streaming_text_buffer.take();
+        self.separate_next_assistant_chunk = false;
+
+        let Some(entry_index) = self.entries.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(AgentThreadEntry::AssistantMessage(message)) = self.entries.last_mut() else {
+            return false;
+        };
+        if message.is_subagent_output {
+            return false;
+        }
+
+        let prev_chunks_len = message.chunks.len();
+        message
+            .chunks
+            .retain(|chunk| matches!(chunk, AssistantMessageChunk::Thought { .. }));
+        if message.chunks.len() == prev_chunks_len {
+            return false;
+        }
+
+        if message.chunks.is_empty() {
+            self.entries.pop();
+            cx.emit(AcpThreadEvent::EntriesRemoved(
+                entry_index..(entry_index + 1),
+            ));
+        } else {
+            cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+        }
+        cx.notify();
+        true
+    }
+
     fn push_assistant_content_block_with_message_id(
         &mut self,
         message_id: Option<acp_v1::MessageId>,
@@ -27403,6 +27441,95 @@ mod tests {
             };
             assert_eq!(user_msg.client_id, None);
             assert!(!thread.can_rewind_to(user_msg.client_id.as_ref(), cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_discard_last_assistant_response_preserves_thoughts_and_removes_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update({
+                let connection = connection.clone();
+                |cx| {
+                    connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+                }
+            })
+            .await
+            .expect("new session");
+
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Explain angles".into(), cx);
+            thread.push_assistant_content_block("Initial reasoning".into(), true, cx);
+            thread.push_assistant_content_block("Broken $1 + bad_ident$".into(), false, cx);
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries.len(), 2);
+            let AgentThreadEntry::AssistantMessage(msg) = &thread.entries[1] else {
+                panic!("expected assistant entry");
+            };
+            assert_eq!(msg.chunks.len(), 2);
+        });
+
+        let discarded = thread.update(cx, |thread, cx| thread.discard_last_assistant_response(cx));
+        assert!(discarded);
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries.len(), 2);
+            let AgentThreadEntry::AssistantMessage(msg) = &thread.entries[1] else {
+                panic!("expected assistant entry with preserved thought");
+            };
+            assert_eq!(msg.chunks.len(), 1);
+            assert!(matches!(
+                msg.chunks[0],
+                AssistantMessageChunk::Thought { .. }
+            ));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block("Repaired $135 degree$".into(), false, cx);
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let AgentThreadEntry::AssistantMessage(msg) = &thread.entries[1] else {
+                panic!("expected assistant entry");
+            };
+            assert_eq!(msg.chunks.len(), 2);
+            let md = msg.to_markdown(cx);
+            assert!(!md.contains("bad_ident"), "stale draft leaked: {md}");
+            assert!(md.contains("Repaired $135 degree$"), "got: {md}");
+        });
+
+        // Pure-text assistant message (no thoughts) removes the entire entry cleanly.
+        let fs2 = FakeFs::new(cx.executor());
+        let thread_pure = Project::test(fs2, [Path::new(path!("/test2"))], cx).await;
+        let pure_session = cx
+            .update(|cx| {
+                connection.new_session(
+                    thread_pure,
+                    PathList::new(&[Path::new(path!("/test2"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("pure session");
+
+        pure_session.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Prompt".into(), cx);
+            thread.push_assistant_content_block("Only text draft".into(), false, cx);
+        });
+        assert!(pure_session.update(cx, |thread, cx| thread.discard_last_assistant_response(cx)));
+        pure_session.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries.len(), 1);
+            assert!(matches!(
+                thread.entries[0],
+                AgentThreadEntry::UserMessage(_)
+            ));
         });
     }
 }

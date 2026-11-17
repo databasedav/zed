@@ -2959,6 +2959,13 @@ impl NativeAgentConnection {
                                 assistant_message_id =
                                     uuid::Uuid::new_v4().to_string().into();
                             }
+                            ThreadEvent::DiscardLastAssistantMessage => {
+                                assistant_message_id =
+                                    uuid::Uuid::new_v4().to_string().into();
+                                acp_thread.update(cx, |thread, cx| {
+                                    thread.discard_last_assistant_response(cx);
+                                })?;
+                            }
                             ThreadEvent::AgentText(text) => {
                                 let message_id = assistant_message_id.clone();
                                 acp_thread.update(cx, |thread, cx| {

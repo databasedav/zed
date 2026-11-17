@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
@@ -27,10 +28,13 @@ use typst_layout::PagedDocument;
 use util::ResultExt;
 
 use crate::preprocess::{
-    OffsetMap, TypstInlineCodeSpan, escape_typst_plain_text, extract_inline_code_spans,
-    preprocess_typst_segment,
+    OffsetMap, TypstDocumentSegment, TypstInlineCodeSpan, escape_typst_plain_text,
+    extract_inline_code_spans, preprocess_typst_segment, preprocess_typst_segment_strict,
+    segment_typst_document,
 };
-use crate::world::{TypstFontCatalog, TypstRenderStyle, ZedTypstWorld, resolve_gpui_font_id};
+use crate::world::{
+    TypstFontCatalog, TypstRenderStyle, ZedTypstWorld, resolve_gpui_font_id, user_typst_preamble,
+};
 
 const INTER_PAGE_GAP_PT: f64 = 8.0;
 
@@ -379,6 +383,190 @@ fn quantize_style(style: &TypstRenderStyle) -> TypstRenderStyle {
     quantized
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypstCompileDiagnostic {
+    pub line: usize,
+    pub column: usize,
+    pub snippet: String,
+    pub message: String,
+    pub hints: Vec<String>,
+}
+
+pub fn validate_typst_document(source: &str) -> Vec<TypstCompileDiagnostic> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let segments = segment_typst_document(source);
+    let style = TypstRenderStyle {
+        user_preamble: user_typst_preamble(),
+        ..TypstRenderStyle::default()
+    };
+    let primary_preamble = style.build_preamble();
+    let builtin_preamble = style
+        .user_preamble
+        .is_some()
+        .then(|| style.build_builtin_preamble());
+    let font_catalog = TypstFontCatalog::base();
+    let empty_links = HashMap::default();
+    let mut diagnostics_out = Vec::new();
+
+    for segment in segments {
+        match segment {
+            TypstDocumentSegment::FencedCodeBlock(block) => {
+                if block.is_unclosed {
+                    let (line, column, snippet) =
+                        source_line_col_and_snippet(source, block.full_range.start);
+                    diagnostics_out.push(TypstCompileDiagnostic {
+                        line,
+                        column,
+                        snippet,
+                        message: "unclosed fenced code block".to_string(),
+                        hints: vec![
+                            "close the fenced code block with matching ``` or ~~~ on its own line"
+                                .to_string(),
+                        ],
+                    });
+                }
+            }
+            TypstDocumentSegment::TypstMarkup { source_range } => {
+                let Some(raw_segment) = source.get(source_range.clone()) else {
+                    continue;
+                };
+                if raw_segment.trim().is_empty() {
+                    continue;
+                }
+                let (normalized, offset_map) =
+                    preprocess_typst_segment_strict(raw_segment, source_range.start, &empty_links);
+                collect_segment_diagnostics(
+                    source,
+                    &source_range,
+                    &normalized,
+                    &offset_map,
+                    &primary_preamble,
+                    builtin_preamble.as_deref(),
+                    &font_catalog,
+                    &mut diagnostics_out,
+                );
+            }
+        }
+    }
+
+    typst::comemo::evict(30);
+    diagnostics_out
+}
+
+pub fn format_typst_diagnostics(diagnostics: &[TypstCompileDiagnostic]) -> String {
+    let mut out = String::new();
+    for (index, diag) in diagnostics.iter().take(8).enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let _ = writeln!(
+            out,
+            "Line {}, column {}: {}",
+            diag.line, diag.column, diag.message
+        );
+        if !diag.snippet.trim().is_empty() {
+            let _ = writeln!(out, "  | {}", diag.snippet);
+        }
+        for hint in &diag.hints {
+            let _ = writeln!(out, "  = hint: {hint}");
+        }
+    }
+    if diagnostics.len() > 8 {
+        let _ = writeln!(
+            out,
+            "... and {} additional Typst error(s)",
+            diagnostics.len() - 8
+        );
+    }
+    out.trim_end().to_string()
+}
+
+fn collect_segment_diagnostics(
+    full_source: &str,
+    source_range: &Range<usize>,
+    normalized_typst: &str,
+    offset_map: &OffsetMap,
+    preamble: &str,
+    fallback_builtin_preamble: Option<&str>,
+    font_catalog: &Arc<TypstFontCatalog>,
+    diagnostics_out: &mut Vec<TypstCompileDiagnostic>,
+) {
+    let Ok(world) = ZedTypstWorld::new(preamble, normalized_typst, font_catalog.clone()) else {
+        return;
+    };
+    let warned = typst::compile::<PagedDocument>(&world);
+    let Err(diags) = warned.output else {
+        return;
+    };
+
+    if let Some(builtin_preamble) = fallback_builtin_preamble {
+        let has_preamble_error = diags.iter().any(|diag| {
+            world
+                .range(diag.span)
+                .is_some_and(|range| range.start < world.preamble_byte_len())
+        });
+        if has_preamble_error {
+            collect_segment_diagnostics(
+                full_source,
+                source_range,
+                normalized_typst,
+                offset_map,
+                builtin_preamble,
+                None,
+                font_catalog,
+                diagnostics_out,
+            );
+            return;
+        }
+    }
+
+    for diag in diags {
+        let src_offset = world
+            .range(diag.span)
+            .map(|range| {
+                let norm_offset = range.start.saturating_sub(world.preamble_byte_len());
+                offset_map
+                    .map_to_source(norm_offset)
+                    .clamp(source_range.start, source_range.end)
+            })
+            .unwrap_or(source_range.start);
+        let (line, column, snippet) = source_line_col_and_snippet(full_source, src_offset);
+        diagnostics_out.push(TypstCompileDiagnostic {
+            line,
+            column,
+            snippet,
+            message: diag.message.to_string(),
+            hints: diag.hints.iter().map(|hint| hint.v.to_string()).collect(),
+        });
+    }
+}
+
+fn source_line_col_and_snippet(source: &str, byte_offset: usize) -> (usize, usize, String) {
+    let clamped = byte_offset.min(source.len());
+    let mut safe_offset = clamped;
+    while safe_offset > 0 && !source.is_char_boundary(safe_offset) {
+        safe_offset -= 1;
+    }
+    let before = &source[..safe_offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |pos| pos + 1);
+    let column = source[line_start..safe_offset].chars().count() + 1;
+    let line_end = source[safe_offset..]
+        .find('\n')
+        .map_or(source.len(), |rel| safe_offset + rel);
+    let raw_line = source[line_start..line_end].trim_end_matches('\r');
+    let snippet = if raw_line.chars().count() > 160 {
+        let truncated: String = raw_line.chars().take(160).collect();
+        format!("{truncated}…")
+    } else {
+        raw_line.to_string()
+    };
+    (line, column, snippet)
+}
+
 fn compile_typst_with_fallback(
     normalized_typst: &str,
     raw_fallback_text: &str,
@@ -458,35 +646,17 @@ fn try_compile_with_preamble(
                             );
                             return None;
                         }
-                        let body_err_start =
-                            diag_range.start.saturating_sub(world.preamble_byte_len());
-                        if let Some(split_newline) = normalized_typst
-                            .get(..body_err_start)
-                            .and_then(|prefix| prefix.rfind('\n'))
-                        {
-                            let valid_prefix = &normalized_typst[..split_newline];
-                            let unparsed_tail = &normalized_typst[split_newline..];
-                            let combined = format!(
-                                "{valid_prefix}\n{}",
-                                escape_typst_plain_text(unparsed_tail)
-                            );
-                            if let Ok(split_world) =
-                                ZedTypstWorld::new(preamble, &combined, font_catalog.clone())
-                            {
-                                if let Ok(document) =
-                                    typst::compile::<PagedDocument>(&split_world).output
-                                {
-                                    typst::comemo::evict(30);
-                                    return Some(build_compiled_layout(
-                                        document,
-                                        &split_world,
-                                        offset_map,
-                                        source_range,
-                                    ));
-                                }
-                            }
-                        }
                     }
+                }
+                if let Some(salvaged) = try_salvage_typst_blocks(
+                    preamble,
+                    normalized_typst,
+                    raw_fallback_text,
+                    offset_map,
+                    source_range.clone(),
+                    font_catalog.clone(),
+                ) {
+                    return Some(salvaged);
                 }
             }
         }
@@ -507,6 +677,361 @@ fn try_compile_with_preamble(
     }
 
     None
+}
+
+enum SalvagedPiece {
+    ValidNormalized(Range<usize>),
+    EscapedPlain(String),
+}
+
+fn try_salvage_typst_blocks(
+    preamble: &str,
+    normalized_typst: &str,
+    raw_fallback_text: &str,
+    offset_map: &OffsetMap,
+    source_range: Range<usize>,
+    font_catalog: Arc<TypstFontCatalog>,
+) -> Option<CompiledTypstLayout> {
+    let primary_blocks = split_top_level_typst_blocks(normalized_typst, true);
+    let mut candidate_blocks: Vec<Range<usize>> = Vec::with_capacity(primary_blocks.len());
+    for block_range in primary_blocks {
+        let slice = &normalized_typst[block_range.clone()];
+        if slice.trim().is_empty() {
+            continue;
+        }
+        if has_unclosed_typst_delimiters(slice)
+            && compile_snippet_first_error(preamble, slice, &font_catalog).is_some()
+        {
+            let sub_blocks = split_top_level_typst_blocks(slice, false);
+            if sub_blocks.len() > 1 {
+                for sub in sub_blocks {
+                    if !slice[sub.clone()].trim().is_empty() {
+                        candidate_blocks
+                            .push((block_range.start + sub.start)..(block_range.start + sub.end));
+                    }
+                }
+                continue;
+            }
+        }
+        candidate_blocks.push(block_range);
+    }
+
+    if candidate_blocks.is_empty() {
+        return None;
+    }
+
+    let mut pieces: Vec<SalvagedPiece> = Vec::with_capacity(candidate_blocks.len() + 1);
+    let mut any_valid_typst = false;
+
+    for block_range in candidate_blocks {
+        let block_slice = &normalized_typst[block_range.clone()];
+        match compile_snippet_first_error(preamble, block_slice, &font_catalog) {
+            None => {
+                any_valid_typst = true;
+                pieces.push(SalvagedPiece::ValidNormalized(block_range));
+            }
+            Some(err_byte_in_block) => {
+                if let Some(split_rel) = block_slice
+                    .get(..err_byte_in_block)
+                    .and_then(|prefix| prefix.rfind('\n'))
+                {
+                    let prefix_slice = &block_slice[..split_rel];
+                    if !prefix_slice.trim().is_empty()
+                        && !has_unclosed_typst_delimiters(prefix_slice)
+                        && compile_snippet_first_error(preamble, prefix_slice, &font_catalog)
+                            .is_none()
+                    {
+                        any_valid_typst = true;
+                        pieces.push(SalvagedPiece::ValidNormalized(
+                            block_range.start..(block_range.start + split_rel),
+                        ));
+                        let tail_norm_range = (block_range.start + split_rel + 1)..block_range.end;
+                        let raw_tail = map_norm_range_to_raw_slice(
+                            &tail_norm_range,
+                            normalized_typst,
+                            raw_fallback_text,
+                            offset_map,
+                            &source_range,
+                        );
+                        pieces.push(SalvagedPiece::EscapedPlain(escape_typst_plain_text(
+                            raw_tail,
+                        )));
+                        continue;
+                    }
+                }
+                let raw_block = map_norm_range_to_raw_slice(
+                    &block_range,
+                    normalized_typst,
+                    raw_fallback_text,
+                    offset_map,
+                    &source_range,
+                );
+                pieces.push(SalvagedPiece::EscapedPlain(escape_typst_plain_text(
+                    raw_block,
+                )));
+            }
+        }
+    }
+
+    if !any_valid_typst {
+        return None;
+    }
+
+    let mut combined = String::with_capacity(normalized_typst.len() + 32);
+    let mut map_segments: Vec<(Range<usize>, Option<Range<usize>>, &OffsetMap)> =
+        Vec::with_capacity(pieces.len());
+    for (index, piece) in pieces.iter().enumerate() {
+        if index > 0 {
+            combined.push_str("\n\n");
+        }
+        let new_start = combined.len();
+        match piece {
+            SalvagedPiece::ValidNormalized(orig_range) => {
+                combined.push_str(&normalized_typst[orig_range.clone()]);
+                let new_end = combined.len();
+                map_segments.push((new_start..new_end, Some(orig_range.clone()), offset_map));
+            }
+            SalvagedPiece::EscapedPlain(escaped) => {
+                combined.push_str(escaped);
+                let new_end = combined.len();
+                map_segments.push((new_start..new_end, None, offset_map));
+            }
+        }
+    }
+
+    let salvaged_world = ZedTypstWorld::new(preamble, &combined, font_catalog).ok()?;
+    let document = typst::compile::<PagedDocument>(&salvaged_world)
+        .output
+        .ok()?;
+    typst::comemo::evict(30);
+    let salvaged_map = OffsetMap::from_salvaged_segments(&map_segments, offset_map.source_end());
+    Some(build_compiled_layout(
+        document,
+        &salvaged_world,
+        &salvaged_map,
+        source_range,
+    ))
+}
+
+fn compile_snippet_first_error(
+    preamble: &str,
+    snippet: &str,
+    font_catalog: &Arc<TypstFontCatalog>,
+) -> Option<usize> {
+    let Ok(world) = ZedTypstWorld::new(preamble, snippet, font_catalog.clone()) else {
+        return Some(0);
+    };
+    let warned = typst::compile::<PagedDocument>(&world);
+    match warned.output {
+        Ok(_) => None,
+        Err(diags) => {
+            let err_start = diags
+                .first()
+                .and_then(|diag| world.range(diag.span))
+                .map(|range| range.start.saturating_sub(world.preamble_byte_len()))
+                .unwrap_or(0);
+            Some(err_start)
+        }
+    }
+}
+
+fn map_norm_range_to_raw_slice<'a>(
+    norm_range: &Range<usize>,
+    normalized_typst: &'a str,
+    raw_fallback_text: &'a str,
+    offset_map: &OffsetMap,
+    source_range: &Range<usize>,
+) -> &'a str {
+    let src_start = if norm_range.start == 0 {
+        source_range.start
+    } else {
+        offset_map
+            .map_to_source(norm_range.start)
+            .clamp(source_range.start, source_range.end)
+    };
+    let src_end = if norm_range.end >= normalized_typst.len() {
+        source_range.end
+    } else {
+        offset_map
+            .map_to_source(norm_range.end)
+            .clamp(src_start, source_range.end)
+    };
+    let local_start = src_start.saturating_sub(source_range.start);
+    let local_end = src_end.saturating_sub(source_range.start);
+    if local_start < local_end
+        && local_end <= raw_fallback_text.len()
+        && raw_fallback_text.is_char_boundary(local_start)
+        && raw_fallback_text.is_char_boundary(local_end)
+    {
+        &raw_fallback_text[local_start..local_end]
+    } else {
+        normalized_typst.get(norm_range.clone()).unwrap_or("")
+    }
+}
+
+fn has_unclosed_typst_delimiters(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut in_string = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if in_string {
+            if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'`' {
+            let mut ticks = 0usize;
+            while index + ticks < bytes.len() && bytes[index + ticks] == b'`' {
+                ticks += 1;
+            }
+            index += ticks;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'`' {
+                    let mut close_ticks = 0usize;
+                    while index + close_ticks < bytes.len() && bytes[index + close_ticks] == b'`' {
+                        close_ticks += 1;
+                    }
+                    index += close_ticks;
+                    if close_ticks == ticks {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if !closed {
+                return true;
+            }
+            continue;
+        }
+        match byte {
+            b'"' if paren_depth > 0 || brace_depth > 0 => in_string = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+
+    in_string || paren_depth > 0 || brace_depth > 0 || bracket_depth > 0
+}
+
+fn split_top_level_typst_blocks(text: &str, require_zero_depth: bool) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut block_start = 0usize;
+    let mut index = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut in_string = false;
+
+    while index < len {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index = (index + 2).min(len);
+            continue;
+        }
+        if in_string {
+            if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'`' {
+            let mut ticks = 0usize;
+            while index + ticks < len && bytes[index + ticks] == b'`' {
+                ticks += 1;
+            }
+            index += ticks;
+            while index < len {
+                if bytes[index] == b'`' {
+                    let mut close_ticks = 0usize;
+                    while index + close_ticks < len && bytes[index + close_ticks] == b'`' {
+                        close_ticks += 1;
+                    }
+                    index += close_ticks;
+                    if close_ticks == ticks {
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        let at_top_level =
+            !require_zero_depth || (paren_depth == 0 && brace_depth == 0 && bracket_depth == 0);
+
+        if byte == b'\n' && at_top_level {
+            let mut scan = index + 1;
+            let mut blank_line_count = 0usize;
+            loop {
+                let mut ws = scan;
+                while ws < len && (bytes[ws] == b' ' || bytes[ws] == b'\t' || bytes[ws] == b'\r') {
+                    ws += 1;
+                }
+                if ws < len && bytes[ws] == b'\n' {
+                    blank_line_count += 1;
+                    scan = ws + 1;
+                } else {
+                    break;
+                }
+            }
+
+            let next_line_is_heading = scan < len && bytes[scan] == b'=';
+            if blank_line_count > 0 || next_line_is_heading {
+                if block_start < index && !text[block_start..index].trim().is_empty() {
+                    blocks.push(block_start..index);
+                }
+                block_start = scan;
+                index = scan;
+                continue;
+            }
+        }
+
+        match byte {
+            b'"' if paren_depth > 0 || brace_depth > 0 => in_string = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if block_start < len && !text[block_start..len].trim().is_empty() {
+        blocks.push(block_start..len);
+    }
+
+    blocks
 }
 
 fn build_compiled_layout(

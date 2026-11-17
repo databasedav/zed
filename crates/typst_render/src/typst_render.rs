@@ -3,20 +3,21 @@ mod preprocess;
 mod world;
 
 pub use element::{
-    CompiledTypstLayout, PreparedTypstSegment, TypstFrameElement, TypstGlyphCluster,
-    TypstLinkRegion, try_extract_rounded_rect_quad,
+    CompiledTypstLayout, PreparedTypstSegment, TypstCompileDiagnostic, TypstFrameElement,
+    TypstGlyphCluster, TypstLinkRegion, format_typst_diagnostics, try_extract_rounded_rect_quad,
+    validate_typst_document,
 };
 pub use preprocess::{
     OffsetMap, TypstCodeBlock, TypstDocumentSegment, TypstInlineCodeSpan, convert_math_to_typst,
     escape_typst_plain_text, extract_inline_code_spans, looks_like_latex_math,
-    preprocess_typst_segment, segment_typst_document,
+    preprocess_typst_segment, preprocess_typst_segment_strict, segment_typst_document,
 };
 pub use typst;
 pub use typst_layout;
 pub use typst_syntax;
 pub use world::{
-    TypstFontCatalog, TypstRenderStyle, ZedTypstWorld, hsla_to_typst_hex, resolve_gpui_font_id,
-    set_user_typst_preamble, user_typst_preamble,
+    TypstFontCatalog, TypstRenderStyle, ZedTypstWorld, hsla_to_typst_hex, is_library_math_symbol,
+    resolve_gpui_font_id, set_user_typst_preamble, user_typst_preamble,
 };
 
 #[cfg(test)]
@@ -688,5 +689,141 @@ See @fig-flow for `<timer_notification>` (<timer_notification>), <2% of headset 
             .map(|item| item.text.as_str())
             .collect();
         assert_eq!(fallback_rendered, "file:///tmp/a//b/*c*/");
+    }
+
+    #[test]
+    fn compiles_digit_led_degree_math_inside_tables_and_prose() {
+        let source = "\
+= Why It Generalizes: Foundation Priors + Per-Scene Inverse Graphics
+
+1. *Test-time inverse-graphics optimization:*
+   - Solver: $ min_theta sum_j w_j norm(Pi_K (\"FK\"_j (theta_t)) - x_(t, j))^2 + lambda_\"bone\" norm(Delta L)^2 $
+
+= Where Iterating on One Case _Can_ Still Overfit
+
+Even without training weights, a 2D shoulder-width ratio heuristic mistook crossed arms for a $135 degree$ back-spin.
+
+#table(
+  columns: 2,
+  [*Guardrail*], [*How It Prevents Single-Case Overfitting*],
+  [*3-Domain Inner Loop*], [Every iteration improves #link(\"file:///tmp/09_solo_dance.mp4\")[`09_solo_dance.mp4`] at $+1.0$.],
+  [*Off-Axis 3D Anti-Cheat*], [`eval_recreation.py` scores both `Source Camera` *and* $plus.minus 45 degree$ and $90 degree$ orbited views.],
+)
+
+= Live Parallel Status
+
+All three background engineering lanes (#link(\"file:///tmp/demo_voice_ai.rs#L151-L176\")[`ExpressionWeights`]) are running at `90 Hz`.";
+
+        let diags = validate_typst_document(source);
+        assert!(
+            diags.is_empty(),
+            "expected zero diagnostics on digit-led degree math + #table, got: {diags:?}"
+        );
+
+        let catalog = TypstFontCatalog::base();
+        let segment =
+            PreparedTypstSegment::new(source, 0..source.len(), &HashMap::default(), catalog);
+        let layout = segment.layout_for_style(&TypstRenderStyle {
+            page_width_pt: Some(640.0),
+            ..TypstRenderStyle::default()
+        });
+        let rendered = layout.rendered_text();
+        assert!(
+            rendered.contains("135°"),
+            "expected 135° in rendered output, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("90°"),
+            "expected 90° in rendered output, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("#table("),
+            "expected #table(...) to render natively instead of plain text, got {rendered:?}"
+        );
+        assert_eq!(layout.links().len(), 2);
+    }
+
+    #[test]
+    fn isolates_mid_document_table_syntax_errors_to_offending_block() {
+        let source = "\
+= Valid Intro Heading
+
+Intro math $ x_i <= y_i $ and #link(\"file:///tmp/intro.rs\")[`intro.rs`].
+
+#table(
+  columns: 2,
+  [*Header A*], [*Header B*],
+  [#nonexistent_typst_fn()], [Broken cell],
+)
+
+= Valid Trailing Section
+
+Trailing #link(\"file:///tmp/trailing.rs\")[`trailing.rs`] and *bold status* still render.";
+
+        let diags = validate_typst_document(source);
+        assert!(
+            !diags.is_empty(),
+            "strict validator must report #nonexistent_typst_fn()"
+        );
+
+        let catalog = TypstFontCatalog::base();
+        let segment =
+            PreparedTypstSegment::new(source, 0..source.len(), &HashMap::default(), catalog);
+        let layout = segment.layout_for_style(&TypstRenderStyle {
+            page_width_pt: Some(640.0),
+            ..TypstRenderStyle::default()
+        });
+        let rendered = layout.rendered_text();
+        assert!(
+            !rendered.contains("= Valid Intro Heading"),
+            "intro heading must remain rich Typst instead of escaped '= ', got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("= Valid Trailing Section"),
+            "trailing heading must remain rich Typst instead of escaped '= ', got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("#nonexistent_typst_fn()"),
+            "broken table block should fall back cleanly to plain text, got {rendered:?}"
+        );
+        let link_urls: Vec<&str> = layout
+            .links()
+            .iter()
+            .map(|link| link.destination_url.as_ref())
+            .collect();
+        assert_eq!(
+            link_urls,
+            vec!["file:///tmp/intro.rs", "file:///tmp/trailing.rs"]
+        );
+    }
+
+    #[test]
+    fn strict_validator_catches_unclosed_delimiters_and_maps_line_numbers() {
+        let valid_doc = "= Clean Output\n\nMath $2 times 25 = 50$ and prose $100.\n\n```rust\nfn broken_rust_inside_fence( {\n```\n";
+        assert!(validate_typst_document(valid_doc).is_empty());
+
+        let unclosed_table = "= Heading\n\nParagraph.\n\n#table(\n  columns: 2,\n  [A], [B]\n";
+        let diags = validate_typst_document(unclosed_table);
+        assert!(
+            !diags.is_empty(),
+            "expected strict validator to catch unclosed #table("
+        );
+        let formatted = format_typst_diagnostics(&diags);
+        assert!(formatted.contains("Line "), "got formatted: {formatted}");
+
+        let bad_math = "= Heading\n\nInline $1 + unknown_symbol_xyz$ fails.";
+        let math_diags = validate_typst_document(bad_math);
+        assert_eq!(math_diags.len(), 1);
+        assert_eq!(math_diags[0].line, 3);
+        assert!(math_diags[0].message.contains("unknown variable"));
+
+        let unclosed_fence = "= Heading\n\n```rust\nlet x = 1;\n";
+        let fence_diags = validate_typst_document(unclosed_fence);
+        assert_eq!(fence_diags[0].line, 3);
+        assert!(
+            fence_diags[0]
+                .message
+                .contains("unclosed fenced code block")
+        );
     }
 }

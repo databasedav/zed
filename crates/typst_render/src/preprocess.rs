@@ -61,6 +61,56 @@ impl OffsetMap {
     pub fn source_end(&self) -> usize {
         self.source_end
     }
+
+    pub fn from_salvaged_segments(
+        segments: &[(Range<usize>, Option<Range<usize>>, &OffsetMap)],
+        source_end: usize,
+    ) -> Self {
+        let mut entries = Vec::new();
+        for &(ref new_norm_range, ref orig_norm_range, orig_map) in segments {
+            if new_norm_range.is_empty() {
+                continue;
+            }
+            if let Some(orig_range) = orig_norm_range {
+                for entry in &orig_map.entries {
+                    if entry.normalized_end <= orig_range.start
+                        || entry.normalized_start >= orig_range.end
+                    {
+                        continue;
+                    }
+                    let clipped_start = entry.normalized_start.max(orig_range.start);
+                    let clipped_end = entry.normalized_end.min(orig_range.end);
+                    if clipped_start >= clipped_end {
+                        continue;
+                    }
+                    let norm_span = entry.normalized_end.saturating_sub(entry.normalized_start);
+                    let source_span = entry.source_end.saturating_sub(entry.source_start);
+                    let (src_start, src_end) = if norm_span == source_span {
+                        let delta_start = clipped_start - entry.normalized_start;
+                        let delta_end = clipped_end - entry.normalized_start;
+                        (
+                            entry.source_start + delta_start,
+                            entry.source_start + delta_end,
+                        )
+                    } else {
+                        (entry.source_start, entry.source_end)
+                    };
+                    let shifted_start = new_norm_range.start + (clipped_start - orig_range.start);
+                    let shifted_end = new_norm_range.start + (clipped_end - orig_range.start);
+                    entries.push(OffsetEntry {
+                        normalized_start: shifted_start,
+                        normalized_end: shifted_end,
+                        source_start: src_start,
+                        source_end: src_end,
+                    });
+                }
+            }
+        }
+        Self {
+            entries,
+            source_end,
+        }
+    }
 }
 
 struct NormalizedBuilder {
@@ -572,6 +622,14 @@ pub fn preprocess_typst_segment(
     preprocess_typst_segment_inner(segment_text, base_offset, inline_code_links, false, true)
 }
 
+pub fn preprocess_typst_segment_strict(
+    segment_text: &str,
+    base_offset: usize,
+    inline_code_links: &collections::HashMap<Range<usize>, SharedString>,
+) -> (String, OffsetMap) {
+    preprocess_typst_segment_inner(segment_text, base_offset, inline_code_links, false, false)
+}
+
 fn preprocess_typst_segment_inner(
     segment_text: &str,
     base_offset: usize,
@@ -737,7 +795,7 @@ fn preprocess_typst_segment_inner(
                 }
             }
             builder.push_passthrough(&segment_text[cursor..raw_end], cursor);
-            if !closed {
+            if !closed && apply_streaming_tail {
                 let closing_ticks = "`".repeat(tick_count);
                 builder.push_replaced(&closing_ticks, raw_end..raw_end);
             }
@@ -749,7 +807,7 @@ fn preprocess_typst_segment_inner(
         if !in_markup && current_byte == b'"' {
             let (str_end, closed) = scan_typst_string(bytes, cursor);
             builder.push_passthrough(&segment_text[cursor..str_end], cursor);
-            if !closed {
+            if !closed && apply_streaming_tail {
                 builder.push_replaced("\"", str_end..str_end);
             }
             cursor = str_end;
@@ -790,8 +848,14 @@ fn preprocess_typst_segment_inner(
                 && (!has_both_spaces || standalone_on_line)
             {
                 builder.push_passthrough(&segment_text[cursor..math_end], cursor);
+            } else if !closed && !apply_streaming_tail {
+                builder.push_passthrough(&segment_text[cursor..math_end], cursor);
             } else {
-                let closed_inner = close_unbalanced_math_parens(inner);
+                let closed_inner = if apply_streaming_tail {
+                    close_unbalanced_math_parens(inner)
+                } else {
+                    inner.to_string()
+                };
                 let converted = convert_math_to_typst(&closed_inner, display_mode);
                 builder.push_replaced(&converted, cursor..math_end);
             }
@@ -1845,6 +1909,13 @@ fn looks_like_digit_led_math(between: &str) -> bool {
         return false;
     }
 
+    if unquoted
+        .bytes()
+        .any(|byte| matches!(byte, b'+' | b'=' | b'^' | b'_' | b'<' | b'>' | b'*'))
+    {
+        return true;
+    }
+
     let mut word = String::new();
     for character in unquoted.chars().chain(std::iter::once(' ')) {
         if character.is_ascii_alphabetic() {
@@ -1861,15 +1932,12 @@ fn looks_like_digit_led_math(between: &str) -> bool {
 }
 
 fn is_known_math_word(word: &str) -> bool {
+    if crate::world::is_library_math_symbol(word) {
+        return true;
+    }
     matches!(
         word,
-        "times"
-            | "div"
-            | "approx"
-            | "plus"
-            | "minus"
-            | "pm"
-            | "mp"
+        "pm" | "mp"
             | "leq"
             | "geq"
             | "neq"
@@ -1877,77 +1945,9 @@ fn is_known_math_word(word: &str) -> bool {
             | "not"
             | "mod"
             | "rem"
-            | "log"
-            | "ln"
-            | "lg"
-            | "exp"
-            | "sin"
-            | "cos"
-            | "tan"
-            | "asin"
-            | "acos"
-            | "atan"
-            | "sinh"
-            | "cosh"
-            | "tanh"
-            | "sec"
-            | "csc"
-            | "cot"
-            | "min"
-            | "max"
-            | "sup"
-            | "inf"
-            | "lim"
-            | "sum"
             | "prod"
-            | "product"
-            | "integral"
-            | "sqrt"
-            | "root"
-            | "abs"
-            | "norm"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "quad"
-            | "wide"
-            | "dif"
             | "diff"
-            | "Delta"
-            | "Gamma"
-            | "Lambda"
-            | "Omega"
-            | "Phi"
-            | "Pi"
-            | "Psi"
-            | "Sigma"
-            | "Theta"
-            | "alpha"
-            | "beta"
-            | "gamma"
-            | "delta"
-            | "epsilon"
-            | "zeta"
-            | "eta"
-            | "theta"
-            | "iota"
-            | "kappa"
-            | "lambda"
-            | "mu"
-            | "nu"
-            | "xi"
-            | "pi"
-            | "rho"
-            | "sigma"
-            | "tau"
-            | "upsilon"
-            | "phi"
-            | "chi"
-            | "psi"
-            | "omega"
-            | "infinity"
             | "infty"
-            | "arrow"
             | "rightarrow"
             | "leftarrow"
             | "leftrightarrow"
@@ -1957,18 +1957,8 @@ fn is_known_math_word(word: &str) -> bool {
             | "iff"
             | "implies"
             | "propto"
-            | "subset"
-            | "supset"
-            | "cup"
-            | "cap"
             | "emptyset"
-            | "forall"
-            | "exists"
-            | "nabla"
-            | "partial"
             | "cdot"
-            | "dots"
-            | "circle"
             | "deg"
     )
 }

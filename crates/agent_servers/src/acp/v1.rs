@@ -53,6 +53,7 @@ pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const ZED_TRUNCATE_SESSION_META_KEY: &str = "zed_truncate_session";
 const ZED_USER_MESSAGE_ID_META_KEY: &str = "zed_user_message_id";
+const ZED_VALIDATE_TYPST_META_KEY: &str = "zed_validate_typst";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_zed/diagnostics", response = ZedDiagnosticsResponse)]
@@ -67,6 +68,41 @@ struct ZedDiagnosticsRequest {
 #[serde(rename_all = "camelCase")]
 struct ZedDiagnosticsResponse {
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/validate_typst", response = ZedValidateTypstResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedValidateTypstRequest {
+    session_id: acp::SessionId,
+    text: String,
+    #[serde(default)]
+    discard_if_invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZedTypstDiagnostic {
+    line: usize,
+    column: usize,
+    snippet: String,
+    message: String,
+    hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedValidateTypstResponse {
+    valid: bool,
+    diagnostics: Vec<ZedTypstDiagnostic>,
+    formatted_errors: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/discard_last_assistant_message")]
+#[serde(rename_all = "camelCase")]
+struct ZedDiscardLastAssistantMessageNotification {
+    session_id: acp::SessionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
@@ -525,6 +561,10 @@ fn client_builder(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            on_request!(handle_zed_validate_typst),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             on_request!(handle_create_terminal),
             agent_client_protocol::on_receive_request!(),
         )
@@ -561,6 +601,10 @@ fn client_builder(
             on_notification!(handle_zed_subagent_continuation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            on_notification!(handle_zed_discard_last_assistant_message),
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 /// `acp_beta` advertises the unstable subagents and plan operations RFDs, which Zed only
@@ -574,6 +618,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("zed_async_subagents".into(), true.into()),
         ("zed_subagent_messaging".into(), true.into()),
         (ZED_TRUNCATE_SESSION_META_KEY.into(), true.into()),
+        (ZED_VALIDATE_TYPST_META_KEY.into(), true.into()),
     ]);
 
     meta.insert("zed_markup_format".into(), "typst".into());
@@ -10560,6 +10605,42 @@ exit 7
             meta.get("zed_truncate_session"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            meta.get("zed_validate_typst"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let validate_req = ZedValidateTypstRequest {
+            session_id: acp::SessionId::new("sess-1"),
+            text: "= Heading\n\n$135 degree$".to_string(),
+            discard_if_invalid: true,
+        };
+        assert_eq!(validate_req.method(), "_zed/validate_typst");
+        let untyped_validate = validate_req.to_untyped_message().unwrap();
+        assert_eq!(untyped_validate.method, "_zed/validate_typst");
+        assert_eq!(
+            untyped_validate.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "text": "= Heading\n\n$135 degree$",
+                "discardIfInvalid": true,
+            })
+        );
+
+        let discard_notif = ZedDiscardLastAssistantMessageNotification {
+            session_id: acp::SessionId::new("sess-1"),
+        };
+        assert_eq!(
+            discard_notif.method(),
+            "_zed/discard_last_assistant_message"
+        );
+        let untyped_discard = discard_notif.to_untyped_message().unwrap();
+        assert_eq!(
+            untyped_discard.params,
+            serde_json::json!({
+                "sessionId": "sess-1",
+            })
+        );
 
         let diag_req = ZedDiagnosticsRequest {
             session_id: acp::SessionId::new("sess-1"),
@@ -11290,6 +11371,73 @@ fn handle_zed_diagnostics(
         );
     })
     .detach();
+}
+
+fn handle_zed_validate_typst(
+    args: ZedValidateTypstRequest,
+    responder: Responder<ZedValidateTypstResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+        Ok(t) => t,
+        Err(e) => return respond_err(responder, e),
+    };
+
+    let raw_diagnostics = typst_render::validate_typst_document(&args.text);
+    let valid = raw_diagnostics.is_empty();
+    let formatted_errors = if valid {
+        String::new()
+    } else {
+        typst_render::format_typst_diagnostics(&raw_diagnostics)
+    };
+    let diagnostics = raw_diagnostics
+        .into_iter()
+        .map(|diag| ZedTypstDiagnostic {
+            line: diag.line,
+            column: diag.column,
+            snippet: diag.snippet,
+            message: diag.message,
+            hints: diag.hints,
+        })
+        .collect();
+
+    if !valid && args.discard_if_invalid {
+        thread
+            .update(cx, |thread, cx| {
+                thread.discard_last_assistant_response(cx);
+            })
+            .ok();
+    }
+
+    responder
+        .respond(ZedValidateTypstResponse {
+            valid,
+            diagnostics,
+            formatted_errors,
+        })
+        .log_err();
+}
+
+fn handle_zed_discard_last_assistant_message(
+    notification: ZedDiscardLastAssistantMessageNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let session_id = acp_v2::SessionId::new(notification.session_id.0);
+    let thread = {
+        let sessions = ctx.sessions.borrow();
+        sessions
+            .get(&session_id)
+            .map(|session| session.thread.clone())
+    };
+    if let Some(thread) = thread {
+        thread
+            .update(cx, |thread, cx| {
+                thread.discard_last_assistant_response(cx);
+            })
+            .ok();
+    }
 }
 
 fn apply_v1_subagent_update(

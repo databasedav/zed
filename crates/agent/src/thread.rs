@@ -1069,6 +1069,7 @@ pub struct AvailableModel {
 pub enum ThreadEvent {
     UserMessage(UserMessage),
     SubagentResultBoundary,
+    DiscardLastAssistantMessage,
     AgentText(String),
     AgentThinking(String),
     ToolCallUpdate(acp_thread::ToolCallUpdate),
@@ -1476,6 +1477,7 @@ pub struct Thread {
     /// running to completion. The UI sets this to deliver a "steering" queued
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
+    validate_typst_output: bool,
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
@@ -1638,6 +1640,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            validate_typst_output: !cfg!(any(test, feature = "test-support")),
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
@@ -2034,6 +2037,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            validate_typst_output: !cfg!(any(test, feature = "test-support")),
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
@@ -2658,6 +2662,10 @@ impl Thread {
 
     pub fn end_turn_at_next_boundary(&self) -> bool {
         self.end_turn_at_next_boundary
+    }
+
+    pub fn set_validate_typst_output(&mut self, validate: bool) {
+        self.validate_typst_output = validate;
     }
 
     fn accumulate_token_usage(&mut self, update: language_model::TokenUsage) {
@@ -3299,10 +3307,13 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
+        const MAX_TYPST_REPAIR_ATTEMPTS: usize = 2;
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
+        let mut typst_repair_attempts = 0usize;
+        let mut typst_repair_context: Option<Vec<LanguageModelRequestMessage>> = None;
         loop {
             if *cancellation_rx.borrow()
                 || this.read_with(cx, |this, _| this.steered_interrupt_requested)?
@@ -3406,7 +3417,10 @@ impl Thread {
                     .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
-                let request = this.build_completion_request(intent, cx)?;
+                let mut request = this.build_completion_request(intent, cx)?;
+                if let Some(repair_messages) = &typst_repair_context {
+                    request.messages.extend(repair_messages.iter().cloned());
+                }
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, provider, request))
             })??;
@@ -3694,6 +3708,7 @@ impl Thread {
                     log::debug!("Steering message queued, ending turn at message boundary");
                     return Ok(());
                 }
+                typst_repair_context = None;
                 let has_ready_subagent_results = this.update(cx, |this, cx| {
                     let had_non_canceled = this.has_pending_subagent_results();
                     if !end_turn || had_non_canceled {
@@ -3702,6 +3717,77 @@ impl Thread {
                     had_non_canceled
                 })?;
                 if end_turn && !has_ready_subagent_results {
+                    if typst_repair_attempts < MAX_TYPST_REPAIR_ATTEMPTS {
+                        let maybe_invalid_draft = this.read_with(cx, |this, _| {
+                            if !this.validate_typst_output {
+                                return None;
+                            }
+                            let Some(Message::Agent(agent_message)) = this.last_message() else {
+                                return None;
+                            };
+                            if !agent_message.tool_results.is_empty() {
+                                return None;
+                            }
+                            let mut combined_text = String::new();
+                            for chunk in &agent_message.content {
+                                if let AgentMessageContent::Text(text) = chunk {
+                                    combined_text.push_str(text);
+                                }
+                            }
+                            if combined_text.trim().is_empty() {
+                                return None;
+                            }
+                            let diagnostics = typst_render::validate_typst_document(&combined_text);
+                            if diagnostics.is_empty() {
+                                None
+                            } else {
+                                Some(typst_render::format_typst_diagnostics(&diagnostics))
+                            }
+                        })?;
+
+                        if let Some(formatted_errors) = maybe_invalid_draft {
+                            typst_repair_attempts += 1;
+                            let repair_prompt = format_typst_repair_prompt(
+                                typst_repair_attempts,
+                                MAX_TYPST_REPAIR_ATTEMPTS,
+                                &formatted_errors,
+                            );
+                            let maybe_repair_messages = this.update(cx, |this, cx| {
+                                if !matches!(this.last_message(), Some(Message::Agent(_))) {
+                                    return None;
+                                }
+                                let Some(popped) = this.messages.pop() else {
+                                    return None;
+                                };
+                                let Message::Agent(broken_agent_message) = popped.as_ref() else {
+                                    this.messages.push(popped);
+                                    return None;
+                                };
+                                let mut extra = broken_agent_message.to_request();
+                                extra.push(LanguageModelRequestMessage {
+                                    role: Role::User,
+                                    content: vec![repair_prompt.into()],
+                                    cache: false,
+                                    reasoning_details: None,
+                                });
+                                cx.notify();
+                                Some(extra)
+                            })?;
+
+                            if let Some(repair_messages) = maybe_repair_messages {
+                                log::info!(
+                                    "Agent Typst output failed strict validation (attempt {}/{}); requesting self-repair",
+                                    typst_repair_attempts,
+                                    MAX_TYPST_REPAIR_ATTEMPTS
+                                );
+                                event_stream.send_discard_last_assistant_message();
+                                typst_repair_context = Some(repair_messages);
+                                intent = CompletionIntent::UserPrompt;
+                                attempt = 0;
+                                continue;
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 intent = CompletionIntent::ToolResults;
@@ -6211,6 +6297,12 @@ impl ThreadEventStream {
     fn send_thinking(&self, text: &str) {
         self.sender
             .unbounded_send(Ok(ThreadEvent::AgentThinking(text.to_string())))
+            .ok();
+    }
+
+    fn send_discard_last_assistant_message(&self) {
+        self.sender
+            .unbounded_send(Ok(ThreadEvent::DiscardLastAssistantMessage))
             .ok();
     }
 
@@ -10936,4 +11028,119 @@ mod tests {
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
     }
+
+    #[gpui::test]
+    async fn test_typst_compile_error_self_repairs_and_discards_draft(cx: &mut TestAppContext) {
+        let (thread, _unused_stream, fake) = setup_thread_for_test(cx).await;
+        let model = cx.update(|cx| {
+            let model = fake.model("fake");
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_validate_typst_output(true);
+            });
+            model
+        });
+
+        let mut events_rx = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .send(
+                        ClientUserMessageId::new(),
+                        vec![UserMessageContent::Text("Show angle equation".to_string())],
+                        cx,
+                    )
+                    .expect("send user prompt")
+            })
+        });
+        cx.run_until_parked();
+
+        // Attempt 1: invalid Typst math (`unknown_ident_xyz` is undefined in Typst math scope).
+        fake.send_last_text(&model, "= Draft\n\nBad math: $1 + unknown_ident_xyz$");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        // Thread should have requested a repair completion carrying `<typst_compile_error>`.
+        let repair_request = fake
+            .pending_completions()
+            .into_iter()
+            .last()
+            .expect("expected second completion request for Typst self-repair");
+        let last_req_text = repair_request
+            .messages
+            .last()
+            .expect("repair user message")
+            .string_contents();
+        assert!(
+            last_req_text.contains("<typst_compile_error"),
+            "expected <typst_compile_error> in repair request, got: {last_req_text}"
+        );
+        assert!(
+            last_req_text.contains("unknown variable"),
+            "expected compiler diagnostic in repair request, got: {last_req_text}"
+        );
+
+        // Attempt 2: valid Typst math (`$135 degree$`).
+        fake.send_last_text(&model, "= Final\n\nClean angle: $135 degree$");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        let mut saw_discard = false;
+        let mut final_texts = Vec::new();
+        let mut saw_stop = false;
+        while let Ok(Ok(event)) = events_rx.try_recv() {
+            match event {
+                ThreadEvent::AgentText(text) => {
+                    final_texts.push(text);
+                }
+                ThreadEvent::DiscardLastAssistantMessage => {
+                    saw_discard = true;
+                    final_texts.clear();
+                }
+                ThreadEvent::Stop(acp_v2::StopReason::EndTurn) => {
+                    saw_stop = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_discard, "expected DiscardLastAssistantMessage event");
+        assert!(saw_stop, "expected Stop(EndTurn)");
+        assert_eq!(final_texts.concat(), "= Final\n\nClean angle: $135 degree$");
+
+        // Saved thread history must contain ONLY the user prompt and the repaired assistant message!
+        cx.update(|cx| {
+            let messages = &thread.read(cx).messages;
+            assert_eq!(messages.len(), 2, "got messages: {messages:?}");
+            assert!(matches!(&*messages[0], Message::User(_)));
+            match &*messages[1] {
+                Message::Agent(agent_msg) => {
+                    assert_eq!(
+                        agent_msg.content,
+                        vec![AgentMessageContent::Text(
+                            "= Final\n\nClean angle: $135 degree$".to_string()
+                        )]
+                    );
+                }
+                other => panic!("expected repaired Message::Agent, got {other:?}"),
+            }
+        });
+    }
+}
+
+fn format_typst_repair_prompt(
+    attempt: usize,
+    max_attempts: usize,
+    formatted_errors: &str,
+) -> String {
+    format!(
+        "<typst_compile_error attempt=\"{attempt}\" max_attempts=\"{max_attempts}\">\n\
+Your previous response failed to compile in Zed's native Typst renderer with the following compiler diagnostic(s):\n\n\
+{formatted_errors}\n\n\
+Re-emit your complete, self-contained response in valid Typst so it compiles cleanly \
+(the failed draft has been discarded from the user's transcript—do not apologize or mention this compiler check; output only the corrected final response).\n\
+Common fixes:\n\
+- Escape prose currency dollar signs as `\\$` (e.g. `\\$100`), never inside backticks.\n\
+- Close every `#table(...)`, `[...]`, `{{...}}`, `(...)`, `$...$`, `` `...` ``, and fenced ```` ``` ```` block, and keep all delimiters balanced inside each `#table(...)` cell.\n\
+- Inside `$...$` math, quote multi-letter words (`\"bone\"`, `\"Hz\"`) or use valid Typst math/symbol names (`degree`, `times`, `approx`, `plus.minus`, `<=`, `>=`, `!=`, `->`, `<->`)—never backslash-stripped LaTeX macros.\n\
+</typst_compile_error>"
+    )
 }
