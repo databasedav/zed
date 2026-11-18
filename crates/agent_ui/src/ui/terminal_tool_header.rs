@@ -172,11 +172,18 @@ impl RenderOnce for TerminalToolHeader {
                 ),
             )
             .child(
-                Disclosure::new(child_id("disclosure"), is_expanded)
-                    .opened_icon(IconName::ChevronUp)
-                    .closed_icon(IconName::ChevronDown)
-                    .visible_on_hover(&hover_group)
-                    .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
+                div()
+                    .debug_selector({
+                        let selector = child_id("disclosure");
+                        move || selector
+                    })
+                    .child(
+                        Disclosure::new(child_id("disclosure"), is_expanded)
+                            .opened_icon(IconName::ChevronUp)
+                            .closed_icon(IconName::ChevronDown)
+                            .when(is_expanded, |this| this.visible_on_hover(&hover_group))
+                            .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
+                    ),
             )
             .when(show_elapsed, |header| {
                 let elapsed = elapsed.unwrap_or_default();

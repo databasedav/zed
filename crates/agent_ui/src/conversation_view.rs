@@ -20170,6 +20170,179 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_tall_floating_permission_card_preserves_list_viewport_and_scroll_button(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let tool_id = acp_v2::ToolCallId::new("perm-tall-real");
+        let terminal_id = acp_v1::TerminalId::new("term-tall-real");
+        let long_cmd = format!(
+            "```\ncat <<'PY' > synth_4d_oracle.py\n{}\nPY\n```",
+            (0..150)
+                .map(|i| format!("x_{i} = {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tool_call =
+            acp_v1::ToolCall::new(acp_v1::ToolCallId::new(tool_id.0.clone()), long_cmd.clone())
+                .kind(acp_v1::ToolKind::Execute)
+                .content(vec![acp_v1::ToolCallContent::Terminal(
+                    acp_v1::Terminal::new(terminal_id.clone()),
+                )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let real_thread_view = active_thread(&conversation_view, cx);
+        let thread = real_thread_view.read_with(cx, |view, _| view.thread.clone());
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                Default::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        cx.update(|_window, cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                            "Earlier response\n\n".repeat(45).into(),
+                        )),
+                        cx,
+                    )
+                    .expect("preceding assistant response");
+            });
+        });
+        cx.run_until_parked();
+
+        let _auth_task = cx.update(|_window, cx| {
+            thread.update(cx, |thread, cx| {
+                thread.on_terminal_provider_event(
+                    acp_thread::TerminalProviderEvent::Created {
+                        terminal_id: terminal_id.clone(),
+                        label: long_cmd.clone(),
+                        cwd: None,
+                        output_byte_limit: None,
+                        terminal,
+                    },
+                    cx,
+                );
+                thread
+                    .request_tool_call_authorization_with_id(
+                        tool_call.into(),
+                        PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                            "allow",
+                            "Allow",
+                            acp_v2::PermissionOptionKind::AllowOnce,
+                        )]),
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .expect("permission request")
+                    .1
+            })
+        });
+        cx.run_until_parked();
+
+        // Scroll up to the top of the conversation so the pending tool call sits below the viewport.
+        // The first frame at `item_ix: 0` measures the top entries in `prepaint`; the next frame
+        // renders the activity bar against those measured item bounds.
+        real_thread_view.update(cx, |view, cx| {
+            view.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.0),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        real_thread_view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let floating_bounds = cx
+            .debug_bounds("main-agent-awaiting-permission-card")
+            .expect("floating awaiting-permission card should mount when scrolled up");
+        let window_height = cx.update(|window, _| window.viewport_size().height);
+        assert!(
+            floating_bounds.size.height <= window_height * 0.45,
+            "floating permission card height ({:?}) must stay capped below 45% of window ({:?}) so list stays scrollable",
+            floating_bounds.size.height,
+            window_height,
+        );
+
+        // Clicking `Scroll` on the floating banner must bring the pending entry into view and dismiss the banner.
+        let scroll_btn = cx
+            .debug_bounds("main-agent-permission-scroll-to")
+            .expect("Scroll button on floating permission banner");
+        cx.simulate_click(scroll_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("main-agent-awaiting-permission-card")
+                .is_none(),
+            "clicking Scroll must bring the pending tool call into the non-zero list viewport and dismiss the floating card",
+        );
+
+        // Clicking the disclosure chevron on the inline 150-line terminal card must collapse its height.
+        let inline_card_selector = "tool-call-perm-tall-real-standalone";
+        let expanded_bounds = cx
+            .debug_bounds(inline_card_selector)
+            .expect("inline terminal tool card bounds when expanded");
+        cx.simulate_mouse_move(
+            point(
+                expanded_bounds.center().x,
+                expanded_bounds.origin.y + px(12.0),
+            ),
+            None,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        let terminal_entity_id = real_thread_view.read_with(cx, |view, cx| {
+            let (_, call) = view
+                .thread
+                .read(cx)
+                .tool_call(&tool_id)
+                .expect("terminal tool call");
+            call.terminals()
+                .next()
+                .expect("attached terminal")
+                .entity_id()
+        });
+        let disclosure_selector: &'static str =
+            Box::leak(format!("terminal-tool-disclosure-{terminal_entity_id}").into_boxed_str());
+        let disclosure_bounds = cx
+            .debug_bounds(disclosure_selector)
+            .expect("terminal header disclosure chevron");
+        cx.simulate_click(disclosure_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let collapsed_bounds = cx
+            .debug_bounds(inline_card_selector)
+            .expect("inline terminal tool card bounds when collapsed");
+        assert!(
+            collapsed_bounds.size.height < expanded_bounds.size.height * 0.6,
+            "collapsing a 150-line terminal command must shrink card height significantly (expanded={:?}, collapsed={:?})",
+            expanded_bounds.size.height,
+            collapsed_bounds.size.height,
+        );
+    }
+
+    #[gpui::test]
     async fn test_permission_row_shown_when_inline_prompt_is_above_viewport(
         cx: &mut TestAppContext,
     ) {

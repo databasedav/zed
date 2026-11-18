@@ -840,7 +840,14 @@ impl ListState {
         }
 
         let item_bounds = self.bounds_for_item(ix)?;
-        Some(item_bounds.top() >= viewport_bounds.bottom())
+        if viewport_bounds.size.height <= px(0.) {
+            // When the viewport is squeezed to zero height (`top == bottom`), an item
+            // anchored at `viewport_bounds.top()` (`top <= viewport_bounds.top() < bottom`)
+            // is positioned at the scroll top rather than below the viewport.
+            Some(item_bounds.top() > viewport_bounds.top())
+        } else {
+            Some(item_bounds.top() >= viewport_bounds.bottom())
+        }
     }
 }
 
@@ -2061,6 +2068,8 @@ mod test {
 
         assert_eq!(state.item_is_above_viewport(1), Some(true));
         assert_eq!(state.item_is_below_viewport(1), Some(false));
+        assert_eq!(state.item_is_above_viewport(2), Some(false));
+        assert_eq!(state.item_is_below_viewport(2), Some(false));
         assert_eq!(state.item_is_above_viewport(3), Some(false));
         assert_eq!(state.item_is_below_viewport(3), Some(true));
     }

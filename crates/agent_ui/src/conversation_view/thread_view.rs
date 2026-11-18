@@ -6105,23 +6105,34 @@ impl ThreadView {
                     .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
             )
             .child(
-                Button::new("main-agent-permission-scroll-to", "Scroll")
-                    .label_size(LabelSize::Small)
-                    .end_icon(
-                        Icon::new(scroll_icon)
-                            .size(IconSize::XSmall)
-                            .color(Color::Default),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.list_state.scroll_to(ListOffset {
-                            item_ix: entry_ix,
-                            offset_in_item: px(0.0),
-                        });
-                        cx.notify();
-                    })),
+                div()
+                    .debug_selector(|| "main-agent-permission-scroll-to".into())
+                    .child(
+                        Button::new("main-agent-permission-scroll-to", "Scroll")
+                            .label_size(LabelSize::Small)
+                            .end_icon(
+                                Icon::new(scroll_icon)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Default),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.list_state.scroll_to(ListOffset {
+                                    item_ix: entry_ix,
+                                    offset_in_item: px(0.0),
+                                });
+                                cx.notify();
+                            })),
+                    ),
             );
 
-        Some(v_flex().child(header).child(card).into_any())
+        let scrollable_card = div()
+            .id("main-agent-awaiting-permission-card")
+            .debug_selector(|| "main-agent-awaiting-permission-card".into())
+            .max_h(window.viewport_size().height * 0.4)
+            .overflow_y_scroll()
+            .child(card);
+
+        Some(v_flex().child(header).child(scrollable_card).into_any())
     }
 
     fn render_message_queue_summary(
@@ -12264,6 +12275,9 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
+        is_expanded: bool,
+        needs_confirmation: bool,
+        layout: ToolCallLayout,
         command: Entity<Markdown>,
         window: &Window,
         cx: &Context<Self>,
@@ -12276,6 +12290,7 @@ impl ThreadView {
             .and_then(|s| s.strip_suffix("\n```"))
             .unwrap_or(&command_source)
             .to_string();
+        let command_line_count = command_text.lines().count();
 
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
@@ -12311,6 +12326,29 @@ impl ThreadView {
                 wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
                 border: false,
             });
+        let command_content = if !is_expanded {
+            div()
+                .max_h(rems_from_px(17_f32))
+                .overflow_hidden()
+                .child(markdown_element)
+                .into_any_element()
+        } else if layout == ToolCallLayout::Floating && command_line_count > 6 {
+            div()
+                .id(SharedString::from(format!("{group}-command-scroll")))
+                .max_h(rems(10.))
+                .overflow_y_scroll()
+                .child(markdown_element)
+                .into_any_element()
+        } else if needs_confirmation && command_line_count > 12 {
+            div()
+                .id(SharedString::from(format!("{group}-command-scroll")))
+                .max_h(rems(16.))
+                .overflow_y_scroll()
+                .child(markdown_element)
+                .into_any_element()
+        } else {
+            markdown_element.into_any_element()
+        };
         let copy_button_id = SharedString::from(format!("{group}-copy-command"));
         let copy_button = CopyButton::new(copy_button_id, command_text)
             .tooltip_label("Copy Command")
@@ -12321,7 +12359,7 @@ impl ThreadView {
             .relative()
             .p_1p5()
             .when(is_preview, |this| this.pt_1().children(run_command_label))
-            .child(markdown_element)
+            .child(command_content)
             .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
@@ -12388,18 +12426,21 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
-
         let is_expanded = self
             .entry_view_state
             .read(cx)
             .is_tool_call_expanded(&tool_call.id);
+
+        let command_element = self.render_collapsible_command(
+            header_group.clone(),
+            false,
+            is_expanded,
+            needs_confirmation,
+            layout,
+            tool_call.label.clone(),
+            window,
+            cx,
+        );
 
         let truncated_tooltip = truncated_output.then(|| {
             if let Some(output) = output {
@@ -13001,6 +13042,9 @@ impl ThreadView {
                         self.render_collapsible_command(
                             card_header_id.clone(),
                             true,
+                            true,
+                            needs_confirmation,
+                            layout,
                             tool_call.label.clone(),
                             window,
                             cx,
