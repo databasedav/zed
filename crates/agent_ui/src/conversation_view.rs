@@ -2703,6 +2703,15 @@ impl ConversationView {
             .cloned()
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
         let connection = connected.connection.clone();
+        let is_native_parent = connection
+            .clone()
+            .into_any()
+            .is::<agent::NativeAgentConnection>();
+        let connection_store = self.connection_store.clone();
+        let project = self.project.clone();
+        let thread_store = self.thread_store.clone();
+        let fallback_work_dirs = work_dirs.clone();
+        let fallback_title = provisional_title.clone();
         if let Some(connected) = self.as_connected_mut() {
             connected
                 .loading_subagent_sessions
@@ -2719,7 +2728,44 @@ impl ConversationView {
 
         let parent_thread = parent_thread.downgrade();
         cx.spawn(async move |this, cx| {
-            let result = subagent_thread_task.await;
+            let result = match subagent_thread_task.await {
+                Ok(thread) => Ok(thread),
+                Err(primary_error) if !is_native_parent => {
+                    let native_connect = cx.update(|cx| {
+                        let store = thread_store.or_else(|| agent::ThreadStore::try_global(cx))?;
+                        let fs = project.read(cx).fs().clone();
+                        let server = crate::Agent::NativeAgent.server(fs, store);
+                        let entry = connection_store.update(cx, |connection_store, cx| {
+                            connection_store.request_connection(
+                                crate::Agent::NativeAgent,
+                                server,
+                                cx,
+                            )
+                        });
+                        Some(entry.read(cx).wait_for_connection())
+                    });
+                    if let Some(native_connect) = native_connect {
+                        match native_connect.await {
+                            Ok(connected_state) => {
+                                let load_task = cx.update(|cx| {
+                                    connected_state.connection.load_session(
+                                        subagent_id.clone(),
+                                        project.clone(),
+                                        fallback_work_dirs,
+                                        fallback_title,
+                                        cx,
+                                    )
+                                });
+                                load_task.await.or(Err(primary_error))
+                            }
+                            Err(_) => Err(primary_error),
+                        }
+                    } else {
+                        Err(primary_error)
+                    }
+                }
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, _| {
                 if let Some(connected) = this.as_connected_mut() {
                     connected.loading_subagent_sessions.remove(&subagent_id);

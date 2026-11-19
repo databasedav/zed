@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+mod native_subagent_bridge;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
@@ -9,6 +10,11 @@ use collections::{HashMap, HashSet};
 pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
+pub use native_subagent_bridge::{
+    GlobalNativeSubagentBridge, NativeSubagentBridge, NativeSubagentFinishedEvent,
+    NativeSubagentModelInfo, NativeSubagentQueryRequest, NativeSubagentSpawnRequest,
+    NativeSubagentSpawnResponse,
+};
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 
 use acp_thread::AgentConnection;

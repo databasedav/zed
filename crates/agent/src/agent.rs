@@ -553,6 +553,8 @@ pub struct NativeAgent {
     models: LanguageModels,
     /// Handler installed by the UI for `create_thread` / `list_agents_and_models` tools.
     sibling_thread_host: Option<Rc<dyn SiblingThreadHost>>,
+    /// Tracks external-parent subagent runs explicitly canceled by a parent Stop click.
+    external_subagent_parent_stops: HashMap<acp_v2::SessionId, bool>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
     /// Tracks the lifecycle of global skills directory observation. We
@@ -726,6 +728,7 @@ impl NativeAgent {
                 templates,
                 models: LanguageModels::new(cx),
                 sibling_thread_host: None,
+                external_subagent_parent_stops: HashMap::default(),
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
@@ -3272,7 +3275,11 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
             effort,
             speed,
             ..
-        } = agent_settings::language_model_to_selection(&model, favorite.as_ref());
+        } = agent_settings::AgentSettings::get_global(cx).resolve_model_selection(
+            &model,
+            favorite.as_ref(),
+            false,
+        );
 
         thread.update(cx, |thread, cx| {
             thread.set_model(model.clone(), cx);
@@ -3360,20 +3367,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 }
 
-fn subagent_model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
-    let settings = agent_settings::AgentSettings::get_global(cx);
-    let Some((provider, model)) = model_id.as_ref().split_once('/') else {
-        return model_id_to_selection(model_id, cx);
-    };
-    if let Some(selection) = settings.subagent_model.as_ref()
-        && selection.provider.0 == provider
-        && selection.model == model
-    {
-        return selection.clone();
-    }
-    model_id_to_selection(model_id, cx)
-}
-
 fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
     let id = model_id.as_ref();
     let (provider, model) = id.split_once('/').unwrap_or(("", id));
@@ -3390,32 +3383,211 @@ fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSele
                 .find(|model| model.id() == model_id)
         });
 
-    let Some(resolved) = resolved else {
-        return LanguageModelSelection {
-            provider: provider.to_owned().into(),
-            model: model.to_owned(),
+    if let Some(model) = resolved {
+        agent_settings::AgentSettings::get_global(cx).resolve_model_selection(&model, None, false)
+    } else {
+        LanguageModelSelection {
+            provider: provider.to_string().into(),
+            model: model.to_string(),
             enable_thinking: false,
             effort: None,
             speed: None,
+        }
+    }
+}
+
+fn parse_model_and_effort<'a>(
+    models: &LanguageModels,
+    raw_model: &'a str,
+    explicit_effort: Option<&'a str>,
+) -> (&'a str, Option<&'a str>) {
+    let trimmed_model = raw_model.trim();
+    if explicit_effort.is_some()
+        || models
+            .model_from_id(&AgentModelId::new(trimmed_model))
+            .is_some()
+    {
+        return (trimmed_model, explicit_effort);
+    }
+
+    for delimiter in ['@', ':'] {
+        if let Some((candidate_model, candidate_effort)) = trimmed_model.rsplit_once(delimiter) {
+            let candidate_model = candidate_model.trim();
+            let candidate_effort = candidate_effort.trim();
+            if !candidate_model.is_empty()
+                && !candidate_effort.is_empty()
+                && models
+                    .model_from_id(&AgentModelId::new(candidate_model))
+                    .is_some()
+            {
+                return (candidate_model, Some(candidate_effort));
+            }
+        }
+    }
+
+    (trimmed_model, explicit_effort)
+}
+
+fn resolve_subagent_model_and_effort(
+    models: &LanguageModels,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    fallback_model: Option<&LanguageModel>,
+    cx: &App,
+) -> Result<(LanguageModel, LanguageModelSelection)> {
+    let explicit_effort = requested_effort
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty());
+    let requested_model = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+
+    let (resolved_model, effective_effort) = if let Some(raw_model) = requested_model {
+        let (candidate_model, effective_effort) =
+            parse_model_and_effort(models, raw_model, explicit_effort);
+        let Some(model) = models.model_from_id(&AgentModelId::new(candidate_model)) else {
+            anyhow::bail!(
+                "Model {candidate_model} is unavailable. Call list_agents_and_models to inspect available models."
+            );
         };
+        (model, effective_effort)
+    } else {
+        let settings = agent_settings::AgentSettings::get_global(cx);
+        let configured_subagent_model = settings.subagent_model.as_ref().and_then(|selection| {
+            models.model_from_id(&AgentModelId::new(format!(
+                "{}/{}",
+                selection.provider.0, selection.model
+            )))
+        });
+        let model = configured_subagent_model
+            .or_else(|| fallback_model.cloned())
+            .or_else(|| {
+                LanguageModelRegistry::read_global(cx)
+                    .default_model()
+                    .and_then(|default_model| {
+                        models.model_from_id(&LanguageModels::model_id(&default_model))
+                    })
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "No authenticated Zed language model is available. Configure a provider in Zed or pass an explicit model."
+                )
+            })?;
+        (model, explicit_effort)
     };
 
-    let current_user_selection = agent_settings::AgentSettings::get_global(cx)
-        .default_model
-        .as_ref()
-        .filter(|selection| {
-            selection.provider.0 == resolved.provider_id().0.as_ref()
-                && selection.model == resolved.id().0.as_ref()
-        })
-        .cloned();
+    let settings = agent_settings::AgentSettings::get_global(cx);
+    let mut selection = settings.resolve_model_selection(&resolved_model, None, true);
+    if let Some(effort) = effective_effort {
+        agent_settings::apply_explicit_effort(&mut selection, &resolved_model, effort)?;
+    }
 
-    agent_settings::language_model_to_selection(&resolved, current_user_selection.as_ref())
+    Ok((resolved_model, selection))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSubagentModelDescriptor {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub is_default: bool,
+    pub supports_thinking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_efforts: Vec<String>,
+}
+
+pub struct ExternalSubagentSpawnRequest {
+    pub parent_acp_thread: Entity<AcpThread>,
+    pub tool_call_id: String,
+    pub label: String,
+    pub message: String,
+    pub session_id: Option<acp_v2::SessionId>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub interrupt: bool,
+    pub on_finished: Box<dyn FnOnce(ExternalSubagentFinishedEvent) + 'static>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalSubagentSpawnResponse {
+    pub session_id: acp_v2::SessionId,
+    pub status: String,
+    pub model_id: String,
+    pub model_name: String,
+    pub message_start_index: usize,
+    pub interrupt: bool,
+    pub pending_steers: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalSubagentFinishedEvent {
+    pub parent_session_id: acp_v2::SessionId,
+    pub session_id: acp_v2::SessionId,
+    pub tool_call_id: String,
+    pub label: String,
+    pub status: String,
+    pub output: String,
+    pub message_end_index: Option<usize>,
+    pub model_name: String,
+    pub canceled_by_parent_stop: bool,
+}
+
+pub fn list_native_subagent_models(cx: &App) -> Vec<NativeSubagentModelDescriptor> {
+    let registry = LanguageModelRegistry::read_global(cx);
+    let settings = agent_settings::AgentSettings::get_global(cx);
+    let default = registry.default_model();
+    let subagent_default = settings.subagent_model.as_ref();
+    let mut models = Vec::new();
+    for provider in registry.visible_providers() {
+        if !provider.is_authenticated(cx) {
+            continue;
+        }
+        let provider_id = provider.id();
+        let provider_name = provider.name().0.to_string();
+        for model in provider.provided_models(cx) {
+            let id = format!("{}/{}", provider_id.0, model.id().0);
+            let is_default = if let Some(subagent_default) = subagent_default {
+                subagent_default.provider.0 == provider_id.0.as_ref()
+                    && subagent_default.model == model.id().0.as_ref()
+            } else {
+                default.as_ref().is_some_and(|default| {
+                    default.provider_id == provider_id && default.id == model.id
+                })
+            };
+            let resolved = settings.resolve_model_selection(&model, None, true);
+            let default_effort = resolved
+                .enable_thinking
+                .then_some(resolved.effort)
+                .flatten();
+            let supported_efforts = model
+                .supported_effort_levels()
+                .into_iter()
+                .map(|level| level.value.to_string())
+                .collect();
+            models.push(NativeSubagentModelDescriptor {
+                id,
+                name: model.name().0.to_string(),
+                provider_id: provider_id.0.to_string(),
+                provider_name: provider_name.clone(),
+                is_default,
+                supports_thinking: model.supports_thinking(),
+                default_effort,
+                supported_efforts,
+            });
+        }
+    }
+    models
 }
 
 pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Zed Agent"));
 
 pub fn available_native_agent(cx: &App) -> AvailableAgent {
     let registry = LanguageModelRegistry::read_global(cx);
+    let settings = agent_settings::AgentSettings::get_global(cx);
     let default = registry.default_model();
     let mut models = Vec::new();
     for provider in registry.visible_providers() {
@@ -3428,10 +3600,23 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
             let is_default = default.as_ref().is_some_and(|default| {
                 default.provider_id == provider_id && default.id == model.id
             });
+            let resolved = settings.resolve_model_selection(&model, None, true);
+            let default_effort = resolved
+                .enable_thinking
+                .then_some(resolved.effort)
+                .flatten();
+            let supported_efforts = model
+                .supported_effort_levels()
+                .into_iter()
+                .map(|level| level.value.to_string())
+                .collect();
             models.push(AvailableModel {
                 id,
                 name: model.name().0,
                 is_default,
+                supports_thinking: model.supports_thinking(),
+                default_effort,
+                supported_efforts,
             });
         }
     }
@@ -3441,6 +3626,427 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
         name: ZED_AGENT_ID.0.clone(),
         is_native: true,
         models,
+    }
+}
+
+impl NativeAgent {
+    pub fn spawn_or_follow_up_external_subagent(
+        &mut self,
+        request: ExternalSubagentSpawnRequest,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ExternalSubagentSpawnResponse>> {
+        let ExternalSubagentSpawnRequest {
+            parent_acp_thread,
+            tool_call_id,
+            label,
+            message,
+            session_id,
+            model,
+            effort,
+            interrupt,
+            on_finished,
+        } = request;
+
+        let model = model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let effort = effort
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let parent_session_id = parent_acp_thread.read(cx).session_id().clone();
+        let project = parent_acp_thread.read(cx).project().clone();
+
+        if let Some(subagent_session_id) = session_id {
+            if model.is_some() {
+                return Task::ready(Err(anyhow!(
+                    "model cannot be changed when resuming a subagent session"
+                )));
+            }
+            if effort.is_some() {
+                return Task::ready(Err(anyhow!(
+                    "effort cannot be changed when resuming a subagent session"
+                )));
+            }
+
+            let existing = self.sessions.get(&subagent_session_id).and_then(|session| {
+                session
+                    .acp_thread
+                    .upgrade()
+                    .map(|acp_thread| (session.thread.clone(), acp_thread))
+            });
+
+            if let Some((subagent_thread, acp_thread)) = existing {
+                if subagent_thread.read(cx).parent_thread_id().as_ref() != Some(&parent_session_id)
+                {
+                    return Task::ready(Err(anyhow!(
+                        "Session {subagent_session_id} is not a subagent of this thread"
+                    )));
+                }
+
+                let (model_id, model_name) = subagent_thread
+                    .read(cx)
+                    .model()
+                    .map(|model| {
+                        (
+                            LanguageModels::model_id(model).as_ref().to_string(),
+                            model.name().0.to_string(),
+                        )
+                    })
+                    .unwrap_or_default();
+
+                let is_running = subagent_thread.read(cx).is_active_subagent_run()
+                    || acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle;
+                if is_running {
+                    let entry_count = acp_thread.read(cx).entries().len();
+                    let pending_steers = subagent_thread.update(cx, |thread, cx| {
+                        thread.enqueue_subagent_steer(message, interrupt, cx)
+                    });
+                    if interrupt {
+                        self.interrupt_session_for_follow_up(&subagent_session_id);
+                    }
+                    return Task::ready(Ok(ExternalSubagentSpawnResponse {
+                        session_id: subagent_session_id,
+                        status: "steered".to_string(),
+                        model_id,
+                        model_name,
+                        message_start_index: entry_count,
+                        interrupt,
+                        pending_steers,
+                    }));
+                }
+
+                let message_start_index = acp_thread.read(cx).entries().len();
+                if parent_acp_thread
+                    .read(cx)
+                    .subagent(&subagent_session_id)
+                    .is_none()
+                {
+                    parent_acp_thread.update(cx, |parent, cx| {
+                        parent.register_subagent(acp_thread.clone(), cx);
+                    });
+                }
+                if !label.trim().is_empty() {
+                    subagent_thread.update(cx, |thread, cx| {
+                        thread.set_title(label.clone().into(), cx);
+                    });
+                }
+                self.external_subagent_parent_stops
+                    .remove(&subagent_session_id);
+                subagent_thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
+                self.launch_external_subagent_turn(
+                    parent_session_id,
+                    subagent_session_id.clone(),
+                    tool_call_id,
+                    label,
+                    model_name.clone(),
+                    subagent_thread,
+                    acp_thread,
+                    message,
+                    on_finished,
+                    cx,
+                );
+                return Task::ready(Ok(ExternalSubagentSpawnResponse {
+                    session_id: subagent_session_id,
+                    status: "running".to_string(),
+                    model_id,
+                    model_name,
+                    message_start_index,
+                    interrupt: false,
+                    pending_steers: 0,
+                }));
+            }
+
+            let open_task = self.open_thread(subagent_session_id.clone(), project, cx);
+            return cx.spawn(async move |this, cx| {
+                let acp_thread = open_task.await?;
+                this.update(cx, |agent, cx| {
+                    let session = agent.sessions.get(&subagent_session_id).ok_or_else(|| {
+                        anyhow!("Subagent session {subagent_session_id} not found")
+                    })?;
+                    let subagent_thread = session.thread.clone();
+                    if subagent_thread.read(cx).parent_thread_id().as_ref()
+                        != Some(&parent_session_id)
+                    {
+                        anyhow::bail!(
+                            "Session {subagent_session_id} is not a subagent of this thread"
+                        );
+                    }
+                    let (model_id, model_name) = subagent_thread
+                        .read(cx)
+                        .model()
+                        .map(|model| {
+                            (
+                                LanguageModels::model_id(model).as_ref().to_string(),
+                                model.name().0.to_string(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let message_start_index = acp_thread.read(cx).entries().len();
+                    if parent_acp_thread
+                        .read(cx)
+                        .subagent(&subagent_session_id)
+                        .is_none()
+                    {
+                        parent_acp_thread.update(cx, |parent, cx| {
+                            parent.register_subagent(acp_thread.clone(), cx);
+                        });
+                    }
+                    if !label.trim().is_empty() {
+                        subagent_thread.update(cx, |thread, cx| {
+                            thread.set_title(label.clone().into(), cx);
+                        });
+                    }
+                    agent
+                        .external_subagent_parent_stops
+                        .remove(&subagent_session_id);
+                    subagent_thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
+                    agent.launch_external_subagent_turn(
+                        parent_session_id,
+                        subagent_session_id.clone(),
+                        tool_call_id,
+                        label,
+                        model_name.clone(),
+                        subagent_thread,
+                        acp_thread,
+                        message,
+                        on_finished,
+                        cx,
+                    );
+                    Ok(ExternalSubagentSpawnResponse {
+                        session_id: subagent_session_id,
+                        status: "running".to_string(),
+                        model_id,
+                        model_name,
+                        message_start_index,
+                        interrupt: false,
+                        pending_steers: 0,
+                    })
+                })?
+            });
+        }
+
+        let (resolved_model, selection) = match resolve_subagent_model_and_effort(
+            &self.models,
+            model.as_deref(),
+            effort.as_deref(),
+            None,
+            cx,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        let model_id = LanguageModels::model_id(&resolved_model)
+            .as_ref()
+            .to_string();
+        let model_name = resolved_model.name().0.to_string();
+
+        let project_id = self.get_or_create_project_state(&project, cx);
+        let project_state = &self.projects[&project_id];
+        let project_context = project_state.project_context.clone();
+        let context_server_registry = project_state.context_server_registry.clone();
+        let templates = self.templates.clone();
+        let parent_action_log = parent_acp_thread.read(cx).action_log().clone();
+
+        let subagent_thread: Entity<Thread> = cx.new(|cx| {
+            let mut thread = Thread::new_external_subagent(
+                project.clone(),
+                project_context,
+                context_server_registry,
+                templates,
+                parent_session_id.clone(),
+                parent_action_log,
+                &selection,
+                cx,
+            );
+            thread.set_title(label.clone().into(), cx);
+            thread
+        });
+
+        let subagent_session_id = subagent_thread.read(cx).id().clone();
+        let acp_thread = self.register_session(subagent_thread.clone(), project_id, cx);
+        parent_acp_thread.update(cx, |parent, cx| {
+            parent.register_subagent(acp_thread.clone(), cx);
+        });
+        subagent_thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
+
+        telemetry::event!(
+            "Subagent Started",
+            session = parent_session_id.to_string(),
+            subagent_session = subagent_session_id.to_string(),
+            depth = 1u8,
+            is_resumed = false,
+        );
+
+        self.launch_external_subagent_turn(
+            parent_session_id,
+            subagent_session_id.clone(),
+            tool_call_id,
+            label,
+            model_name.clone(),
+            subagent_thread,
+            acp_thread,
+            message,
+            on_finished,
+            cx,
+        );
+
+        Task::ready(Ok(ExternalSubagentSpawnResponse {
+            session_id: subagent_session_id,
+            status: "running".to_string(),
+            model_id,
+            model_name,
+            message_start_index: 0,
+            interrupt: false,
+            pending_steers: 0,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_external_subagent_turn(
+        &self,
+        parent_session_id: acp_v2::SessionId,
+        subagent_session_id: acp_v2::SessionId,
+        tool_call_id: String,
+        label: String,
+        model_name: String,
+        subagent_thread: Entity<Thread>,
+        acp_thread: Entity<AcpThread>,
+        message: String,
+        on_finished: Box<dyn FnOnce(ExternalSubagentFinishedEvent) + 'static>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let send_result = run_subagent_turn_loop(
+                subagent_session_id.clone(),
+                subagent_thread.clone(),
+                acp_thread.clone(),
+                None,
+                message,
+                cx,
+            )
+            .await;
+
+            let (status, output) = match send_result {
+                crate::SubagentSendResult::Completed(output) => ("completed".to_string(), output),
+                crate::SubagentSendResult::Canceled => {
+                    ("canceled".to_string(), "User canceled".to_string())
+                }
+                crate::SubagentSendResult::Error(error) => ("error".to_string(), error),
+            };
+
+            telemetry::event!(
+                "Subagent Completed",
+                subagent_session = subagent_session_id.to_string(),
+                status = status.as_str(),
+            );
+
+            let (message_end_index, canceled_by_parent_stop, resolved_model_name) =
+                cx.update(|cx| {
+                    let entry_count = acp_thread.read(cx).entries().len();
+                    let end_index = entry_count.checked_sub(1);
+                    let canceled_by_parent_stop = this
+                        .update(cx, |agent, _| {
+                            agent
+                                .external_subagent_parent_stops
+                                .remove(&subagent_session_id)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let resolved_model_name = subagent_thread
+                        .read(cx)
+                        .model()
+                        .map(|model| model.name().0.to_string())
+                        .unwrap_or(model_name);
+                    (end_index, canceled_by_parent_stop, resolved_model_name)
+                });
+
+            on_finished(ExternalSubagentFinishedEvent {
+                parent_session_id,
+                session_id: subagent_session_id,
+                tool_call_id,
+                label,
+                status,
+                output,
+                message_end_index,
+                model_name: resolved_model_name,
+                canceled_by_parent_stop,
+            });
+        })
+        .detach();
+    }
+
+    pub fn query_external_subagents(
+        &mut self,
+        parent_acp_thread: Entity<AcpThread>,
+        input: crate::QuerySubagentToolInput,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<crate::QuerySubagentToolOutput>> {
+        let project = parent_acp_thread.read(cx).project().clone();
+        let parent_session_id = parent_acp_thread.read(cx).session_id().clone();
+
+        if let Some(target_session_id) = input.session_id.clone()
+            && parent_acp_thread
+                .read(cx)
+                .subagent(&target_session_id)
+                .is_none()
+        {
+            let open_task = self.open_thread(target_session_id.clone(), project.clone(), cx);
+            return cx.spawn(async move |this, cx| {
+                let acp_thread = open_task.await?;
+                this.update(cx, |agent, cx| {
+                    let native_thread = agent
+                        .sessions
+                        .get(&target_session_id)
+                        .map(|session| session.thread.clone());
+                    if let Some(thread) = native_thread.as_ref()
+                        && thread.read(cx).parent_thread_id().as_ref() == Some(&parent_session_id)
+                    {
+                        parent_acp_thread.update(cx, |parent, cx| {
+                            if parent.subagent(&target_session_id).is_none() {
+                                parent.register_subagent(acp_thread.clone(), cx);
+                            }
+                        });
+                    }
+                    let subagents = vec![(native_thread, acp_thread)];
+                    crate::evaluate_subagent_query(&subagents, &project, input, cx)
+                })?
+            });
+        }
+
+        let child_acp_threads: Vec<Entity<AcpThread>> =
+            parent_acp_thread.read(cx).subagents().cloned().collect();
+        let subagents: Vec<(Option<Entity<Thread>>, Entity<AcpThread>)> = child_acp_threads
+            .into_iter()
+            .filter_map(|acp_thread| {
+                let session_id = acp_thread.read(cx).session_id();
+                self.sessions
+                    .get(session_id)
+                    .map(|session| (Some(session.thread.clone()), acp_thread))
+            })
+            .collect();
+
+        Task::ready(crate::evaluate_subagent_query(
+            &subagents, &project, input, cx,
+        ))
+    }
+
+    pub fn cancel_external_subagent(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        canceled_by_parent_stop: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.sessions.contains_key(session_id) {
+            return false;
+        }
+        if canceled_by_parent_stop {
+            self.external_subagent_parent_stops
+                .insert(session_id.clone(), true);
+        }
+        self.cancel_session_and_subagents(session_id, cx);
+        true
     }
 }
 
@@ -4101,23 +4707,26 @@ impl NativeThreadEnvironment {
         &self,
         label: String,
         model: Option<AgentModelId>,
+        effort: Option<String>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let model = if let Some(model_id) = model {
-            let available = self.agent.read_with(cx, |agent, _| {
-                agent.models.model_from_id(&model_id).is_some()
-            })?;
-            if !available {
-                anyhow::bail!(
-                    "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
-                );
-            }
-            Some(subagent_model_id_to_selection(&model_id, cx))
-        } else {
-            None
-        };
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
+        };
+        let parent_model = parent_thread_entity.read(cx).model().cloned();
+        let model_selection = if model.is_some() || effort.is_some() {
+            let (_, selection) = self.agent.read_with(cx, |agent, cx| {
+                resolve_subagent_model_and_effort(
+                    &agent.models,
+                    model.as_ref().map(|model_id| model_id.as_ref()),
+                    effort.as_deref(),
+                    parent_model.as_ref(),
+                    cx,
+                )
+            })??;
+            Some(selection)
+        } else {
+            None
         };
         let parent_thread = parent_thread_entity.read(cx);
         let current_depth = parent_thread.depth();
@@ -4131,7 +4740,8 @@ impl NativeThreadEnvironment {
         }
 
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, model.as_ref(), cx);
+            let mut thread =
+                Thread::new_subagent(&parent_thread_entity, model_selection.as_ref(), cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -4336,9 +4946,10 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         &self,
         label: String,
         model: Option<AgentModelId>,
+        effort: Option<String>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, model, cx)
+        self.create_subagent_thread(label, model, effort, cx)
     }
 
     fn resume_subagent(
@@ -4501,6 +5112,221 @@ impl NativeSubagentHandle {
     }
 }
 
+fn run_subagent_turn_loop(
+    subagent_session_id: acp_v2::SessionId,
+    thread: Entity<Thread>,
+    acp_thread: Entity<acp_thread::AcpThread>,
+    parent_thread: Option<WeakEntity<Thread>>,
+    message: String,
+    cx: &AsyncApp,
+) -> Task<crate::SubagentSendResult> {
+    cx.spawn(async move |cx| {
+        cx.update(|cx| {
+            thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
+            if let Some(parent_thread) = &parent_thread {
+                parent_thread
+                    .update(cx, |parent_thread, _cx| {
+                        parent_thread.register_running_subagent(thread.downgrade())
+                    })
+                    .ok();
+            }
+        });
+
+        let mut current_message = message;
+        let response = loop {
+            let prompt_message = current_message;
+            let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+                let ratio_before_prompt = thread
+                    .read(cx)
+                    .latest_token_usage()
+                    .map_or(TokenUsageRatio::Normal, |usage| usage.ratio());
+                let (token_limit_tx, token_limit_rx) = oneshot::channel();
+                let mut token_limit_tx = Some(token_limit_tx);
+                let subscription = cx.subscribe(
+                    &thread,
+                    move |thread, event: &TokenUsageUpdated, cx| {
+                        if !thread.read(cx).auto_compaction_enabled(cx)
+                            && event
+                                .0
+                                .as_ref()
+                                .is_some_and(|usage| usage.ratio() > ratio_before_prompt)
+                            && let Some(sender) = token_limit_tx.take()
+                        {
+                            sender.send(()).ok();
+                        }
+                    },
+                );
+                let task = match acp_thread
+                    .read(cx)
+                    .connection()
+                    .clone()
+                    .into_any()
+                    .downcast::<NativeAgentConnection>()
+                {
+                    Ok(connection) => connection.send_and_wait_for_completion(
+                        acp_thread.clone(),
+                        vec![prompt_message.into()],
+                        cx,
+                    ),
+                    Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
+                };
+                (task, token_limit_rx, subscription)
+            });
+
+            let mut task = task.fuse();
+            let turn_response = futures::select_biased! {
+                response = task => response,
+                _ = token_limit_rx.fuse() => {
+                    if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
+                        task.await
+                    } else {
+                        thread.update(cx, |thread, cx| thread.request_cancel(cx)).await;
+                        // Let the run report its own idle state first, so this run's outcome
+                        // reported below comes after it.
+                        task.await.log_err();
+                        Err(anyhow!(
+                            "The agent is nearing the end of its context window and has been \
+                             stopped. You can prompt the thread again to have the agent wrap up \
+                             or hand off its work."
+                        ))
+                    }
+                }
+            };
+
+            let queued_steer = cx.update(|cx| {
+                thread.update(cx, |thread, _| thread.take_queued_subagent_steer())
+            });
+            if let Some((steered_message, was_interrupted)) = queued_steer {
+                let can_continue_into_steer = match &turn_response {
+                    Ok(acp_v2::StopReason::EndTurn) => true,
+                    Ok(acp_v2::StopReason::Cancelled) if was_interrupted => true,
+                    _ => false,
+                };
+                if can_continue_into_steer {
+                    current_message = steered_message;
+                    continue;
+                }
+            }
+            break turn_response;
+        };
+        let discard_partial_output = matches!(
+            &response,
+            Ok(acp_v2::StopReason::Cancelled | acp_v2::StopReason::Refusal)
+        );
+        let response_stop_reason = response.as_ref().ok().cloned();
+        let result = match response {
+            Ok(reason) => match reason {
+                acp_v2::StopReason::Cancelled => Err(anyhow!("User canceled")),
+                acp_v2::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
+                acp_v2::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
+                acp_v2::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
+                acp_v2::StopReason::Error(reason) => Err(match reason.error {
+                    Some(error) => anyhow::Error::new(*error),
+                    None => anyhow!("Native agent stopped with an error"),
+                }),
+                acp_v2::StopReason::EndTurn => thread.read_with(cx, |thread, _cx| {
+                    thread
+                        .last_message()
+                        .and_then(|message| {
+                            let content = message.as_agent_message()?
+                                .content
+                                .iter()
+                                .filter_map(|content| match content {
+                                    AgentMessageContent::Text(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .join("\n\n");
+                            if content.is_empty() {
+                                None
+                            } else {
+                                Some(content)
+                            }
+                        })
+                        .context("No response from subagent")
+                }),
+                _ => Err(anyhow!("Native subagent returned an unsupported stop reason")),
+            },
+            Err(error) => Err(error),
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _| thread.set_active_subagent_run(false));
+            if let Some(parent_thread) = &parent_thread {
+                parent_thread
+                    .update(cx, |parent_thread, cx| {
+                        parent_thread.unregister_running_subagent(&subagent_session_id, cx)
+                    })
+                    .ok();
+            }
+        });
+
+        let result = if discard_partial_output {
+            result
+        } else {
+            result.map_err(|error| {
+                let partial_output = thread.read_with(cx, |thread, _| thread.subagent_partial_output());
+                if partial_output.is_empty() {
+                    anyhow!("{error:#}")
+                } else {
+                    anyhow!("{error:#}\n\nPartial subagent output (last 3 messages, up to 4096 characters each):\n\n{partial_output}")
+                }
+            })
+        };
+
+        let was_cancelled =
+            matches!(response_stop_reason, Some(acp_v2::StopReason::Cancelled));
+        // The run's own idle state only says how the model stopped. Report the verdict
+        // the parent's tool call gets, so the subagent's cards agree with it.
+        let stop_reason = match (&result, response_stop_reason) {
+            (Ok(_), Some(reason))
+            | (
+                Err(_),
+                Some(
+                    reason @ (acp_v2::StopReason::Cancelled
+                    | acp_v2::StopReason::MaxTokens
+                    | acp_v2::StopReason::MaxTurnRequests
+                    | acp_v2::StopReason::Refusal),
+                ),
+            ) => reason,
+            (result, _) => {
+                let mut error = acp_v2::Error::internal_error();
+                error.message = match result {
+                    Ok(_) => "The subagent stopped without a reason".to_string(),
+                    Err(error) => error.to_string(),
+                };
+                acp_v2::StopReason::Error(acp_v2::ErrorStopReason::new().error(error))
+            }
+        };
+        cx.update(|cx| {
+            let entry_count = acp_thread.read(cx).entries().len();
+            thread.update(cx, |thread, cx| {
+                thread.record_subagent_outcome(
+                    SubagentOutcome {
+                        entry_count,
+                        stop_reason: stop_reason.clone(),
+                    },
+                    cx,
+                )
+            });
+            acp_thread.update(cx, |acp_thread, cx| {
+                acp_thread.update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(stop_reason),
+                    ),
+                    cx,
+                )
+            })
+        })
+        .log_err();
+
+        match result {
+            Ok(output) => crate::SubagentSendResult::Completed(output),
+            Err(_) if was_cancelled => crate::SubagentSendResult::Canceled,
+            Err(error) => crate::SubagentSendResult::Error(error.to_string()),
+        }
+    })
+}
+
 impl SubagentHandle for NativeSubagentHandle {
     fn id(&self) -> acp_v2::SessionId {
         self.session_id.clone()
@@ -4516,212 +5342,14 @@ impl SubagentHandle for NativeSubagentHandle {
     }
 
     fn send(&self, message: String, cx: &AsyncApp) -> Task<crate::SubagentSendResult> {
-        let thread = self.subagent_thread.clone();
-        let acp_thread = self.acp_thread.clone();
-        let subagent_session_id = self.session_id.clone();
-        let parent_thread = self.parent_thread.clone();
-
-        cx.spawn(async move |cx| {
-            cx.update(|cx| {
-                thread.update(cx, |thread, _| thread.set_active_subagent_run(true));
-                parent_thread
-                    .update(cx, |parent_thread, _cx| {
-                        parent_thread.register_running_subagent(thread.downgrade())
-                    })
-                    .ok();
-            });
-
-            let mut current_message = message;
-            let response = loop {
-                let prompt_message = current_message;
-                let (task, token_limit_rx, _subscription) = cx.update(|cx| {
-                    let ratio_before_prompt = thread
-                        .read(cx)
-                        .latest_token_usage()
-                        .map_or(TokenUsageRatio::Normal, |usage| usage.ratio());
-                    let (token_limit_tx, token_limit_rx) = oneshot::channel();
-                    let mut token_limit_tx = Some(token_limit_tx);
-                    let subscription = cx.subscribe(
-                        &thread,
-                        move |thread, event: &TokenUsageUpdated, cx| {
-                            if !thread.read(cx).auto_compaction_enabled(cx)
-                                && event
-                                    .0
-                                    .as_ref()
-                                    .is_some_and(|usage| usage.ratio() > ratio_before_prompt)
-                                && let Some(sender) = token_limit_tx.take()
-                            {
-                                sender.send(()).ok();
-                            }
-                        },
-                    );
-                    let task = match acp_thread
-                        .read(cx)
-                        .connection()
-                        .clone()
-                        .into_any()
-                        .downcast::<NativeAgentConnection>()
-                    {
-                        Ok(connection) => connection.send_and_wait_for_completion(
-                            acp_thread.clone(),
-                            vec![prompt_message.into()],
-                            cx,
-                        ),
-                        Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
-                    };
-                    (task, token_limit_rx, subscription)
-                });
-
-                let mut task = task.fuse();
-                let turn_response = futures::select_biased! {
-                    response = task => response,
-                    _ = token_limit_rx.fuse() => {
-                        if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
-                            task.await
-                        } else {
-                            thread.update(cx, |thread, cx| thread.request_cancel(cx)).await;
-                            // Let the run report its own idle state first, so this run's outcome
-                            // reported below comes after it.
-                            task.await.log_err();
-                            Err(anyhow!(
-                                "The agent is nearing the end of its context window and has been \
-                                 stopped. You can prompt the thread again to have the agent wrap up \
-                                 or hand off its work."
-                            ))
-                        }
-                    }
-                };
-
-                let queued_steer = cx.update(|cx| {
-                    thread.update(cx, |thread, _| thread.take_queued_subagent_steer())
-                });
-                if let Some((steered_message, was_interrupted)) = queued_steer {
-                    let can_continue_into_steer = match &turn_response {
-                        Ok(acp_v2::StopReason::EndTurn) => true,
-                        Ok(acp_v2::StopReason::Cancelled) if was_interrupted => true,
-                        _ => false,
-                    };
-                    if can_continue_into_steer {
-                        current_message = steered_message;
-                        continue;
-                    }
-                }
-                break turn_response;
-            };
-            let discard_partial_output = matches!(
-                &response,
-                Ok(acp_v2::StopReason::Cancelled | acp_v2::StopReason::Refusal)
-            );
-            let response_stop_reason = response.as_ref().ok().cloned();
-            let result = match response {
-                Ok(reason) => match reason {
-                    acp_v2::StopReason::Cancelled => Err(anyhow!("User canceled")),
-                    acp_v2::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
-                    acp_v2::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
-                    acp_v2::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
-                    acp_v2::StopReason::Error(reason) => Err(match reason.error {
-                        Some(error) => anyhow::Error::new(*error),
-                        None => anyhow!("Native agent stopped with an error"),
-                    }),
-                    acp_v2::StopReason::EndTurn => thread.read_with(cx, |thread, _cx| {
-                        thread
-                            .last_message()
-                            .and_then(|message| {
-                                let content = message.as_agent_message()?
-                                    .content
-                                    .iter()
-                                    .filter_map(|content| match content {
-                                        AgentMessageContent::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .join("\n\n");
-                                if content.is_empty() {
-                                    None
-                                } else {
-                                    Some(content)
-                                }
-                            })
-                            .context("No response from subagent")
-                    }),
-                    _ => Err(anyhow!("Native subagent returned an unsupported stop reason")),
-                },
-                Err(error) => Err(error),
-            };
-
-            cx.update(|cx| {
-                thread.update(cx, |thread, _| thread.set_active_subagent_run(false));
-                parent_thread
-                    .update(cx, |parent_thread, cx| {
-                        parent_thread.unregister_running_subagent(&subagent_session_id, cx)
-                    })
-                    .ok();
-            });
-
-            let result = if discard_partial_output {
-                result
-            } else {
-                result.map_err(|error| {
-                    let partial_output = thread.read_with(cx, |thread, _| thread.subagent_partial_output());
-                    if partial_output.is_empty() {
-                        anyhow!("{error:#}")
-                    } else {
-                        anyhow!("{error:#}\n\nPartial subagent output (last 3 messages, up to 4096 characters each):\n\n{partial_output}")
-                    }
-                })
-            };
-
-            let was_cancelled =
-                matches!(response_stop_reason, Some(acp_v2::StopReason::Cancelled));
-            // The run's own idle state only says how the model stopped. Report the verdict
-            // the parent's tool call gets, so the subagent's cards agree with it.
-            let stop_reason = match (&result, response_stop_reason) {
-                (Ok(_), Some(reason))
-                | (
-                    Err(_),
-                    Some(
-                        reason @ (acp_v2::StopReason::Cancelled
-                        | acp_v2::StopReason::MaxTokens
-                        | acp_v2::StopReason::MaxTurnRequests
-                        | acp_v2::StopReason::Refusal),
-                    ),
-                ) => reason,
-                (result, _) => {
-                    let mut error = acp_v2::Error::internal_error();
-                    error.message = match result {
-                        Ok(_) => "The subagent stopped without a reason".to_string(),
-                        Err(error) => error.to_string(),
-                    };
-                    acp_v2::StopReason::Error(acp_v2::ErrorStopReason::new().error(error))
-                }
-            };
-            cx.update(|cx| {
-                let entry_count = acp_thread.read(cx).entries().len();
-                thread.update(cx, |thread, cx| {
-                    thread.record_subagent_outcome(
-                        SubagentOutcome {
-                            entry_count,
-                            stop_reason: stop_reason.clone(),
-                        },
-                        cx,
-                    )
-                });
-                acp_thread.update(cx, |acp_thread, cx| {
-                    acp_thread.update_session_state(
-                        acp_v2::StateUpdate::Idle(
-                            acp_v2::IdleStateUpdate::new().stop_reason(stop_reason),
-                        ),
-                        cx,
-                    )
-                })
-            })
-            .log_err();
-
-            match result {
-                Ok(output) => crate::SubagentSendResult::Completed(output),
-                Err(_) if was_cancelled => crate::SubagentSendResult::Canceled,
-                Err(error) => crate::SubagentSendResult::Error(error.to_string()),
-            }
-        })
+        run_subagent_turn_loop(
+            self.session_id.clone(),
+            self.subagent_thread.clone(),
+            self.acp_thread.clone(),
+            Some(self.parent_thread.clone()),
+            message,
+            cx,
+        )
     }
 
     fn complete(
@@ -5203,6 +5831,7 @@ mod internal_tests {
                 environment.create_subagent_thread(
                     "subagent".to_string(),
                     Some(AgentModelId::from("fake-corp/subagent-model".to_string())),
+                    None,
                     cx,
                 )
             })
@@ -5218,6 +5847,318 @@ mod internal_tests {
             // intentionally filtered while the model selection is applied.
             assert_eq!(thread.speed(), None);
         });
+    }
+
+    #[gpui::test]
+    async fn test_list_native_subagent_models_and_external_subagent_lifecycle(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("openai-subscribed".to_string()),
+            LanguageModelProviderName::from("OpenAI Subscribed".to_string()),
+        ));
+        let astra_model = provider.update_model("gpt-6.2-astra", |model| {
+            model.name = LanguageModelName::from("GPT-6.2 Astra".to_string());
+            model.supports_thinking = true;
+            model.supported_effort_levels = Arc::from([
+                language_model::LanguageModelEffortLevel {
+                    name: "Low".into(),
+                    value: "low".into(),
+                    is_default: false,
+                    supports_disabling_thinking: None,
+                },
+                language_model::LanguageModelEffortLevel {
+                    name: "Medium".into(),
+                    value: "medium".into(),
+                    is_default: true,
+                    supports_disabling_thinking: None,
+                },
+                language_model::LanguageModelEffortLevel {
+                    name: "High".into(),
+                    value: "high".into(),
+                    is_default: false,
+                    supports_disabling_thinking: None,
+                },
+                language_model::LanguageModelEffortLevel {
+                    name: "Extra High".into(),
+                    value: "xhigh".into(),
+                    is_default: false,
+                    supports_disabling_thinking: None,
+                },
+            ]);
+        });
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+            });
+            <SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{
+                            "agent": {
+                                "model_parameters": [
+                                    {
+                                        "provider": "openai-subscribed",
+                                        "model": "gpt-6.2-astra",
+                                        "effort": "high"
+                                    }
+                                ]
+                            }
+                        }"#,
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+        agent.update(cx, |agent, cx| agent.models.refresh_list(cx));
+
+        let listed = cx.update(|cx| list_native_subagent_models(cx));
+        let astra_info = listed
+            .iter()
+            .find(|model| model.id == "openai-subscribed/gpt-6.2-astra")
+            .expect("gpt-6.2-astra should be listed");
+        assert!(astra_info.supports_thinking);
+        assert_eq!(astra_info.default_effort.as_deref(), Some("high"));
+        assert_eq!(
+            astra_info.supported_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+
+        let parent_action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+        let parent_session_id = acp_v2::SessionId::new("external-acp-parent");
+        let parent_acp_thread = cx.new(|cx| {
+            acp_thread::AcpThread::new(
+                None,
+                Some("External Parent".into()),
+                None,
+                connection.clone(),
+                project.clone(),
+                parent_action_log.clone(),
+                parent_session_id.clone(),
+                watch::Receiver::constant(Default::default()),
+                cx,
+            )
+        });
+
+        // 1. Invalid effort produces a clear error listing supported levels.
+        let bad_effort = agent
+            .update(cx, |agent, cx| {
+                agent.spawn_or_follow_up_external_subagent(
+                    ExternalSubagentSpawnRequest {
+                        parent_acp_thread: parent_acp_thread.clone(),
+                        tool_call_id: "tc-bad".to_string(),
+                        label: "Bad effort".to_string(),
+                        message: "Should fail".to_string(),
+                        session_id: None,
+                        model: Some("openai-subscribed/gpt-6.2-astra".to_string()),
+                        effort: Some("ludicrous".to_string()),
+                        interrupt: false,
+                        on_finished: Box::new(|_| {}),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let bad_err = bad_effort.unwrap_err().to_string();
+        assert!(bad_err.contains("Unsupported effort level"));
+        assert!(bad_err.contains("xhigh"));
+
+        // 2. Spawn with inline `@xhigh` shorthand, steer mid-run, and complete.
+        let finished_events: Arc<std::sync::Mutex<Vec<ExternalSubagentFinishedEvent>>> =
+            Arc::default();
+        let spawn_resp = agent
+            .update(cx, |agent, cx| {
+                let finished_events = finished_events.clone();
+                agent.spawn_or_follow_up_external_subagent(
+                    ExternalSubagentSpawnRequest {
+                        parent_acp_thread: parent_acp_thread.clone(),
+                        tool_call_id: "tc-1".to_string(),
+                        label: "Astra analysis".to_string(),
+                        message: "Analyze crates/agent".to_string(),
+                        session_id: None,
+                        model: Some("openai-subscribed/gpt-6.2-astra@xhigh".to_string()),
+                        effort: None,
+                        interrupt: false,
+                        on_finished: Box::new(move |event| {
+                            finished_events.lock().unwrap().push(event);
+                        }),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(spawn_resp.status, "running");
+        assert_eq!(spawn_resp.model_id, "openai-subscribed/gpt-6.2-astra");
+        assert_eq!(spawn_resp.model_name, "GPT-6.2 Astra");
+        let sub_session_id = spawn_resp.session_id.clone();
+
+        // Child is registered on the external parent AcpThread with xhigh effort applied.
+        parent_acp_thread.read_with(cx, |parent, _| {
+            assert!(parent.subagent(&sub_session_id).is_some());
+        });
+        agent.read_with(cx, |agent, cx| {
+            let sub_thread = &agent.sessions.get(&sub_session_id).unwrap().thread;
+            sub_thread.read_with(cx, |thread, _| {
+                assert!(thread.thinking_enabled());
+                assert_eq!(thread.thinking_effort().map(String::as_str), Some("xhigh"));
+            });
+        });
+
+        cx.run_until_parked();
+        assert_eq!(provider.pending_completions_for(&astra_model).len(), 1);
+
+        // Steer while running (interrupt=false).
+        let steer_resp = agent
+            .update(cx, |agent, cx| {
+                agent.spawn_or_follow_up_external_subagent(
+                    ExternalSubagentSpawnRequest {
+                        parent_acp_thread: parent_acp_thread.clone(),
+                        tool_call_id: "tc-steer".to_string(),
+                        label: "Astra analysis".to_string(),
+                        message: "Also check agent_servers".to_string(),
+                        session_id: Some(sub_session_id.clone()),
+                        model: None,
+                        effort: None,
+                        interrupt: false,
+                        on_finished: Box::new(|_| {}),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(steer_resp.status, "steered");
+        assert_eq!(steer_resp.pending_steers, 1);
+
+        // Complete first turn -> subagent immediately drains steer into turn 2.
+        provider.send_last_text(&astra_model, "Initial findings");
+        provider.end_last(&astra_model);
+        cx.run_until_parked();
+        assert!(finished_events.lock().unwrap().is_empty());
+        assert_eq!(provider.pending_completions_for(&astra_model).len(), 1);
+
+        // Complete steered turn -> on_finished fires once with final output.
+        provider.send_last_text(&astra_model, "Updated findings with agent_servers");
+        provider.end_last(&astra_model);
+        cx.run_until_parked();
+
+        {
+            let events = finished_events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].parent_session_id, parent_session_id);
+            assert_eq!(events[0].session_id, sub_session_id);
+            assert_eq!(events[0].tool_call_id, "tc-1");
+            assert_eq!(events[0].status, "completed");
+            assert_eq!(events[0].output, "Updated findings with agent_servers");
+            assert!(!events[0].canceled_by_parent_stop);
+        }
+
+        // 3. Query overview and detail for the external subagent.
+        let overview_json = agent
+            .update(cx, |agent, cx| {
+                agent.query_external_subagents(
+                    parent_acp_thread.clone(),
+                    crate::QuerySubagentToolInput {
+                        session_id: None,
+                        entry_kinds: None,
+                        tool_names: None,
+                        statuses: None,
+                        path_glob: None,
+                        search_regex: None,
+                        case_sensitive: false,
+                        from_entry: None,
+                        to_entry: None,
+                        limit: None,
+                        tail: None,
+                        include_file_changes: None,
+                        include_diffs: false,
+                        max_content_chars: None,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let overview_json = serde_json::to_string(&overview_json).unwrap();
+        assert!(overview_json.contains(sub_session_id.0.as_ref()));
+        assert!(overview_json.contains("Astra analysis"));
+
+        let detail_json = agent
+            .update(cx, |agent, cx| {
+                agent.query_external_subagents(
+                    parent_acp_thread.clone(),
+                    crate::QuerySubagentToolInput {
+                        session_id: Some(sub_session_id.clone()),
+                        entry_kinds: None,
+                        tool_names: None,
+                        statuses: None,
+                        path_glob: None,
+                        search_regex: None,
+                        case_sensitive: false,
+                        from_entry: None,
+                        to_entry: None,
+                        limit: None,
+                        tail: None,
+                        include_file_changes: None,
+                        include_diffs: false,
+                        max_content_chars: None,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let detail_json = serde_json::to_string(&detail_json).unwrap();
+        assert!(detail_json.contains("Updated findings with agent_servers"));
+
+        // 4. Resume and cancel with canceled_by_parent_stop=true.
+        let resume_events: Arc<std::sync::Mutex<Vec<ExternalSubagentFinishedEvent>>> =
+            Arc::default();
+        let resume_resp = agent
+            .update(cx, |agent, cx| {
+                let resume_events = resume_events.clone();
+                agent.spawn_or_follow_up_external_subagent(
+                    ExternalSubagentSpawnRequest {
+                        parent_acp_thread: parent_acp_thread.clone(),
+                        tool_call_id: "tc-resume".to_string(),
+                        label: "Astra follow-up".to_string(),
+                        message: "Run a long task".to_string(),
+                        session_id: Some(sub_session_id.clone()),
+                        model: None,
+                        effort: None,
+                        interrupt: false,
+                        on_finished: Box::new(move |event| {
+                            resume_events.lock().unwrap().push(event);
+                        }),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(resume_resp.status, "running");
+        cx.run_until_parked();
+        assert_eq!(provider.pending_completions_for(&astra_model).len(), 1);
+
+        let canceled = agent.update(cx, |agent, cx| {
+            agent.cancel_external_subagent(&sub_session_id, true, cx)
+        });
+        assert!(canceled);
+        cx.run_until_parked();
+
+        let events = resume_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, "canceled");
+        assert!(events[0].canceled_by_parent_stop);
     }
 
     #[cfg(target_os = "macos")]
@@ -10233,10 +11174,10 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("first".to_string(), None, None, cx))
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("second".to_string(), None, None, cx))
             .unwrap();
         cx.run_until_parked();
 
@@ -10303,7 +11244,7 @@ mod internal_tests {
         };
 
         let child = cx
-            .update(|cx| environment.create_subagent_thread("child".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("child".to_string(), None, None, cx))
             .unwrap();
         cx.update(|cx| environment.resume_subagent_thread(child.id(), cx))
             .expect("resume the child");

@@ -3029,6 +3029,26 @@ impl AgentPanel {
         });
     }
 
+    pub(crate) fn request_native_agent_connection(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> futures::future::Shared<
+        gpui::Task<
+            Result<crate::agent_connection_store::AgentConnectedState, acp_thread::LoadError>,
+        >,
+    > {
+        let fs = self.fs.clone();
+        let thread_store = self.thread_store.clone();
+        let entry = self.connection_store.update(cx, |store, cx| {
+            store.request_connection(
+                Agent::NativeAgent,
+                Agent::NativeAgent.server(fs, thread_store),
+                cx,
+            )
+        });
+        entry.read(cx).wait_for_connection()
+    }
+
     pub fn activate_draft(
         &mut self,
         focus: bool,

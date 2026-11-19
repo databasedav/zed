@@ -683,6 +683,240 @@ pub(crate) fn humanize_token_count(count: u64) -> String {
     }
 }
 
+struct AgentUiNativeSubagentBridge {
+    fs: Arc<dyn Fs>,
+    fallback_native_agent: std::cell::RefCell<Option<Entity<agent::NativeAgent>>>,
+}
+
+impl AgentUiNativeSubagentBridge {
+    fn resolve_native_agent(
+        &self,
+        project: &Entity<Project>,
+        cx: &mut App,
+    ) -> gpui::Task<anyhow::Result<Entity<agent::NativeAgent>>> {
+        let target_project_id = project.entity_id();
+        let panel_connect_task = workspace::AppState::try_global(cx).and_then(|app_state| {
+            let workspaces: Vec<_> = app_state
+                .workspace_store
+                .read(cx)
+                .workspaces()
+                .cloned()
+                .collect();
+            let matching_panel = workspaces.iter().find_map(|workspace| {
+                workspace
+                    .read_with(cx, |workspace, cx| {
+                        (workspace.project().entity_id() == target_project_id)
+                            .then(|| workspace.panel::<AgentPanel>(cx))
+                            .flatten()
+                    })
+                    .ok()
+                    .flatten()
+            });
+            let panel = matching_panel.or_else(|| {
+                workspaces.iter().find_map(|workspace| {
+                    workspace
+                        .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                        .ok()
+                        .flatten()
+                })
+            })?;
+            Some(panel.update(cx, |panel, cx| panel.request_native_agent_connection(cx)))
+        });
+
+        if let Some(connect_task) = panel_connect_task {
+            return cx.spawn(async move |_cx| {
+                let connected = connect_task
+                    .await
+                    .map_err(|error| anyhow::anyhow!("Failed connecting native agent: {error}"))?;
+                let native = connected
+                    .connection
+                    .into_any()
+                    .downcast::<agent::NativeAgentConnection>()
+                    .map_err(|_| {
+                        anyhow::anyhow!("Native agent connection had unexpected concrete type")
+                    })?;
+                Ok(native.0.clone())
+            });
+        }
+
+        if let Some(existing) = self.fallback_native_agent.borrow().clone() {
+            return gpui::Task::ready(Ok(existing));
+        }
+
+        let thread_store = agent::ThreadStore::global(cx);
+        let native_agent =
+            agent::NativeAgent::new(thread_store, agent::Templates::new(), self.fs.clone(), cx);
+        *self.fallback_native_agent.borrow_mut() = Some(native_agent.clone());
+        gpui::Task::ready(Ok(native_agent))
+    }
+}
+
+fn parse_query_request(
+    request: agent_servers::NativeSubagentQueryRequest,
+) -> anyhow::Result<agent::QuerySubagentToolInput> {
+    let entry_kinds = request
+        .entry_kinds
+        .map(|kinds| {
+            kinds
+                .into_iter()
+                .map(|kind| match kind.as_str() {
+                    "user_message" => Ok(agent::SubagentEntryKindFilter::UserMessage),
+                    "assistant_message" => Ok(agent::SubagentEntryKindFilter::AssistantMessage),
+                    "thinking" => Ok(agent::SubagentEntryKindFilter::Thinking),
+                    "tool_call" => Ok(agent::SubagentEntryKindFilter::ToolCall),
+                    other => anyhow::bail!("Unsupported entry kind filter: {other:?}"),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    let statuses = request
+        .statuses
+        .map(|statuses| {
+            statuses
+                .into_iter()
+                .map(|status| match status.as_str() {
+                    "pending" => Ok(agent::SubagentToolStatusFilter::Pending),
+                    "waiting_for_confirmation" => {
+                        Ok(agent::SubagentToolStatusFilter::WaitingForConfirmation)
+                    }
+                    "in_progress" => Ok(agent::SubagentToolStatusFilter::InProgress),
+                    "paused" => Ok(agent::SubagentToolStatusFilter::Paused),
+                    "completed" => Ok(agent::SubagentToolStatusFilter::Completed),
+                    "failed" => Ok(agent::SubagentToolStatusFilter::Failed),
+                    "rejected" => Ok(agent::SubagentToolStatusFilter::Rejected),
+                    "canceled" => Ok(agent::SubagentToolStatusFilter::Canceled),
+                    other => anyhow::bail!("Unsupported status filter: {other:?}"),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    Ok(agent::QuerySubagentToolInput {
+        session_id: request.session_id,
+        entry_kinds,
+        tool_names: request.tool_names,
+        statuses,
+        path_glob: request.path_glob,
+        search_regex: request.search_regex,
+        case_sensitive: request.case_sensitive,
+        from_entry: request.from_entry,
+        to_entry: request.to_entry,
+        limit: request.limit,
+        tail: request.tail,
+        include_file_changes: Some(request.include_file_changes),
+        include_diffs: request.include_diffs,
+        max_content_chars: request.max_content_chars,
+    })
+}
+
+impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
+    fn list_models(&self, cx: &mut App) -> Vec<agent_servers::NativeSubagentModelInfo> {
+        agent::list_native_subagent_models(cx)
+            .into_iter()
+            .map(|model| agent_servers::NativeSubagentModelInfo {
+                id: model.id,
+                name: model.name,
+                provider_id: model.provider_id,
+                provider_name: model.provider_name,
+                is_default: model.is_default,
+                supports_thinking: model.supports_thinking,
+                default_effort: model.default_effort,
+                supported_efforts: model.supported_efforts,
+            })
+            .collect()
+    }
+
+    fn spawn_or_follow_up(
+        &self,
+        request: agent_servers::NativeSubagentSpawnRequest,
+        cx: &mut App,
+    ) -> gpui::Task<anyhow::Result<agent_servers::NativeSubagentSpawnResponse>> {
+        let project = request.parent_acp_thread.read(cx).project().clone();
+        let native_agent_task = self.resolve_native_agent(&project, cx);
+        cx.spawn(async move |cx| {
+            let native_agent = native_agent_task.await?;
+            let on_finished = request.on_finished;
+            let external_request = agent::ExternalSubagentSpawnRequest {
+                parent_acp_thread: request.parent_acp_thread,
+                tool_call_id: request.tool_call_id,
+                label: request.label,
+                message: request.message,
+                session_id: request.session_id,
+                model: request.model,
+                effort: request.effort,
+                interrupt: request.interrupt,
+                on_finished: Box::new(move |event| {
+                    on_finished(agent_servers::NativeSubagentFinishedEvent {
+                        parent_session_id: event.parent_session_id,
+                        session_id: event.session_id,
+                        tool_call_id: event.tool_call_id,
+                        label: event.label,
+                        status: event.status,
+                        output: event.output,
+                        message_end_index: event.message_end_index,
+                        model_name: event.model_name,
+                        canceled_by_parent_stop: event.canceled_by_parent_stop,
+                    });
+                }),
+            };
+            let spawn_task = native_agent.update(cx, |agent, cx| {
+                agent.spawn_or_follow_up_external_subagent(external_request, cx)
+            });
+            let response = spawn_task.await?;
+            Ok(agent_servers::NativeSubagentSpawnResponse {
+                session_id: response.session_id,
+                status: response.status,
+                model_id: response.model_id,
+                model_name: response.model_name,
+                message_start_index: response.message_start_index,
+                interrupt: response.interrupt,
+                pending_steers: response.pending_steers,
+            })
+        })
+    }
+
+    fn query(
+        &self,
+        parent_acp_thread: Entity<acp_thread::AcpThread>,
+        request: agent_servers::NativeSubagentQueryRequest,
+        cx: &mut App,
+    ) -> gpui::Task<anyhow::Result<String>> {
+        let input = match parse_query_request(request) {
+            Ok(input) => input,
+            Err(error) => return gpui::Task::ready(Err(error)),
+        };
+        let project = parent_acp_thread.read(cx).project().clone();
+        let native_agent_task = self.resolve_native_agent(&project, cx);
+        cx.spawn(async move |cx| {
+            let native_agent = native_agent_task.await?;
+            let query_task = native_agent.update(cx, |agent, cx| {
+                agent.query_external_subagents(parent_acp_thread, input, cx)
+            });
+            let output = query_task.await?;
+            Ok(serde_json::to_string_pretty(&output)?)
+        })
+    }
+
+    fn cancel(
+        &self,
+        parent_acp_thread: Entity<acp_thread::AcpThread>,
+        session_id: acp_v2::SessionId,
+        canceled_by_parent_stop: bool,
+        cx: &mut App,
+    ) -> gpui::Task<anyhow::Result<bool>> {
+        let project = parent_acp_thread.read(cx).project().clone();
+        let native_agent_task = self.resolve_native_agent(&project, cx);
+        cx.spawn(async move |cx| {
+            let native_agent = native_agent_task.await?;
+            let canceled = native_agent.update(cx, |agent, cx| {
+                agent.cancel_external_subagent(&session_id, canceled_by_parent_stop, cx)
+            });
+            Ok(canceled)
+        })
+    }
+}
+
 /// Initializes the `agent` crate.
 pub fn init(
     fs: Arc<dyn Fs>,
@@ -713,6 +947,12 @@ pub fn init(
                 .ok();
         }
     })));
+    cx.set_global(agent_servers::GlobalNativeSubagentBridge(Rc::new(
+        AgentUiNativeSubagentBridge {
+            fs: fs.clone(),
+            fallback_native_agent: std::cell::RefCell::new(None),
+        },
+    )));
 
     if !is_eval {
         // Initializing the language model from the user settings messes with the eval, so we only initialize them when

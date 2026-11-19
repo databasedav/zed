@@ -43,9 +43,10 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 ///
 /// ### Model selection
 /// - When the user requests a particular model or asks you to choose based on cost or capability, call `list_agents_and_models` first, then pass the exact `models[].id` from the native Zed agent entry (`is_native: true`) in `model`.
+/// - Optionally pass `effort` (e.g., `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"none"` to disable thinking) from `models[].supported_efforts` to override the model's configured default thinking effort.
 /// - Omit `model` to use the user's configured subagent model, or the parent model when no subagent model is configured.
 /// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
-/// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
+/// - A resumed session keeps its existing model and effort, so `model` and `effort` cannot be combined with `session_id`.
 ///
 /// ### Output
 /// - Launching or resuming an idle sub-agent returns `session_id` and `status: "running"` immediately.
@@ -67,6 +68,13 @@ pub struct SpawnAgentToolInput {
     /// Omit to preserve default behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional thinking/reasoning effort override for a newly spawned subagent
+    /// (e.g., `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"none"` to disable
+    /// thinking). Check `models[].supported_efforts` from `list_agents_and_models`.
+    /// Omit to use the model's configured default effort. Must be omitted when
+    /// `session_id` is provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Only used when `session_id` refers to a currently running sub-agent:
     /// - `false` (default): steer cleanly at the sub-agent's next tool-call/reasoning boundary.
     /// - `true`: immediately interrupt the sub-agent's current turn/tool call and pivot to `message`.
@@ -243,8 +251,12 @@ impl AgentTool for SpawnAgentTool {
                 message,
                 session_id,
                 model,
+                effort,
                 interrupt,
             } = input;
+            let effort = effort
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
             let subagent_label: SharedString = label.clone().into();
             let tool_use_id = event_stream.tool_use_id().clone();
             let tool_call_id = event_stream.tool_call_id().clone();
@@ -258,11 +270,14 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let launch_outcome = cx.update(|cx| {
-                let outcome = match (session_id, model) {
-                    (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                let outcome = match (session_id, model, effort) {
+                    (Some(_), Some(_), _) => Err(anyhow::anyhow!(
                         "model cannot be changed when resuming a subagent session"
                     )),
-                    (Some(session_id), None) => self
+                    (Some(_), None, Some(_)) => Err(anyhow::anyhow!(
+                        "effort cannot be changed when resuming a subagent session"
+                    )),
+                    (Some(session_id), None, None) => self
                         .environment
                         .follow_up_subagent(session_id, message.clone(), interrupt, cx)
                         .map(|follow_up| match follow_up {
@@ -284,9 +299,9 @@ impl AgentTool for SpawnAgentTool {
                                 pending_steers,
                             },
                         }),
-                    (None, model) => self
+                    (None, model, effort) => self
                         .environment
-                        .create_subagent(label, model.map(AgentModelId::from), cx)
+                        .create_subagent(label, model.map(AgentModelId::from), effort, cx)
                         .map(|subagent| {
                             subagent.mark_started(cx);
                             let session_info = SubagentSessionInfo {

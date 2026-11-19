@@ -54,6 +54,11 @@ const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const ZED_TRUNCATE_SESSION_META_KEY: &str = "zed_truncate_session";
 const ZED_USER_MESSAGE_ID_META_KEY: &str = "zed_user_message_id";
 const ZED_VALIDATE_TYPST_META_KEY: &str = "zed_validate_typst";
+const ZED_NATIVE_SUBAGENTS_META_KEY: &str = "zed_native_subagents";
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_zed/diagnostics", response = ZedDiagnosticsResponse)]
@@ -148,6 +153,126 @@ struct ZedTruncateSessionRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonRpcResponse)]
 #[serde(rename_all = "camelCase")]
 struct ZedTruncateSessionResponse {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/list_native_models", response = ZedListNativeModelsResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedListNativeModelsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<acp::SessionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedListNativeModelsResponse {
+    models: Vec<crate::NativeSubagentModelInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/spawn_native_subagent", response = ZedSpawnNativeSubagentResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedSpawnNativeSubagentRequest {
+    parent_session_id: acp::SessionId,
+    tool_call_id: String,
+    label: String,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<acp::SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(default)]
+    interrupt: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedSpawnNativeSubagentResponse {
+    session_id: acp::SessionId,
+    status: String,
+    model_id: String,
+    model_name: String,
+    message_start_index: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    interrupt: bool,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pending_steers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/query_native_subagent", response = ZedQueryNativeSubagentResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedQueryNativeSubagentRequest {
+    parent_session_id: acp::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<acp::SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_kinds: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statuses: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_glob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search_regex: Option<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_entry: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_entry: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tail: Option<bool>,
+    #[serde(default)]
+    include_file_changes: bool,
+    #[serde(default)]
+    include_diffs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_content_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedQueryNativeSubagentResponse {
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/cancel_native_subagent", response = ZedCancelNativeSubagentResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedCancelNativeSubagentRequest {
+    parent_session_id: acp::SessionId,
+    session_id: acp::SessionId,
+    #[serde(default)]
+    canceled_by_parent_stop: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedCancelNativeSubagentResponse {
+    canceled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed/native_subagent_finished")]
+#[serde(rename_all = "camelCase")]
+struct ZedNativeSubagentFinishedNotification {
+    parent_session_id: acp::SessionId,
+    session_id: acp::SessionId,
+    tool_call_id: String,
+    label: String,
+    status: String,
+    output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_end_index: Option<usize>,
+    model_name: String,
+    #[serde(default)]
+    canceled_by_parent_stop: bool,
+}
 async fn close_session_and_drain(
     connection: &ConnectionTo<Agent>,
     session_id: acp_v2::SessionId,
@@ -530,6 +655,15 @@ fn client_builder(
             }
         }};
     }
+    macro_rules! on_request_with_connection {
+        ($handler:ident) => {{
+            let dispatch_sender = dispatch_sender.clone();
+            async move |request, responder, connection| {
+                enqueue_request(&dispatch_sender, (request, connection), responder, $handler);
+                Ok(())
+            }
+        }};
+    }
     macro_rules! on_notification {
         ($handler:ident) => {{
             let dispatch_sender = dispatch_sender.clone();
@@ -562,6 +696,22 @@ fn client_builder(
         )
         .on_receive_request(
             on_request!(handle_zed_validate_typst),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request!(handle_zed_list_native_models),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request_with_connection!(handle_zed_spawn_native_subagent),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request!(handle_zed_query_native_subagent),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request!(handle_zed_cancel_native_subagent),
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
@@ -617,6 +767,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("zed_steer_at_boundary".into(), true.into()),
         ("zed_async_subagents".into(), true.into()),
         ("zed_subagent_messaging".into(), true.into()),
+        (ZED_NATIVE_SUBAGENTS_META_KEY.into(), true.into()),
         (ZED_TRUNCATE_SESSION_META_KEY.into(), true.into()),
         (ZED_VALIDATE_TYPST_META_KEY.into(), true.into()),
     ]);
@@ -10609,6 +10760,70 @@ exit 7
             meta.get("zed_validate_typst"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            meta.get("zed_native_subagents"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let list_models_req = ZedListNativeModelsRequest {
+            session_id: Some(acp::SessionId::new("sess-1")),
+        };
+        assert_eq!(list_models_req.method(), "_zed/list_native_models");
+        assert_eq!(
+            list_models_req.to_untyped_message().unwrap().params,
+            serde_json::json!({ "sessionId": "sess-1" })
+        );
+
+        let spawn_native_req = ZedSpawnNativeSubagentRequest {
+            parent_session_id: acp::SessionId::new("parent-1"),
+            tool_call_id: "tc-1".to_string(),
+            label: "Explore".to_string(),
+            message: "Read files".to_string(),
+            session_id: None,
+            model: Some("openai-subscribed/gpt-6.2-astra".to_string()),
+            effort: Some("high".to_string()),
+            interrupt: false,
+        };
+        assert_eq!(spawn_native_req.method(), "_zed/spawn_native_subagent");
+        assert_eq!(
+            spawn_native_req.to_untyped_message().unwrap().params,
+            serde_json::json!({
+                "parentSessionId": "parent-1",
+                "toolCallId": "tc-1",
+                "label": "Explore",
+                "message": "Read files",
+                "model": "openai-subscribed/gpt-6.2-astra",
+                "effort": "high",
+                "interrupt": false,
+            })
+        );
+
+        let finished_notif = ZedNativeSubagentFinishedNotification {
+            parent_session_id: acp::SessionId::new("parent-1"),
+            session_id: acp::SessionId::new("native-sub-1"),
+            tool_call_id: "tc-1".to_string(),
+            label: "Explore".to_string(),
+            status: "completed".to_string(),
+            output: "Done".to_string(),
+            message_end_index: Some(3),
+            model_name: "GPT-6.2 Astra".to_string(),
+            canceled_by_parent_stop: false,
+        };
+        assert_eq!(finished_notif.method(), "_zed/native_subagent_finished");
+        assert_eq!(
+            finished_notif.to_untyped_message().unwrap().params,
+            serde_json::json!({
+                "parentSessionId": "parent-1",
+                "sessionId": "native-sub-1",
+                "toolCallId": "tc-1",
+                "label": "Explore",
+                "status": "completed",
+                "output": "Done",
+                "messageEndIndex": 3,
+                "modelName": "GPT-6.2 Astra",
+                "canceledByParentStop": false,
+            })
+        );
 
         let validate_req = ZedValidateTypstRequest {
             session_id: acp::SessionId::new("sess-1"),
@@ -10983,6 +11198,312 @@ exit 7
                 "## User\n\nTurn 1\n\n## Assistant\n\nAnswer 1\n\n"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_acp_native_subagent_bridge_rpc_round_trip(cx: &mut gpui::TestAppContext) {
+        struct FakeBridge {
+            seen_spawns: Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>>,
+            seen_cancels: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        }
+
+        impl crate::NativeSubagentBridge for FakeBridge {
+            fn list_models(&self, _cx: &mut App) -> Vec<crate::NativeSubagentModelInfo> {
+                vec![crate::NativeSubagentModelInfo {
+                    id: "openai-subscribed/gpt-6.2-astra".to_string(),
+                    name: "GPT-6.2 Astra".to_string(),
+                    provider_id: "openai-subscribed".to_string(),
+                    provider_name: "OpenAI Subscribed".to_string(),
+                    is_default: true,
+                    supports_thinking: true,
+                    default_effort: Some("high".to_string()),
+                    supported_efforts: vec![
+                        "low".to_string(),
+                        "high".to_string(),
+                        "xhigh".to_string(),
+                    ],
+                }]
+            }
+
+            fn spawn_or_follow_up(
+                &self,
+                request: crate::NativeSubagentSpawnRequest,
+                cx: &mut App,
+            ) -> Task<Result<crate::NativeSubagentSpawnResponse>> {
+                self.seen_spawns.lock().unwrap().push((
+                    request.label.clone(),
+                    request.model.clone(),
+                    request.effort.clone(),
+                ));
+                let parent_session_id = request.parent_acp_thread.read(cx).session_id().clone();
+                let on_finished = request.on_finished;
+                let tool_call_id = request.tool_call_id;
+                let label = request.label;
+                cx.spawn(async move |_| {
+                    on_finished(crate::NativeSubagentFinishedEvent {
+                        parent_session_id,
+                        session_id: acp_v2::SessionId::new("native-sub-1"),
+                        tool_call_id,
+                        label,
+                        status: "completed".to_string(),
+                        output: "Native answer".to_string(),
+                        message_end_index: Some(2),
+                        model_name: "GPT-6.2 Astra".to_string(),
+                        canceled_by_parent_stop: false,
+                    });
+                })
+                .detach();
+                Task::ready(Ok(crate::NativeSubagentSpawnResponse {
+                    session_id: acp_v2::SessionId::new("native-sub-1"),
+                    status: "running".to_string(),
+                    model_id: "openai-subscribed/gpt-6.2-astra".to_string(),
+                    model_name: "GPT-6.2 Astra".to_string(),
+                    message_start_index: 0,
+                    interrupt: false,
+                    pending_steers: 0,
+                }))
+            }
+
+            fn query(
+                &self,
+                _parent_acp_thread: Entity<AcpThread>,
+                request: crate::NativeSubagentQueryRequest,
+                _cx: &mut App,
+            ) -> Task<Result<String>> {
+                let target = request
+                    .session_id
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_else(|| "overview".to_string());
+                Task::ready(Ok(serde_json::json!({ "queried": target }).to_string()))
+            }
+
+            fn cancel(
+                &self,
+                _parent_acp_thread: Entity<AcpThread>,
+                session_id: acp_v2::SessionId,
+                canceled_by_parent_stop: bool,
+                _cx: &mut App,
+            ) -> Task<Result<bool>> {
+                self.seen_cancels
+                    .lock()
+                    .unwrap()
+                    .push((session_id.0.to_string(), canceled_by_parent_stop));
+                Task::ready(Ok(true))
+            }
+        }
+
+        init_settings_test(cx);
+        let seen_spawns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cancels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        cx.update(|cx| {
+            cx.set_global(crate::GlobalNativeSubagentBridge(Rc::new(FakeBridge {
+                seen_spawns: seen_spawns.clone(),
+                seen_cancels: seen_cancels.clone(),
+            })));
+        });
+
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (agent_conn_tx, agent_conn_rx) =
+            futures::channel::oneshot::channel::<ConnectionTo<Client>>();
+        let agent_conn_tx = Arc::new(std::sync::Mutex::new(Some(agent_conn_tx)));
+        let finished_notifications: Arc<
+            std::sync::Mutex<Vec<ZedNativeSubagentFinishedNotification>>,
+        > = Arc::default();
+
+        let agent_future = Agent
+            .v1()
+            .name("fake-native-subagent-caller")
+            .on_receive_request(
+                {
+                    let agent_conn_tx = agent_conn_tx.clone();
+                    async move |req: acp::InitializeRequest, responder, cx| {
+                        if let Some(tx) = agent_conn_tx.lock().unwrap().take() {
+                            tx.send(cx).ok();
+                        }
+                        responder.respond(
+                            acp::InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(acp::AgentCapabilities::default()),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::NewSessionRequest, responder, _cx| {
+                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new(
+                        "parent-sess-1",
+                    )))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                {
+                    let finished_notifications = finished_notifications.clone();
+                    async move |notif: ZedNativeSubagentFinishedNotification, _cx| {
+                        finished_notifications.lock().unwrap().push(notif);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_to(agent_transport);
+
+        let _agent_io_task = cx.background_executor.spawn(async move {
+            agent_future.await.ok();
+        });
+
+        let sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>> =
+            Rc::new(RefCell::new(HashMap::default()));
+        let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
+            Rc::new(RefCell::new(None));
+        let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let client_future = connect_client_future(
+            "zed-native-subagents-test",
+            client_transport,
+            dispatch_tx.clone(),
+            connection_tx,
+            futures::future::pending(),
+        );
+        let client_io_task = cx.background_executor.spawn(async move {
+            client_future.await.ok();
+        });
+        let client_conn = connection_rx.await.expect("client connection");
+        let init_response = client_conn
+            .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await
+            .expect("initialize");
+        let agent_conn = agent_conn_rx.await.expect("agent connection");
+
+        let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let dispatch_context = ClientContext {
+            sessions: sessions.clone(),
+            session_list: client_session_list,
+            request_elicitations: request_elicitations.clone(),
+            active_request_scopes: None,
+            pending_session_updates: None,
+            accepts_subagent_updates: false,
+        };
+        let dispatch_task = cx.spawn(async move |mut cx| {
+            use futures::StreamExt as _;
+            while let Some(work) = dispatch_rx.next().await {
+                work.run(&mut cx, &dispatch_context);
+            }
+        });
+        let agent_server_store =
+            project.read_with(cx, |project, _| project.agent_server_store().downgrade());
+        let connection = Rc::new(cx.update(|cx| {
+            AcpConnection::new_for_test(
+                client_conn,
+                sessions,
+                init_response.agent_capabilities,
+                false,
+                request_elicitations,
+                agent_server_store,
+                client_io_task,
+                dispatch_tx,
+                dispatch_task,
+                cx,
+            )
+        }));
+
+        let _parent_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new_session");
+
+        let list_resp = agent_conn
+            .send_request(ZedListNativeModelsRequest {
+                session_id: Some(acp::SessionId::new("parent-sess-1")),
+            })
+            .block_task()
+            .await
+            .expect("list native models");
+        assert_eq!(list_resp.models.len(), 1);
+        assert_eq!(list_resp.models[0].id, "openai-subscribed/gpt-6.2-astra");
+        assert_eq!(list_resp.models[0].default_effort.as_deref(), Some("high"));
+
+        let spawn_resp = agent_conn
+            .send_request(ZedSpawnNativeSubagentRequest {
+                parent_session_id: acp::SessionId::new("parent-sess-1"),
+                tool_call_id: "tc-native-1".to_string(),
+                label: "Astra check".to_string(),
+                message: "Inspect code".to_string(),
+                session_id: None,
+                model: Some("openai-subscribed/gpt-6.2-astra".to_string()),
+                effort: Some("xhigh".to_string()),
+                interrupt: false,
+            })
+            .block_task()
+            .await
+            .expect("spawn native subagent");
+        assert_eq!(spawn_resp.session_id.0.as_ref(), "native-sub-1");
+        assert_eq!(spawn_resp.status, "running");
+
+        cx.run_until_parked();
+        {
+            let notifs = finished_notifications.lock().unwrap();
+            assert_eq!(notifs.len(), 1);
+            assert_eq!(notifs[0].session_id.0.as_ref(), "native-sub-1");
+            assert_eq!(notifs[0].output, "Native answer");
+            assert_eq!(notifs[0].message_end_index, Some(2));
+        }
+
+        let query_resp = agent_conn
+            .send_request(ZedQueryNativeSubagentRequest {
+                parent_session_id: acp::SessionId::new("parent-sess-1"),
+                session_id: Some(acp::SessionId::new("native-sub-1")),
+                entry_kinds: None,
+                tool_names: None,
+                statuses: None,
+                path_glob: None,
+                search_regex: None,
+                case_sensitive: false,
+                from_entry: None,
+                to_entry: None,
+                limit: None,
+                tail: None,
+                include_file_changes: false,
+                include_diffs: false,
+                max_content_chars: None,
+            })
+            .block_task()
+            .await
+            .expect("query native subagent");
+        assert!(query_resp.content.contains("native-sub-1"));
+
+        let cancel_resp = agent_conn
+            .send_request(ZedCancelNativeSubagentRequest {
+                parent_session_id: acp::SessionId::new("parent-sess-1"),
+                session_id: acp::SessionId::new("native-sub-1"),
+                canceled_by_parent_stop: true,
+            })
+            .block_task()
+            .await
+            .expect("cancel native subagent");
+        assert!(cancel_resp.canceled);
+        assert_eq!(
+            *seen_spawns.lock().unwrap(),
+            vec![(
+                "Astra check".to_string(),
+                Some("openai-subscribed/gpt-6.2-astra".to_string()),
+                Some("xhigh".to_string()),
+            )]
+        );
+        assert_eq!(
+            *seen_cancels.lock().unwrap(),
+            vec![("native-sub-1".to_string(), true)]
+        );
     }
 
     fn release_dropped_entities(cx: &mut gpui::TestAppContext) {
@@ -11417,6 +11938,185 @@ fn handle_zed_validate_typst(
             formatted_errors,
         })
         .log_err();
+}
+
+fn native_subagent_bridge(
+    cx: &mut AsyncApp,
+) -> Result<Rc<dyn crate::NativeSubagentBridge>, agent_client_protocol::Error> {
+    cx.update(|cx| {
+        cx.try_global::<crate::GlobalNativeSubagentBridge>()
+            .map(|bridge| bridge.0.clone())
+    })
+    .ok_or_else(|| {
+        agent_client_protocol::Error::from(anyhow!("Zed native subagent bridge is not registered"))
+    })
+}
+
+fn handle_zed_list_native_models(
+    _args: ZedListNativeModelsRequest,
+    responder: Responder<ZedListNativeModelsResponse>,
+    cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    let bridge = match native_subagent_bridge(cx) {
+        Ok(bridge) => bridge,
+        Err(error) => return respond_err(responder, error),
+    };
+    let models = cx.update(|cx| bridge.list_models(cx));
+    responder
+        .respond(ZedListNativeModelsResponse { models })
+        .log_err();
+}
+
+fn upgraded_session_thread(
+    ctx: &ClientContext,
+    session_id: &acp_v2::SessionId,
+) -> Result<Entity<AcpThread>, agent_client_protocol::Error> {
+    session_thread(ctx, session_id)?.upgrade().ok_or_else(|| {
+        agent_client_protocol::Error::from(anyhow!("Session thread has been dropped"))
+    })
+}
+
+fn handle_zed_spawn_native_subagent(
+    (args, connection): (ZedSpawnNativeSubagentRequest, ConnectionTo<Agent>),
+    responder: Responder<ZedSpawnNativeSubagentResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let bridge = match native_subagent_bridge(cx) {
+        Ok(bridge) => bridge,
+        Err(error) => return respond_err(responder, error),
+    };
+    let parent_thread =
+        match upgraded_session_thread(ctx, &acp_v2::SessionId::new(args.parent_session_id.0)) {
+            Ok(thread) => thread,
+            Err(error) => return respond_err(responder, error),
+        };
+
+    let request = crate::NativeSubagentSpawnRequest {
+        parent_acp_thread: parent_thread,
+        tool_call_id: args.tool_call_id,
+        label: args.label,
+        message: args.message,
+        session_id: args.session_id.map(|id| acp_v2::SessionId::new(id.0)),
+        model: args.model,
+        effort: args.effort,
+        interrupt: args.interrupt,
+        on_finished: Box::new(move |event: crate::NativeSubagentFinishedEvent| {
+            let notification = ZedNativeSubagentFinishedNotification {
+                parent_session_id: acp::SessionId::new(event.parent_session_id.0),
+                session_id: acp::SessionId::new(event.session_id.0),
+                tool_call_id: event.tool_call_id,
+                label: event.label,
+                status: event.status,
+                output: event.output,
+                message_end_index: event.message_end_index,
+                model_name: event.model_name,
+                canceled_by_parent_stop: event.canceled_by_parent_stop,
+            };
+            connection.send_notification(notification).log_err();
+        }),
+    };
+
+    cx.spawn(async move |cx| {
+        let task = cx.update(|cx| bridge.spawn_or_follow_up(request, cx));
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async { task.await.map_err(agent_client_protocol::Error::from) })
+            .await;
+        respond_result(
+            responder,
+            result.map(|response| ZedSpawnNativeSubagentResponse {
+                session_id: acp::SessionId::new(response.session_id.0),
+                status: response.status,
+                model_id: response.model_id,
+                model_name: response.model_name,
+                message_start_index: response.message_start_index,
+                interrupt: response.interrupt,
+                pending_steers: response.pending_steers,
+            }),
+        );
+    })
+    .detach();
+}
+
+fn handle_zed_query_native_subagent(
+    args: ZedQueryNativeSubagentRequest,
+    responder: Responder<ZedQueryNativeSubagentResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let bridge = match native_subagent_bridge(cx) {
+        Ok(bridge) => bridge,
+        Err(error) => return respond_err(responder, error),
+    };
+    let parent_thread =
+        match upgraded_session_thread(ctx, &acp_v2::SessionId::new(args.parent_session_id.0)) {
+            Ok(thread) => thread,
+            Err(error) => return respond_err(responder, error),
+        };
+    let request = crate::NativeSubagentQueryRequest {
+        session_id: args.session_id.map(|id| acp_v2::SessionId::new(id.0)),
+        entry_kinds: args.entry_kinds,
+        tool_names: args.tool_names,
+        statuses: args.statuses,
+        path_glob: args.path_glob,
+        search_regex: args.search_regex,
+        case_sensitive: args.case_sensitive,
+        from_entry: args.from_entry,
+        to_entry: args.to_entry,
+        limit: args.limit,
+        tail: args.tail,
+        include_file_changes: args.include_file_changes,
+        include_diffs: args.include_diffs,
+        max_content_chars: args.max_content_chars,
+    };
+
+    cx.spawn(async move |cx| {
+        let task = cx.update(|cx| bridge.query(parent_thread, request, cx));
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async { task.await.map_err(agent_client_protocol::Error::from) })
+            .await;
+        respond_result(
+            responder,
+            result.map(|content| ZedQueryNativeSubagentResponse { content }),
+        );
+    })
+    .detach();
+}
+
+fn handle_zed_cancel_native_subagent(
+    args: ZedCancelNativeSubagentRequest,
+    responder: Responder<ZedCancelNativeSubagentResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let bridge = match native_subagent_bridge(cx) {
+        Ok(bridge) => bridge,
+        Err(error) => return respond_err(responder, error),
+    };
+    let parent_thread =
+        match upgraded_session_thread(ctx, &acp_v2::SessionId::new(args.parent_session_id.0)) {
+            Ok(thread) => thread,
+            Err(error) => return respond_err(responder, error),
+        };
+    let session_id = acp_v2::SessionId::new(args.session_id.0);
+
+    cx.spawn(async move |cx| {
+        let task = cx.update(|cx| {
+            bridge.cancel(parent_thread, session_id, args.canceled_by_parent_stop, cx)
+        });
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async { task.await.map_err(agent_client_protocol::Error::from) })
+            .await;
+        respond_result(
+            responder,
+            result.map(|canceled| ZedCancelNativeSubagentResponse { canceled }),
+        );
+    })
+    .detach();
 }
 
 fn handle_zed_discard_last_assistant_message(

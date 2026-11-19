@@ -270,20 +270,75 @@ impl AgentSettings {
 
     pub fn temperature_for_model(model: &LanguageModel, cx: &App) -> Option<f32> {
         let settings = Self::get_global(cx);
-        for setting in settings.model_parameters.iter().rev() {
-            if let Some(provider) = &setting.provider
-                && provider.0 != model.provider_id().0
-            {
-                continue;
+        let mut temperature = None;
+        for specificity in 0..=3 {
+            for setting in &settings.model_parameters {
+                if model_parameters_specificity(setting, model) == Some(specificity)
+                    && let Some(value) = setting.temperature
+                {
+                    temperature = Some(value);
+                }
             }
-            if let Some(setting_model) = &setting.model
-                && *setting_model != model.id().0
-            {
-                continue;
-            }
-            return setting.temperature;
         }
-        return None;
+        temperature
+    }
+
+    /// Resolves default selection parameters (`enable_thinking`, `effort`, `speed`)
+    /// for `model`, applying `model_parameters` (ordered by specificity: global <
+    /// model-only < provider-only < provider+model), `default_model`, optional
+    /// `subagent_model`, and any explicit selection override.
+    pub fn resolve_model_selection(
+        &self,
+        model: &LanguageModel,
+        override_selection: Option<&LanguageModelSelection>,
+        is_subagent: bool,
+    ) -> LanguageModelSelection {
+        let provider = model.provider_id().0.to_string().into();
+        let model_name = model.id().0.to_string();
+        let mut selection = LanguageModelSelection {
+            provider,
+            model: model_name,
+            enable_thinking: model.supports_thinking(),
+            effort: model
+                .default_effort_level()
+                .map(|effort| effort.value.to_string()),
+            speed: None,
+        };
+
+        for specificity in 0..=2 {
+            for setting in &self.model_parameters {
+                if model_parameters_specificity(setting, model) == Some(specificity) {
+                    apply_model_parameters(&mut selection, setting, model);
+                }
+            }
+        }
+
+        if let Some(default_selection) = self.default_model.as_ref().filter(|sel| {
+            sel.provider.0 == model.provider_id().0.as_ref() && sel.model == model.id().0.as_ref()
+        }) {
+            apply_selection_override(&mut selection, default_selection, model);
+        }
+
+        for setting in &self.model_parameters {
+            if model_parameters_specificity(setting, model) == Some(3) {
+                apply_model_parameters(&mut selection, setting, model);
+            }
+        }
+
+        if is_subagent
+            && let Some(subagent_selection) = self.subagent_model.as_ref().filter(|sel| {
+                sel.provider.0 == model.provider_id().0.as_ref()
+                    && sel.model == model.id().0.as_ref()
+            })
+        {
+            apply_selection_override(&mut selection, subagent_selection, model);
+        }
+
+        if let Some(explicit) = override_selection {
+            apply_selection_override(&mut selection, explicit, model);
+        }
+
+        selection
     }
 
     pub fn sidebar_side(&self) -> SidebarSide {
@@ -303,6 +358,156 @@ impl AgentSettings {
             .map(|sel| SharedString::from(format!("{}/{}", sel.provider.0, sel.model)))
             .collect()
     }
+}
+
+fn model_parameters_specificity(
+    setting: &LanguageModelParameters,
+    model: &LanguageModel,
+) -> Option<u8> {
+    if let Some(provider) = &setting.provider
+        && provider.0 != model.provider_id().0
+    {
+        return None;
+    }
+    if let Some(setting_model) = &setting.model
+        && *setting_model != model.id().0
+    {
+        return None;
+    }
+    Some(match (&setting.provider, &setting.model) {
+        (None, None) => 0,
+        (None, Some(_)) => 1,
+        (Some(_), None) => 2,
+        (Some(_), Some(_)) => 3,
+    })
+}
+
+fn canonical_effort_value(model: &LanguageModel, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    model
+        .supported_effort_levels()
+        .iter()
+        .find(|level| level.value.eq_ignore_ascii_case(trimmed))
+        .map(|level| level.value.to_string())
+}
+
+fn apply_model_parameters(
+    selection: &mut LanguageModelSelection,
+    setting: &LanguageModelParameters,
+    model: &LanguageModel,
+) {
+    if let Some(enable_thinking) = setting.enable_thinking {
+        selection.enable_thinking = enable_thinking && model.supports_thinking();
+        if !selection.enable_thinking {
+            selection.effort = None;
+        }
+    }
+    if let Some(effort) = &setting.effort {
+        let trimmed = effort.trim();
+        if let Some(canonical) = canonical_effort_value(model, trimmed) {
+            selection.effort = Some(canonical);
+            if setting.enable_thinking.is_none() && model.supports_thinking() {
+                selection.enable_thinking = true;
+            }
+        } else if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("off") {
+            selection.enable_thinking = false;
+            selection.effort = None;
+        } else if !trimmed.is_empty()
+            && model.supports_thinking()
+            && model.supported_effort_levels().is_empty()
+        {
+            selection.effort = Some(trimmed.to_string());
+            if setting.enable_thinking.is_none() {
+                selection.enable_thinking = true;
+            }
+        }
+    }
+    if let Some(speed) = setting.speed
+        && model.supports_fast_mode()
+    {
+        selection.speed = Some(speed);
+    }
+}
+
+fn apply_selection_override(
+    selection: &mut LanguageModelSelection,
+    override_selection: &LanguageModelSelection,
+    model: &LanguageModel,
+) {
+    selection.enable_thinking = override_selection.enable_thinking && model.supports_thinking();
+    if let Some(effort) = &override_selection.effort {
+        let trimmed = effort.trim();
+        if let Some(canonical) = canonical_effort_value(model, trimmed) {
+            selection.effort = Some(canonical);
+        } else if !trimmed.is_empty()
+            && model.supports_thinking()
+            && model.supported_effort_levels().is_empty()
+        {
+            selection.effort = Some(trimmed.to_string());
+        } else if !selection.enable_thinking {
+            selection.effort = None;
+        }
+    } else if !selection.enable_thinking {
+        selection.effort = None;
+    }
+    if let Some(speed) = override_selection
+        .speed
+        .filter(|_| model.supports_fast_mode())
+    {
+        selection.speed = Some(speed);
+    }
+}
+
+/// Validates and applies an explicit per-call `effort` override to a resolved
+/// `LanguageModelSelection`. Returns an error if the model does not support the
+/// requested effort level.
+pub fn apply_explicit_effort(
+    selection: &mut LanguageModelSelection,
+    model: &LanguageModel,
+    raw_effort: &str,
+) -> anyhow::Result<()> {
+    let trimmed = raw_effort.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if let Some(canonical) = canonical_effort_value(model, trimmed) {
+        selection.effort = Some(canonical);
+        selection.enable_thinking = model.supports_thinking();
+        return Ok(());
+    }
+    if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("off") {
+        if model.supports_thinking() && !model.supports_disabling_thinking() {
+            anyhow::bail!(
+                "Model {}/{} does not support disabling thinking.",
+                model.provider_id().0,
+                model.id().0,
+            );
+        }
+        selection.enable_thinking = false;
+        selection.effort = None;
+        return Ok(());
+    }
+    let supported = model.supported_effort_levels();
+    if supported.is_empty() {
+        anyhow::bail!(
+            "Model {}/{} does not support configurable thinking effort levels.",
+            model.provider_id().0,
+            model.id().0,
+        );
+    }
+    let supported_list = supported
+        .iter()
+        .map(|level| level.value.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "Unsupported effort level {trimmed:?} for model {}/{}. Supported effort levels: {supported_list} (or \"none\" to disable thinking).",
+        model.provider_id().0,
+        model.id().0,
+    );
 }
 
 pub fn language_model_to_selection(
@@ -2304,5 +2509,172 @@ mod tests {
             assert_eq!(user_layout.agent_dock, Some(DockPosition::Right));
             assert_eq!(user_layout.project_panel_dock, Some(DockSide::Right));
         });
+    }
+
+    fn test_thinking_model(provider: &str, id: &str) -> LanguageModel {
+        let mut model = LanguageModel::new(
+            language_model::LanguageModelId::from(id.to_string()),
+            language_model::LanguageModelName::from(id.to_string()),
+            language_model::LanguageModelProviderId::from(provider.to_string()),
+            language_model::LanguageModelProviderName::from(provider.to_string()),
+            id.to_string(),
+            200_000,
+        );
+        model.supports_thinking = true;
+        model.supports_fast_mode = true;
+        model.supported_effort_levels = Arc::from([
+            language_model::LanguageModelEffortLevel {
+                name: "Low".into(),
+                value: "low".into(),
+                is_default: false,
+                supports_disabling_thinking: None,
+            },
+            language_model::LanguageModelEffortLevel {
+                name: "Medium".into(),
+                value: "medium".into(),
+                is_default: true,
+                supports_disabling_thinking: None,
+            },
+            language_model::LanguageModelEffortLevel {
+                name: "High".into(),
+                value: "high".into(),
+                is_default: false,
+                supports_disabling_thinking: None,
+            },
+            language_model::LanguageModelEffortLevel {
+                name: "Extra High".into(),
+                value: "xhigh".into(),
+                is_default: false,
+                supports_disabling_thinking: None,
+            },
+        ]);
+        model
+    }
+
+    #[gpui::test]
+    fn test_resolve_model_selection_precedence_and_temperature(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "default_model": {
+                                "provider": "openai-subscribed",
+                                "model": "gpt-6.2-astra",
+                                "enable_thinking": true,
+                                "effort": "high"
+                            },
+                            "subagent_model": {
+                                "provider": "openai-subscribed",
+                                "model": "gpt-6.2-astra",
+                                "enable_thinking": true,
+                                "effort": "xhigh",
+                                "speed": "fast"
+                            },
+                            "model_parameters": [
+                                {
+                                    "temperature": 0.4,
+                                    "effort": "low"
+                                },
+                                {
+                                    "provider": "openai-subscribed",
+                                    "effort": "medium",
+                                    "speed": "standard"
+                                },
+                                {
+                                    "provider": "openai-subscribed",
+                                    "model": "gpt-6.2-astra",
+                                    "effort": "xhigh"
+                                },
+                                {
+                                    "provider": "openai-subscribed",
+                                    "model": "gpt-5.6-sol",
+                                    "enable_thinking": false
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        let astra = test_thinking_model("openai-subscribed", "gpt-6.2-astra");
+        let sol = test_thinking_model("openai-subscribed", "gpt-5.6-sol");
+        let other = test_thinking_model("anthropic", "claude-opus");
+
+        // Temperature should not be shadowed by a more-specific entry with temperature: None.
+        assert_eq!(AgentSettings::temperature_for_model(&astra, cx), Some(0.4));
+        assert_eq!(AgentSettings::temperature_for_model(&sol, cx), Some(0.4));
+
+        // Exact provider+model model_parameters beats default_model (xhigh over high) and keeps
+        // provider-level speed=standard.
+        let resolved_astra = settings.resolve_model_selection(&astra, None, false);
+        assert!(resolved_astra.enable_thinking);
+        assert_eq!(resolved_astra.effort.as_deref(), Some("xhigh"));
+        assert_eq!(resolved_astra.speed, Some(language_model::Speed::Standard));
+
+        // When is_subagent=true, matching subagent_model overrides speed to Fast.
+        let resolved_subagent = settings.resolve_model_selection(&astra, None, true);
+        assert!(resolved_subagent.enable_thinking);
+        assert_eq!(resolved_subagent.effort.as_deref(), Some("xhigh"));
+        assert_eq!(resolved_subagent.speed, Some(language_model::Speed::Fast));
+
+        // Explicit override_selection wins over all configured defaults.
+        let explicit = LanguageModelSelection {
+            provider: "openai-subscribed".into(),
+            model: "gpt-6.2-astra".to_string(),
+            enable_thinking: true,
+            effort: Some("low".to_string()),
+            speed: Some(language_model::Speed::Standard),
+        };
+        let resolved_override = settings.resolve_model_selection(&astra, Some(&explicit), true);
+        assert_eq!(resolved_override.effort.as_deref(), Some("low"));
+        assert_eq!(
+            resolved_override.speed,
+            Some(language_model::Speed::Standard)
+        );
+
+        // Exact provider+model can disable thinking even when provider sets effort=medium.
+        let resolved_sol = settings.resolve_model_selection(&sol, None, false);
+        assert!(!resolved_sol.enable_thinking);
+        assert_eq!(resolved_sol.effort, None);
+
+        // Global model_parameters applies to other providers.
+        let resolved_other = settings.resolve_model_selection(&other, None, false);
+        assert!(resolved_other.enable_thinking);
+        assert_eq!(resolved_other.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_apply_explicit_effort_validation() {
+        let model = test_thinking_model("openai-subscribed", "gpt-6.2-astra");
+        let mut selection = language_model_to_selection(&model, None);
+        assert_eq!(selection.effort.as_deref(), Some("medium"));
+
+        apply_explicit_effort(&mut selection, &model, "XHIGH").unwrap();
+        assert!(selection.enable_thinking);
+        assert_eq!(selection.effort.as_deref(), Some("xhigh"));
+
+        apply_explicit_effort(&mut selection, &model, "none").unwrap();
+        assert!(!selection.enable_thinking);
+        assert_eq!(selection.effort, None);
+
+        let error = apply_explicit_effort(&mut selection, &model, "ultra")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unsupported effort level"));
+        assert!(error.contains("xhigh"));
+
+        let mut locked_model = test_thinking_model("anthropic", "always-thinking");
+        locked_model.supports_disabling_thinking = false;
+        let mut locked_selection = language_model_to_selection(&locked_model, None);
+        assert!(apply_explicit_effort(&mut locked_selection, &locked_model, "off").is_err());
     }
 }

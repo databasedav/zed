@@ -940,6 +940,7 @@ pub trait ThreadEnvironment {
         &self,
         label: String,
         model: Option<AgentModelId>,
+        effort: Option<String>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
 
@@ -1063,6 +1064,15 @@ pub struct AvailableModel {
     pub name: SharedString,
     /// Whether this is the default model for the agent.
     pub is_default: bool,
+    /// Whether this model supports configurable thinking.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_thinking: bool,
+    /// Default thinking effort level applied when `effort` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// Supported thinking effort values that can be passed via `effort`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_efforts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1573,6 +1583,38 @@ impl Thread {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&model_selection, cx);
         }
+        thread
+    }
+
+    pub fn new_external_subagent(
+        project: Entity<Project>,
+        project_context: Entity<ProjectContext>,
+        context_server_registry: Entity<ContextServerRegistry>,
+        templates: Arc<Templates>,
+        parent_session_id: acp_v2::SessionId,
+        parent_action_log: Entity<ActionLog>,
+        model_selection: &LanguageModelSelection,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let resolved_model = Self::resolve_model_from_selection(model_selection, cx);
+        let action_log =
+            cx.new(|_cx| ActionLog::new(project.clone()).with_linked_action_log(parent_action_log));
+        let mut thread = Self::new_internal(
+            project,
+            project_context,
+            context_server_registry,
+            templates,
+            resolved_model,
+            action_log,
+            cx,
+        );
+        thread.subagent_context = Some(SubagentContext {
+            parent_thread_id: parent_session_id,
+            depth: 1,
+            outcomes: Vec::new(),
+        });
+        thread.inherits_parent_model_settings = false;
+        thread.apply_model_selection(model_selection, cx);
         thread
     }
 

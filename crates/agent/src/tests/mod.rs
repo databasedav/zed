@@ -195,6 +195,7 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_creations: Arc<AtomicUsize>,
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
+    subagent_efforts: std::cell::RefCell<Vec<Option<String>>>,
 }
 
 impl FakeThreadEnvironment {
@@ -223,6 +224,10 @@ impl FakeThreadEnvironment {
     fn subagent_models(&self) -> Vec<Option<AgentModelId>> {
         self.subagent_models.borrow().clone()
     }
+
+    fn subagent_efforts(&self) -> Vec<Option<String>> {
+        self.subagent_efforts.borrow().clone()
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
@@ -250,9 +255,11 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         _label: String,
         model: Option<AgentModelId>,
+        effort: Option<String>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.subagent_models.borrow_mut().push(model);
+        self.subagent_efforts.borrow_mut().push(effort);
         Ok(self
             .subagent_handle
             .clone()
@@ -297,6 +304,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         &self,
         _label: String,
         _model: Option<AgentModelId>,
+        _effort: Option<String>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -6102,6 +6110,7 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     message: "prompt".to_string(),
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
+                    effort: None,
                     interrupt: false,
                 }),
                 event_stream,
@@ -6136,6 +6145,7 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     message: "prompt".to_string(),
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
+                    effort: None,
                     interrupt: false,
                 }),
                 event_stream,
@@ -6150,6 +6160,72 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
     assert_eq!(
         error,
         "model cannot be changed when resuming a subagent session"
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_tool_forwards_explicit_effort_and_rejects_on_resume(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default().with_subagent(FakeSubagentHandle {
+            session_id: acp_v2::SessionId::new("subagent-id"),
+            send_task: Task::ready("done".to_string()).shared(),
+        }),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    session_id: None,
+                    model: Some("fake-corp/thinking-model".to_string()),
+                    effort: Some("xhigh".to_string()),
+                    interrupt: false,
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Running { .. })));
+    assert_eq!(
+        environment.subagent_efforts(),
+        vec![Some("xhigh".to_string())]
+    );
+
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let resume_result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "follow up".to_string(),
+                    session_id: Some(acp_v2::SessionId::new("subagent-id")),
+                    model: None,
+                    effort: Some("high".to_string()),
+                    interrupt: false,
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error { error, .. }) = resume_result else {
+        panic!("expected effort override on resumed session to fail");
+    };
+    assert_eq!(
+        error,
+        "effort cannot be changed when resuming a subagent session"
     );
 }
 
@@ -6207,6 +6283,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6392,6 +6469,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6571,6 +6649,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6710,6 +6789,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the first task".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6797,6 +6877,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        effort: None,
         interrupt: false,
     };
     let resume_tool_use = LanguageModelToolUse {
@@ -7880,6 +7961,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -8048,6 +8130,7 @@ async fn test_subagent_does_not_block_main_thread_or_user_follow_up(cx: &mut Tes
         message: "long running investigation".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8149,6 +8232,7 @@ async fn test_subagent_does_not_block_main_thread_or_user_follow_up(cx: &mut Tes
         message: "narrow scope to b.md".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8303,6 +8387,7 @@ async fn test_subagent_finishing_during_active_parent_turn_delivers_in_turn(
         message: "quick check".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8410,6 +8495,7 @@ async fn test_stopping_individual_subagent_does_not_wake_idle_parent(cx: &mut Te
         message: "work".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8520,6 +8606,7 @@ async fn test_query_subagent_actions_diffs_and_cursor(cx: &mut TestAppContext) {
         message: "read and update b.md".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8759,6 +8846,7 @@ async fn test_mid_run_interrupt_steering(cx: &mut TestAppContext) {
         message: "wrong direction".to_string(),
         session_id: None,
         model: None,
+        effort: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8798,6 +8886,7 @@ async fn test_mid_run_interrupt_steering(cx: &mut TestAppContext) {
         message: "stop that and do right direction instead".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        effort: None,
         interrupt: true,
     };
     fake.send_event(
@@ -10823,7 +10912,7 @@ impl SubagentCompactionTest {
             acp_thread: acp_thread.downgrade(),
         };
         let handle = cx
-            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, None, cx))
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&handle.id()).unwrap().thread.clone()
