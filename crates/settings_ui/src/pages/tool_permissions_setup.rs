@@ -1426,6 +1426,7 @@ mod tests {
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
             "query_subagent",
+            "query_thread_history",
             "spawn_agent",
         ];
 

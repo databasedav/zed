@@ -55,6 +55,7 @@ const ZED_TRUNCATE_SESSION_META_KEY: &str = "zed_truncate_session";
 const ZED_USER_MESSAGE_ID_META_KEY: &str = "zed_user_message_id";
 const ZED_VALIDATE_TYPST_META_KEY: &str = "zed_validate_typst";
 const ZED_NATIVE_SUBAGENTS_META_KEY: &str = "zed_native_subagents";
+const ZED_THREAD_HISTORY_META_KEY: &str = "zed_thread_history";
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
@@ -238,6 +239,49 @@ struct ZedQueryNativeSubagentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
 #[serde(rename_all = "camelCase")]
 struct ZedQueryNativeSubagentResponse {
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_zed/query_thread_history", response = ZedQueryThreadHistoryResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedQueryThreadHistoryRequest {
+    session_id: acp::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<acp::SessionId>,
+    #[serde(default)]
+    list_threads: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_query: Option<String>,
+    #[serde(default)]
+    workspace_only: bool,
+    #[serde(default)]
+    include_subagents: bool,
+    #[serde(default)]
+    before_latest_compaction: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_kinds: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search_regex: Option<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tail: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_content_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ZedQueryThreadHistoryResponse {
     content: String,
 }
 
@@ -711,6 +755,10 @@ fn client_builder(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            on_request!(handle_zed_query_thread_history),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             on_request!(handle_zed_cancel_native_subagent),
             agent_client_protocol::on_receive_request!(),
         )
@@ -768,6 +816,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId, acp_beta: bool) -> acp::Cli
         ("zed_async_subagents".into(), true.into()),
         ("zed_subagent_messaging".into(), true.into()),
         (ZED_NATIVE_SUBAGENTS_META_KEY.into(), true.into()),
+        (ZED_THREAD_HISTORY_META_KEY.into(), true.into()),
         (ZED_TRUNCATE_SESSION_META_KEY.into(), true.into()),
         (ZED_VALIDATE_TYPST_META_KEY.into(), true.into()),
     ]);
@@ -10764,6 +10813,30 @@ exit 7
             meta.get("zed_native_subagents"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            meta.get("zed_thread_history"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let history_req = ZedQueryThreadHistoryRequest {
+            session_id: acp::SessionId::new("sess-1"),
+            thread_id: Some(acp::SessionId::new("thread-99")),
+            list_threads: false,
+            thread_query: None,
+            workspace_only: false,
+            include_subagents: false,
+            before_latest_compaction: true,
+            entry_kinds: None,
+            tool_names: None,
+            search_regex: Some("needle".to_string()),
+            case_sensitive: false,
+            from_index: None,
+            to_index: None,
+            limit: Some(10),
+            tail: None,
+            max_content_chars: None,
+        };
+        assert_eq!(history_req.method(), "_zed/query_thread_history");
 
         let list_models_req = ZedListNativeModelsRequest {
             session_id: Some(acp::SessionId::new("sess-1")),
@@ -11277,6 +11350,24 @@ exit 7
                 Task::ready(Ok(serde_json::json!({ "queried": target }).to_string()))
             }
 
+            fn query_thread_history(
+                &self,
+                _parent_acp_thread: Entity<AcpThread>,
+                request: crate::NativeThreadHistoryQueryRequest,
+                _cx: &mut App,
+            ) -> Task<Result<String>> {
+                let target = request
+                    .thread_id
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_else(|| "list".to_string());
+                Task::ready(Ok(serde_json::json!({
+                    "history_target": target,
+                    "list_threads": request.list_threads,
+                    "thread_query": request.thread_query,
+                })
+                .to_string()))
+            }
+
             fn cancel(
                 &self,
                 _parent_acp_thread: Entity<AcpThread>,
@@ -11481,6 +11572,35 @@ exit 7
             .await
             .expect("query native subagent");
         assert!(query_resp.content.contains("native-sub-1"));
+
+        let history_resp = agent_conn
+            .send_request(ZedQueryThreadHistoryRequest {
+                session_id: acp::SessionId::new("parent-sess-1"),
+                thread_id: None,
+                list_threads: true,
+                thread_query: Some("compaction".to_string()),
+                workspace_only: false,
+                include_subagents: false,
+                before_latest_compaction: false,
+                entry_kinds: None,
+                tool_names: None,
+                search_regex: None,
+                case_sensitive: false,
+                from_index: None,
+                to_index: None,
+                limit: Some(5),
+                tail: None,
+                max_content_chars: None,
+            })
+            .block_task()
+            .await
+            .expect("query thread history");
+        assert!(history_resp.content.contains("\"history_target\":\"list\""));
+        assert!(
+            history_resp
+                .content
+                .contains("\"thread_query\":\"compaction\"")
+        );
 
         let cancel_resp = agent_conn
             .send_request(ZedCancelNativeSubagentRequest {
@@ -12081,6 +12201,53 @@ fn handle_zed_query_native_subagent(
         respond_result(
             responder,
             result.map(|content| ZedQueryNativeSubagentResponse { content }),
+        );
+    })
+    .detach();
+}
+
+fn handle_zed_query_thread_history(
+    args: ZedQueryThreadHistoryRequest,
+    responder: Responder<ZedQueryThreadHistoryResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let bridge = match native_subagent_bridge(cx) {
+        Ok(bridge) => bridge,
+        Err(error) => return respond_err(responder, error),
+    };
+    let parent_thread =
+        match upgraded_session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+            Ok(thread) => thread,
+            Err(error) => return respond_err(responder, error),
+        };
+    let request = crate::NativeThreadHistoryQueryRequest {
+        thread_id: args.thread_id.map(|id| acp_v2::SessionId::new(id.0)),
+        list_threads: args.list_threads,
+        thread_query: args.thread_query,
+        workspace_only: args.workspace_only,
+        include_subagents: args.include_subagents,
+        before_latest_compaction: args.before_latest_compaction,
+        entry_kinds: args.entry_kinds,
+        tool_names: args.tool_names,
+        search_regex: args.search_regex,
+        case_sensitive: args.case_sensitive,
+        from_index: args.from_index,
+        to_index: args.to_index,
+        limit: args.limit,
+        tail: args.tail,
+        max_content_chars: args.max_content_chars,
+    };
+
+    cx.spawn(async move |cx| {
+        let task = cx.update(|cx| bridge.query_thread_history(parent_thread, request, cx));
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(async { task.await.map_err(agent_client_protocol::Error::from) })
+            .await;
+        respond_result(
+            responder,
+            result.map(|content| ZedQueryThreadHistoryResponse { content }),
         );
     })
     .detach();

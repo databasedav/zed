@@ -7513,8 +7513,11 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
             .map(|message| message.string_contents())
             .collect::<Vec<_>>(),
         vec![
-            "subagent task prompt",
-            "The previous conversation was compacted. Use this summary as context:\n\nsubagent summary",
+            "subagent task prompt".to_string(),
+            format!(
+                "The previous conversation was compacted (messages 0..2 of thread `{}` are preserved verbatim in history). Use this summary as context, and call `query_thread_history` (e.g. `before_latest_compaction: true`, `search_regex`, or `from_index`/`to_index`) if you need exact pre-compaction tool outputs, diffs, error logs, or earlier discussion:\n\nsubagent summary",
+                test.handle.id(),
+            ),
         ],
     );
     test.fake

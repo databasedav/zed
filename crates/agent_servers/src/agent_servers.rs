@@ -13,7 +13,7 @@ use http_client::read_no_proxy_from_env;
 pub use native_subagent_bridge::{
     GlobalNativeSubagentBridge, NativeSubagentBridge, NativeSubagentFinishedEvent,
     NativeSubagentModelInfo, NativeSubagentQueryRequest, NativeSubagentSpawnRequest,
-    NativeSubagentSpawnResponse,
+    NativeSubagentSpawnResponse, NativeThreadHistoryQueryRequest,
 };
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 

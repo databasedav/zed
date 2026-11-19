@@ -810,6 +810,48 @@ fn parse_query_request(
     })
 }
 
+fn parse_thread_history_query_request(
+    request: agent_servers::NativeThreadHistoryQueryRequest,
+) -> anyhow::Result<agent::QueryThreadHistoryToolInput> {
+    let entry_kinds = request
+        .entry_kinds
+        .map(|kinds| {
+            kinds
+                .into_iter()
+                .map(|kind| match kind.as_str() {
+                    "user_message" => Ok(agent::ThreadHistoryEntryKindFilter::UserMessage),
+                    "assistant_message" => {
+                        Ok(agent::ThreadHistoryEntryKindFilter::AssistantMessage)
+                    }
+                    "thinking" => Ok(agent::ThreadHistoryEntryKindFilter::Thinking),
+                    "tool_call" => Ok(agent::ThreadHistoryEntryKindFilter::ToolCall),
+                    "compaction" => Ok(agent::ThreadHistoryEntryKindFilter::Compaction),
+                    "subagent_result" => Ok(agent::ThreadHistoryEntryKindFilter::SubagentResult),
+                    other => anyhow::bail!("Unsupported thread history entry kind: {other:?}"),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    Ok(agent::QueryThreadHistoryToolInput {
+        thread_id: request.thread_id,
+        list_threads: request.list_threads,
+        thread_query: request.thread_query,
+        workspace_only: request.workspace_only,
+        include_subagents: request.include_subagents,
+        before_latest_compaction: request.before_latest_compaction,
+        entry_kinds,
+        tool_names: request.tool_names,
+        search_regex: request.search_regex,
+        case_sensitive: request.case_sensitive,
+        from_index: request.from_index,
+        to_index: request.to_index,
+        limit: request.limit,
+        tail: request.tail,
+        max_content_chars: request.max_content_chars,
+    })
+}
+
 impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
     fn list_models(&self, cx: &mut App) -> Vec<agent_servers::NativeSubagentModelInfo> {
         agent::list_native_subagent_models(cx)
@@ -892,6 +934,28 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
             let native_agent = native_agent_task.await?;
             let query_task = native_agent.update(cx, |agent, cx| {
                 agent.query_external_subagents(parent_acp_thread, input, cx)
+            });
+            let output = query_task.await?;
+            Ok(serde_json::to_string_pretty(&output)?)
+        })
+    }
+
+    fn query_thread_history(
+        &self,
+        parent_acp_thread: Entity<acp_thread::AcpThread>,
+        request: agent_servers::NativeThreadHistoryQueryRequest,
+        cx: &mut App,
+    ) -> gpui::Task<anyhow::Result<String>> {
+        let input = match parse_thread_history_query_request(request) {
+            Ok(input) => input,
+            Err(error) => return gpui::Task::ready(Err(error)),
+        };
+        let project = parent_acp_thread.read(cx).project().clone();
+        let native_agent_task = self.resolve_native_agent(&project, cx);
+        cx.spawn(async move |cx| {
+            let native_agent = native_agent_task.await?;
+            let query_task = native_agent.update(cx, |agent, cx| {
+                agent.query_thread_history_for_project(project, input, cx)
             });
             let output = query_task.await?;
             Ok(serde_json::to_string_pretty(&output)?)

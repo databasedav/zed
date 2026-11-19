@@ -4032,6 +4032,55 @@ impl NativeAgent {
         ))
     }
 
+    pub fn query_thread_history_for_project(
+        &self,
+        project: Entity<Project>,
+        input: crate::QueryThreadHistoryToolInput,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<crate::QueryThreadHistoryToolOutput>> {
+        if let Some(target_thread_id) = input.thread_id.clone() {
+            if let Some(session) = self.sessions.get(&target_thread_id) {
+                let result = session.thread.read_with(cx, |thread, _cx| {
+                    crate::evaluate_thread_history_messages(
+                        thread.id().clone(),
+                        thread.title().map(|title| title.to_string()),
+                        thread.messages(),
+                        &input,
+                    )
+                });
+                return Task::ready(result);
+            }
+
+            let database_future = ThreadsDatabase::connect(cx);
+            return cx.background_spawn(async move {
+                let database = database_future.await.map_err(|err| anyhow!(err))?;
+                let Some(db_thread) = database.load_thread(target_thread_id.clone()).await? else {
+                    return Err(anyhow!(
+                        "Thread `{target_thread_id}` was not found in Zed's thread database"
+                    ));
+                };
+                crate::evaluate_thread_history_messages(
+                    target_thread_id,
+                    Some(db_thread.title.to_string()),
+                    &db_thread.messages,
+                    &input,
+                )
+            });
+        }
+
+        let workspace_roots: Vec<PathBuf> = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect();
+        let database_future = ThreadsDatabase::connect(cx);
+        cx.background_spawn(async move {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            let threads = database.list_threads().await?;
+            crate::evaluate_thread_history_list(&threads, &workspace_roots, &input)
+        })
+    }
+
     pub fn cancel_external_subagent(
         &mut self,
         session_id: &acp_v2::SessionId,
@@ -5046,6 +5095,41 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             })?;
 
         crate::evaluate_subagent_query(&subagents, &project, input, cx)
+    }
+
+    fn query_thread_history(
+        &self,
+        input: crate::QueryThreadHistoryToolInput,
+        cx: &mut App,
+    ) -> Task<Result<crate::QueryThreadHistoryToolOutput>> {
+        let parent_thread = match self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")
+        {
+            Ok(thread) => thread,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        if !input.is_list_request() && input.thread_id.is_none() {
+            let result = parent_thread.read_with(cx, |thread, _cx| {
+                crate::evaluate_thread_history_messages(
+                    thread.id().clone(),
+                    thread.title().map(|title| title.to_string()),
+                    thread.messages(),
+                    &input,
+                )
+            });
+            return Task::ready(result);
+        }
+
+        let project = parent_thread.read(cx).project().clone();
+        match self.agent.update(cx, |agent, cx| {
+            agent.query_thread_history_for_project(project, input, cx)
+        }) {
+            Ok(task) => task,
+            Err(error) => Task::ready(Err(error)),
+        }
     }
 
     fn create_sibling_thread(
@@ -11988,6 +12072,131 @@ mod internal_tests {
         agent.update(cx, |agent, cx| {
             agent.save_thread(thread.clone(), cx);
         });
+    }
+
+    #[gpui::test]
+    async fn test_query_thread_history_lists_and_reads_saved_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/work/zed", json!({ "README.md": "hello" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/work/zed").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let saved_id = acp_v2::SessionId::new("saved-thread-history-1");
+        let saved_thread = DbThread {
+            title: "Compaction Investigation".into(),
+            messages: vec![
+                Arc::new(Message::User(UserMessage {
+                    id: ClientUserMessageId::new(),
+                    content: Arc::from([UserMessageContent::Text(
+                        "Investigate sqlite WAL polling".to_string(),
+                    )]),
+                })),
+                Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::Text(
+                        "Confirmed exact sentinel: WAL_SENTINEL_42".to_string(),
+                    )],
+                    tool_results: IndexMap::default(),
+                    reasoning_details: None,
+                })),
+                Arc::new(Message::Compaction(CompactionInfo::Summary(
+                    "Compacted summary".into(),
+                ))),
+                Arc::new(Message::User(UserMessage {
+                    id: ClientUserMessageId::new(),
+                    content: Arc::from([UserMessageContent::Text("Continue".to_string())]),
+                })),
+            ],
+            updated_at: Utc::now(),
+            detailed_summary: None,
+            initial_project_snapshot: None,
+            cumulative_token_usage: Default::default(),
+            request_token_usage: Default::default(),
+            model: None,
+            profile: None,
+            subagent_context: None,
+            speed: None,
+            thinking_enabled: false,
+            thinking_effort: None,
+            draft_prompt: None,
+            ui_scroll_position: None,
+            sandboxed_terminal_temp_dir: None,
+            sandbox_grants: Default::default(),
+            action_log: Default::default(),
+        };
+        database
+            .save_thread(
+                saved_id.clone(),
+                saved_thread,
+                PathList::new(&[PathBuf::from(path!("/work/zed"))]),
+            )
+            .await
+            .unwrap();
+
+        let list_output = cx
+            .update(|cx| {
+                agent.update(cx, |agent, cx| {
+                    agent.query_thread_history_for_project(
+                        project.clone(),
+                        crate::QueryThreadHistoryToolInput {
+                            list_threads: true,
+                            workspace_only: true,
+                            thread_query: Some("Compaction".to_string()),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        match list_output {
+            crate::QueryThreadHistoryToolOutput::ThreadList { threads, .. } => {
+                assert_eq!(threads.len(), 1);
+                assert_eq!(threads[0].thread_id, saved_id);
+            }
+            other => panic!("expected ThreadList, got {other:?}"),
+        }
+
+        let entries_output = cx
+            .update(|cx| {
+                agent.update(cx, |agent, cx| {
+                    agent.query_thread_history_for_project(
+                        project,
+                        crate::QueryThreadHistoryToolInput {
+                            thread_id: Some(saved_id.clone()),
+                            before_latest_compaction: true,
+                            search_regex: Some("WAL_SENTINEL_42".to_string()),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        match entries_output {
+            crate::QueryThreadHistoryToolOutput::Entries(detail) => {
+                assert_eq!(detail.compaction_indices, vec![2]);
+                assert_eq!(detail.scanned_range, (0, 2));
+                assert_eq!(detail.returned_entries, 1);
+                match &detail.entries[0] {
+                    crate::ThreadHistoryEntry::AssistantMessage {
+                        message_index,
+                        text,
+                    } => {
+                        assert_eq!(*message_index, 1);
+                        assert!(text.contains("WAL_SENTINEL_42"));
+                    }
+                    other => panic!("expected AssistantMessage, got {other:?}"),
+                }
+            }
+            other => panic!("expected Entries, got {other:?}"),
+        }
     }
 }
 

@@ -90,8 +90,43 @@ pub struct NativeSubagentQueryRequest {
     pub max_content_chars: Option<usize>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadHistoryQueryRequest {
+    #[serde(default)]
+    pub thread_id: Option<acp_v2::SessionId>,
+    #[serde(default)]
+    pub list_threads: bool,
+    #[serde(default)]
+    pub thread_query: Option<String>,
+    #[serde(default)]
+    pub workspace_only: bool,
+    #[serde(default)]
+    pub include_subagents: bool,
+    #[serde(default)]
+    pub before_latest_compaction: bool,
+    #[serde(default)]
+    pub entry_kinds: Option<Vec<String>>,
+    #[serde(default)]
+    pub tool_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub search_regex: Option<String>,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub from_index: Option<usize>,
+    #[serde(default)]
+    pub to_index: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub tail: Option<bool>,
+    #[serde(default)]
+    pub max_content_chars: Option<usize>,
+}
+
 /// Bridge installed by `agent_ui` so external ACP connections can delegate subagents
-/// to Zed's native `NativeAgent` across any authenticated Zed language model provider.
+/// and thread-history queries to Zed's native `NativeAgent`.
 pub trait NativeSubagentBridge: 'static {
     fn list_models(&self, cx: &mut App) -> Vec<NativeSubagentModelInfo>;
 
@@ -105,6 +140,13 @@ pub trait NativeSubagentBridge: 'static {
         &self,
         parent_acp_thread: Entity<AcpThread>,
         request: NativeSubagentQueryRequest,
+        cx: &mut App,
+    ) -> Task<Result<String>>;
+
+    fn query_thread_history(
+        &self,
+        parent_acp_thread: Entity<AcpThread>,
+        request: NativeThreadHistoryQueryRequest,
         cx: &mut App,
     ) -> Task<Result<String>>;
 

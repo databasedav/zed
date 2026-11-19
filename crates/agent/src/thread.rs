@@ -3,8 +3,8 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, QuerySubagentTool, ReadFileTool, RenameTool, SandboxedTerminalTool,
-    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ProjectSnapshot, QuerySubagentTool, QueryThreadHistoryTool, ReadFileTool, RenameTool,
+    SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
@@ -973,6 +973,16 @@ pub trait ThreadEnvironment {
         Err(anyhow::anyhow!("Querying subagents is not supported"))
     }
 
+    fn query_thread_history(
+        &self,
+        _input: crate::QueryThreadHistoryToolInput,
+        _cx: &mut App,
+    ) -> Task<Result<crate::QueryThreadHistoryToolOutput>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "Querying thread history is not supported in this environment"
+        )))
+    }
+
     /// Creates an independent sibling thread visible in the agent sidebar.
     /// Unlike subagents, sibling threads are first-class threads that persist
     /// and run in parallel without reporting results back to the parent.
@@ -1768,6 +1778,10 @@ impl Thread {
         &self.id
     }
 
+    pub fn messages(&self) -> &[Arc<Message>] {
+        &self.messages
+    }
+
     // Only used by Seatbelt-style sandboxes (macOS); Linux relies on bwrap's
     // tmpfs `/tmp` and Windows on the WSL bwrap tmpfs, so neither needs a
     // per-thread temp directory.
@@ -2535,6 +2549,7 @@ impl Thread {
         // user, even when it can no longer nest further subagents. Visibility
         // to the model is gated by `CreateThreadToolFeatureFlag` in
         // `Thread::enabled_tools`.
+        self.add_tool(QueryThreadHistoryTool::new(environment.clone()));
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
     }
@@ -4685,7 +4700,7 @@ impl Thread {
             ..Default::default()
         };
 
-        self.extend_request_history_until(&mut request.messages, self.messages.len());
+        self.extend_request_history_until(&mut request.messages, self.messages.len(), None);
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -5154,6 +5169,9 @@ impl Thread {
         let end_ix = end_ix.min(self.messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
+        let has_history_tool = available_tools
+            .iter()
+            .any(|name| name.as_ref() == QueryThreadHistoryTool::NAME);
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
@@ -5177,7 +5195,11 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        self.extend_request_history_until(&mut messages, end_ix);
+        self.extend_request_history_until(
+            &mut messages,
+            end_ix,
+            has_history_tool.then_some(&self.id),
+        );
 
         if let Some(last_message) = messages.last_mut() {
             last_message.cache = true;
@@ -5190,8 +5212,14 @@ impl Thread {
         &self,
         request_messages: &mut Vec<LanguageModelRequestMessage>,
         end_ix: usize,
+        history_pointer_thread_id: Option<&acp_v2::SessionId>,
     ) {
-        extend_request_history_until(&self.messages, request_messages, end_ix);
+        extend_request_history_until(
+            &self.messages,
+            request_messages,
+            end_ix,
+            history_pointer_thread_id,
+        );
     }
 
     fn build_compaction_telemetry(
@@ -5764,6 +5792,7 @@ fn extend_request_history_until(
     messages: &[Arc<Message>],
     request_messages: &mut Vec<LanguageModelRequestMessage>,
     end_ix: usize,
+    history_pointer_thread_id: Option<&acp_v2::SessionId>,
 ) {
     let end_ix = end_ix.min(messages.len());
     let Some(compaction_ix) = latest_compaction_message_ix_before(messages, end_ix) else {
@@ -5783,7 +5812,22 @@ fn extend_request_history_until(
         ));
     }
 
-    for message in &messages[compaction_ix..end_ix] {
+    for (offset, message) in messages[compaction_ix..end_ix].iter().enumerate() {
+        if offset == 0
+            && let Some(thread_id) = history_pointer_thread_id
+            && let Message::Compaction(CompactionInfo::Summary(summary)) = &**message
+        {
+            request_messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![format!(
+                    "The previous conversation was compacted (messages 0..{compaction_ix} of thread `{thread_id}` are preserved verbatim in history). Use this summary as context, and call `query_thread_history` (e.g. `before_latest_compaction: true`, `search_regex`, or `from_index`/`to_index`) if you need exact pre-compaction tool outputs, diffs, error logs, or earlier discussion:\n\n{summary}"
+                )
+                .into()],
+                cache: false,
+                reasoning_details: None,
+            });
+            continue;
+        }
         request_messages.extend(message.to_request());
     }
 }
@@ -5866,7 +5910,7 @@ pub fn build_thread_title_request(
         temperature,
         ..Default::default()
     };
-    extend_request_history_until(messages, &mut request.messages, messages.len());
+    extend_request_history_until(messages, &mut request.messages, messages.len(), None);
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![SUMMARIZE_THREAD_PROMPT.into()],
@@ -8986,6 +9030,59 @@ mod tests {
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_summary_injects_history_pointer_when_tool_enabled(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let thread_id = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "pre-compaction user",
+                ));
+                thread
+                    .messages
+                    .push(agent_text_message("pre-compaction assistant"));
+                thread.messages.push(summary_compaction("brief summary"));
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "follow-up question",
+                ));
+                thread.id().clone()
+            })
+        });
+
+        let messages_with_tool = cx.update(|cx| {
+            thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages_until(
+                    vec![SharedString::from(QueryThreadHistoryTool::NAME)],
+                    thread.messages.len(),
+                    cx,
+                )
+            })
+        });
+        let texts = request_texts_after_system(&messages_with_tool);
+        assert_eq!(texts.len(), 3);
+        assert!(
+            texts[1].contains(&format!("messages 0..2 of thread `{thread_id}`")),
+            "expected thread history pointer in compaction message, got: {}",
+            texts[1]
+        );
+        assert!(texts[1].contains("query_thread_history"));
+        assert!(texts[1].ends_with("brief summary"));
+
+        let messages_without_tool = cx.update(|cx| {
+            thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages_until(Vec::new(), thread.messages.len(), cx)
+            })
+        });
+        let plain_texts = request_texts_after_system(&messages_without_tool);
+        assert_eq!(plain_texts[1], summary_request_text("brief summary"));
     }
 
     #[gpui::test]

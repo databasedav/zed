@@ -7,4 +7,6 @@ Include:
 - Next: the specific steps that remain
 - Pitfalls: anything tried that didn't work
 
+Include exact file paths, symbol names, command names, error codes, and concrete search terms for major decisions, failures, or diffs so the next agent can retrieve verbatim pre-compaction history via `query_thread_history` whenever exact details are needed.
+
 Write it so the next agent can act without re-asking the user. Be concise and well-structured.
