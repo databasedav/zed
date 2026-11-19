@@ -812,6 +812,7 @@ pub struct ThreadView {
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
     pub pending_queued_dispatch: Option<(u64, QueueEntry, Task<()>)>,
+    pending_interrupt_send_task: Option<Task<()>>,
     follow_up_cancel_started_at: Option<Instant>,
     next_queued_dispatch_id: u64,
     pub turn_fields: TurnFields,
@@ -1418,6 +1419,7 @@ impl ThreadView {
             editing_message: None,
             message_queue: MessageQueue::default(),
             pending_queued_dispatch: None,
+            pending_interrupt_send_task: None,
             follow_up_cancel_started_at: None,
             next_queued_dispatch_id: 0,
             turn_fields: TurnFields::default(),
@@ -1696,6 +1698,7 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         thread.status() == ThreadStatus::Generating
             || self.pending_queued_dispatch.is_some()
+            || self.pending_interrupt_send_task.is_some()
             || thread.has_follow_up_interrupt_in_flight()
     }
 
@@ -2627,6 +2630,7 @@ impl ThreadView {
 
         self.clear_external_source_prompt_warning(cx);
         self.thread_error.take();
+        self.sync_queue_flag_to_native_thread(cx);
         let generation = (!uses_reported_activity).then(|| self.start_turn(cx));
         self.set_editor_is_expanded(false, cx);
         self.list_state.scroll_to_end();
@@ -2775,6 +2779,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_interrupt_send_task = None;
         if let Some((_, entry, _task)) = self.pending_queued_dispatch.take() {
             self.message_queue.restore_after_failed_send(entry);
         }
@@ -2803,9 +2808,10 @@ impl ThreadView {
         self.sync_generating_indicator(cx);
         cx.notify();
 
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = cancelled.await {
                 this.update(cx, |this, cx| {
+                    this.pending_interrupt_send_task = None;
                     this.follow_up_cancel_started_at = None;
                     this.sync_generating_indicator(cx);
                     this.handle_thread_error(error, cx);
@@ -2815,12 +2821,19 @@ impl ThreadView {
             }
 
             this.update_in(cx, |this, window, cx| {
+                this.pending_interrupt_send_task = None;
                 this.follow_up_cancel_started_at = None;
+                if this.thread.read(cx).status() == ThreadStatus::Generating
+                    || this.thread.read(cx).has_follow_up_interrupt_in_flight()
+                {
+                    this.stop_current_and_send_new_message(message_editor, window, cx);
+                    return;
+                }
                 this.send_impl(message_editor, window, cx);
             })
             .log_err();
-        })
-        .detach();
+        });
+        self.pending_interrupt_send_task = Some(task);
     }
 
     pub(crate) fn handle_thread_error(
@@ -2943,6 +2956,7 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        self.pending_interrupt_send_task = None;
         if let Some((_, entry, _task)) = self.pending_queued_dispatch.take() {
             self.message_queue.restore_after_failed_send(entry);
         }
@@ -3109,9 +3123,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let is_idle = self.thread.read(cx).status() == acp_thread::ThreadStatus::Idle;
-
-        if is_idle {
+        if !self.is_effectively_generating(cx) {
             self.send_impl(message_editor, window, cx);
             return;
         }
@@ -3364,6 +3376,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_interrupt_send_task = None;
         self.sync_queue_flag_to_native_thread(cx);
 
         cx.emit(AcpThreadViewEvent::Interacted);
@@ -3405,6 +3418,7 @@ impl ThreadView {
                         })
                         .ok();
                 }
+                self.message_queue.finish_cancel_absorption();
                 self.send_resolved_content(
                     entry.content,
                     entry.tracked_buffers,
@@ -3460,6 +3474,12 @@ impl ThreadView {
                 };
                 this.follow_up_cancel_started_at = None;
                 this.sync_generating_indicator(cx);
+                if this.thread.read(cx).status() == ThreadStatus::Generating
+                    || this.thread.read(cx).has_follow_up_interrupt_in_flight()
+                {
+                    this.dispatch_queued_entry(entry, window, cx);
+                    return;
+                }
                 if should_be_following {
                     workspace
                         .update(cx, |workspace, cx| {
@@ -3467,6 +3487,7 @@ impl ThreadView {
                         })
                         .ok();
                 }
+                this.message_queue.finish_cancel_absorption();
                 this.send_resolved_content(
                     entry.content,
                     entry.tracked_buffers,

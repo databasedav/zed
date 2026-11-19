@@ -196,6 +196,17 @@ impl MessageQueue {
         Some(entry)
     }
 
+    /// Called once a Send Now or fast-track cancellation finishes unwinding and
+    /// the replacement turn is about to start. If the cancelled turn's Stopped
+    /// event was suppressed or ignored while `pending_queued_dispatch` held the
+    /// entry, clearing `AbsorbingCancel` here prevents the replacement turn's
+    /// own Stopped event from being swallowed.
+    pub fn finish_cancel_absorption(&mut self) {
+        if matches!(self.processing_state, ProcessingState::AbsorbingCancel) {
+            self.processing_state = ProcessingState::AutoProcess;
+        }
+    }
+
     /// Called when the user stops generation; queued messages stay put until
     /// the user re-engages.
     pub fn pause(&mut self) {

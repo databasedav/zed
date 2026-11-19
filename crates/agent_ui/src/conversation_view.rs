@@ -22255,6 +22255,153 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_send_now_beats_subagent_continuation_and_auto_dispatches_next_queued_message(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let first_queued_id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["are you hanging?".into()], vec![], window, cx);
+            view.add_to_queue(vec!["follow up after".into()], vec![], window, cx);
+            view.message_queue.first_id().expect("queued entry")
+        });
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(first_queued_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        // A subagent completes mid-cancel and requests a continuation turn.
+        thread_view.update(cx, |view, cx| {
+            view.thread
+                .update(cx, |thread, cx| thread.request_subagent_continuation(cx));
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                view.pending_queued_dispatch.is_some(),
+                "Send Now entry must remain visible until Turn 1 unwinds"
+            );
+            assert_eq!(view.message_queue.len(), 1);
+        });
+
+        let finish_second = connection.defer_next_prompt_response();
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("first turn waiting");
+        cx.run_until_parked();
+
+        // Send Now must win the turn (not the subagent continuation) and appear immediately.
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.pending_queued_dispatch.is_none());
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "are you hanging?"
+                ),
+                "Send Now message must be dispatched next instead of subagent continuation"
+            );
+            assert!(
+                matches!(
+                    view.thread.read(cx).entries().last(),
+                    Some(acp_thread::AgentThreadEntry::UserMessage(_))
+                ),
+                "Send Now user message must be visible in thread entries immediately"
+            );
+            assert_eq!(view.message_queue.len(), 1);
+        });
+
+        // When Turn 2 finishes normally, `AbsorbingCancel` must NOT swallow its Stopped event:
+        // the next queued message must auto-dispatch cleanly.
+        let finish_third = connection.defer_next_prompt_response();
+        finish_second
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("second turn waiting");
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            assert!(
+                matches!(
+                    view.in_flight_prompt(cx).as_deref(),
+                    Some([acp_v2::ContentBlock::Text(text)]) if text.text == "follow up after"
+                ),
+                "remaining queued message must auto-dispatch after Send Now turn completes"
+            );
+        });
+
+        finish_third
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("third turn waiting");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_stop_cancels_pending_interrupt_and_send(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("should be cancelled", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.interrupt_and_send(window, cx);
+        });
+        cx.run_until_parked();
+
+        // User clicks Stop before Turn 1 finishes unwinding.
+        thread_view.update(cx, |view, cx| view.cancel_generation(cx));
+        cx.run_until_parked();
+
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("first turn waiting");
+        cx.run_until_parked();
+
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "should be cancelled"
+        );
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Idle);
+            assert!(view.in_flight_prompt(cx).is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn test_acp_subagent_card_populates_model_name_from_session_info(
         cx: &mut TestAppContext,
     ) {

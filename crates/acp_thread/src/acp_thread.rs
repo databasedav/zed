@@ -8185,7 +8185,11 @@ impl AcpThread {
     }
 
     pub fn has_follow_up_interrupt_in_flight(&self) -> bool {
-        self.follow_up_interrupts_in_flight > 0 || self.cancelling_follow_up_task.is_some()
+        self.follow_up_interrupts_in_flight > 0
+            || self
+                .cancelling_follow_up_task
+                .as_ref()
+                .is_some_and(|(_, shared)| shared.peek().is_none())
     }
 
     pub fn request_subagent_continuation(&mut self, cx: &mut Context<Self>) {
@@ -8402,7 +8406,7 @@ impl AcpThread {
     ) -> Submission {
         let cancel_task = match self.request_cancellation_inner(
             RequestPermissionOutcome::InterruptedByFollowUp,
-            false,
+            true,
             cx,
         ) {
             Ok(task) => task,
@@ -8620,6 +8624,9 @@ impl AcpThread {
     /// Receipt sessions wait for reported Idle without withdrawing pending prompt RPCs.
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         self.pending_subagent_continuation = false;
+        if self.end_turn_at_next_boundary {
+            self.set_end_turn_at_next_boundary(false, cx);
+        }
         match self.request_cancellation(RequestPermissionOutcome::Cancelled, cx) {
             Ok(task) => task,
             Err(error) => Task::ready(Err(error)),
@@ -8639,6 +8646,9 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<Option<Task<Result<()>>>> {
         self.pending_subagent_continuation = false;
+        if self.end_turn_at_next_boundary {
+            self.set_end_turn_at_next_boundary(false, cx);
+        }
         let Some(task) = self.request_cancellation_inner(
             RequestPermissionOutcome::InterruptedByFollowUp,
             true,
@@ -8659,12 +8669,6 @@ impl AcpThread {
                         this.follow_up_interrupts_in_flight =
                             this.follow_up_interrupts_in_flight.saturating_sub(1);
                         if this.follow_up_interrupts_in_flight == 0 {
-                            if this.pending_subagent_continuation
-                                && this.status() == ThreadStatus::Idle
-                                && !this.has_unsettled_submissions()
-                            {
-                                this.request_subagent_continuation(cx);
-                            }
                             cx.emit(AcpThreadEvent::StatusChanged);
                             cx.notify();
                         }
@@ -8798,6 +8802,9 @@ impl AcpThread {
                 || self.has_unsettled_submissions()
                 || has_running_subagents
             {
+                if self.end_turn_at_next_boundary {
+                    self.set_end_turn_at_next_boundary(false, cx);
+                }
                 if cancel_subagents {
                     self.connection.cancel(self.session_id(), cx)?;
                 } else {
@@ -8851,10 +8858,14 @@ impl AcpThread {
             self.cancelling_follow_up_task
                 .take()
                 .map(|(_, shared)| shared)
+                .filter(|shared| shared.peek().is_none())
         } else {
             None
         };
         if self.running_turn.is_some() || cancelled_follow_up_shared.is_some() {
+            if self.end_turn_at_next_boundary {
+                self.set_end_turn_at_next_boundary(false, cx);
+            }
             if cancel_subagents {
                 self.connection.cancel(self.session_id(), cx)?;
             } else {
@@ -8888,10 +8899,14 @@ impl AcpThread {
                 && let Some((turn_id, shared)) = self.cancelling_follow_up_task.clone()
                 && turn_id == self.turn_id
             {
-                return Ok(Some(cx.background_spawn(async move {
-                    shared.await;
-                    Ok(())
-                })));
+                if shared.peek().is_some() {
+                    self.cancelling_follow_up_task = None;
+                } else {
+                    return Ok(Some(cx.background_spawn(async move {
+                        shared.await;
+                        Ok(())
+                    })));
+                }
             }
             return Ok(None);
         };
@@ -27754,6 +27769,150 @@ mod tests {
                 )
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_follow_up_interrupt_blocks_subagent_continuation_and_clears_steer_flag(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let prompts_seen: Rc<RefCell<Vec<String>>> = Default::default();
+        let (hold_first_tx, hold_first_rx) = oneshot::channel::<acp_v1::StopReason>();
+        let hold_first_rx = Rc::new(RefCell::new(Some(hold_first_rx)));
+        let (hold_second_tx, hold_second_rx) = oneshot::channel::<acp_v1::StopReason>();
+        let hold_second_rx = Rc::new(RefCell::new(Some(hold_second_rx)));
+
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let prompts_seen = prompts_seen.clone();
+            let hold_first_rx = hold_first_rx.clone();
+            let hold_second_rx = hold_second_rx.clone();
+            move |request, _thread, _cx| {
+                let text = request
+                    .prompt
+                    .iter()
+                    .filter_map(|block| match block {
+                        acp_v2::ContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                prompts_seen.borrow_mut().push(text.clone());
+                let maybe_rx = if text == "First turn" {
+                    hold_first_rx.borrow_mut().take()
+                } else if text == "are you hanging?" {
+                    hold_second_rx.borrow_mut().take()
+                } else {
+                    None
+                };
+                async move {
+                    let stop_reason = match maybe_rx {
+                        Some(rx) => rx.await.unwrap_or(acp_v1::StopReason::EndTurn),
+                        None => acp_v1::StopReason::EndTurn,
+                    };
+                    Ok(acp_v1::PromptResponse::new(stop_reason))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("test thread");
+
+        let _first = thread.update(cx, |thread, cx| {
+            thread.set_end_turn_at_next_boundary(true, cx);
+            thread.send(vec!["First turn".into()], cx)
+        });
+        cx.run_until_parked();
+
+        // Interrupting for a follow-up must clear any armed boundary-steer flag immediately.
+        let interrupt_task = thread.update(cx, |thread, cx| {
+            assert!(thread.end_turn_at_next_boundary());
+            let task = thread
+                .interrupt_for_follow_up_or_ready(cx)
+                .expect("interrupt succeeds")
+                .expect("first turn is still unwinding");
+            assert!(!thread.end_turn_at_next_boundary());
+            assert!(thread.has_follow_up_interrupt_in_flight());
+            task
+        });
+
+        // A subagent finishes mid-cancel and requests a continuation turn.
+        thread.update(cx, |thread, cx| {
+            thread.request_subagent_continuation(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(*prompts_seen.borrow(), vec!["First turn".to_string()]);
+
+        // Unwind Turn 1: the interrupt finishes WITHOUT auto-starting a subagent
+        // continuation turn that would steal the slot from the pending user message.
+        hold_first_tx
+            .send(acp_v1::StopReason::Cancelled)
+            .expect("first turn waiting");
+        interrupt_task.await.expect("interrupt completes");
+
+        assert_eq!(*prompts_seen.borrow(), vec!["First turn".to_string()]);
+        let second = thread.update(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(!thread.has_follow_up_interrupt_in_flight());
+            let submission = thread.send(vec!["are you hanging?".into()], cx);
+            // UserMessage must appear synchronously, never hidden behind a surprise cancel task.
+            let last_is_user_msg = matches!(
+                thread.entries().last(),
+                Some(AgentThreadEntry::UserMessage(_))
+            );
+            assert!(
+                last_is_user_msg,
+                "Send Now user message must be pushed synchronously after cancel finishes"
+            );
+            submission
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec!["First turn".to_string(), "are you hanging?".to_string()]
+        );
+
+        // If another send arrives while a follow-up interrupt is still genuinely unwinding,
+        // `run_turn_with_user_message` must await the in-flight cancel instead of overlapping.
+        let _interrupt_second = thread.update(cx, |thread, cx| {
+            thread
+                .interrupt_for_follow_up_or_ready(cx)
+                .expect("interrupt succeeds")
+                .expect("second turn is still unwinding")
+        });
+        let third = thread.update(cx, |thread, cx| {
+            thread.send(vec!["third after unwind".into()], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec!["First turn".to_string(), "are you hanging?".to_string()],
+            "third prompt must wait for second turn's in-flight cancel to finish"
+        );
+
+        hold_second_tx
+            .send(acp_v1::StopReason::Cancelled)
+            .expect("second turn waiting");
+        second.await.expect("second turn settles");
+        third.await.expect("third turn settles");
+        cx.run_until_parked();
+
+        assert_eq!(
+            *prompts_seen.borrow(),
+            vec![
+                "First turn".to_string(),
+                "are you hanging?".to_string(),
+                "third after unwind".to_string(),
+            ]
+        );
     }
 
     #[gpui::test]
