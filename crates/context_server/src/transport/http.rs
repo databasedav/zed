@@ -357,6 +357,10 @@ impl Transport for HttpTransport {
     fn auth_challenge(&self) -> Option<WwwAuthenticate> {
         self.auth_challenge.lock().clone()
     }
+
+    fn oauth_token_provider(&self) -> Option<Arc<dyn OAuthTokenProvider>> {
+        self.token_provider.clone()
+    }
 }
 
 impl Drop for HttpTransport {
@@ -574,6 +578,13 @@ mod tests {
         assert_eq!(
             captured_auth.lock().as_deref(),
             Some("Bearer test-access-token"),
+        );
+        assert_eq!(
+            transport
+                .oauth_token_provider()
+                .and_then(|provider| provider.access_token())
+                .as_deref(),
+            Some("test-access-token"),
         );
     }
 

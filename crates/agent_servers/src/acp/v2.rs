@@ -3,8 +3,9 @@ use super::{
     ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, ReadOnlyConfigOptions,
     UnsupportedVersion, apply_v2_session_notification, close_undelivered_session,
     drain_foreground_queue, enqueue_notification, first_class_terminal_auth_task,
-    is_disconnect_error, is_resource_not_found, map_acp_error, mcp_configurations_for_project,
-    runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    is_disconnect_error, is_resource_not_found, map_acp_error,
+    resolve_mcp_configurations_for_project, runtime, transport,
+    try_mcp_configurations_for_project_sync, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -996,6 +997,44 @@ impl AcpV2Connection {
         replay_history: bool,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        if let Some(configurations) = try_mcp_configurations_for_project_sync(&project, cx) {
+            return self.open_session_with_configurations(
+                session_id,
+                project,
+                work_dirs,
+                title,
+                replay_history,
+                configurations,
+                cx,
+            );
+        }
+        cx.spawn(async move |cx| {
+            let configurations = resolve_mcp_configurations_for_project(project.clone(), cx).await;
+            cx.update(|cx| {
+                self.open_session_with_configurations(
+                    session_id,
+                    project,
+                    work_dirs,
+                    title,
+                    replay_history,
+                    configurations,
+                    cx,
+                )
+            })
+            .await
+        })
+    }
+
+    fn open_session_with_configurations(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        replay_history: bool,
+        configurations: Vec<(String, Arc<ContextServerConfiguration>)>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
         if is_connection_closed(&self.connection) {
             return Task::ready(Err(anyhow!("Agent connection is closed")));
         }
@@ -1005,11 +1044,9 @@ impl AcpV2Connection {
             )));
         }
         let path_style = project.read(cx).path_style(cx);
-        let context = match self.session_context(
-            mcp_configurations_for_project(&project, cx),
-            &work_dirs,
-            |path| path_style.is_absolute(path),
-        ) {
+        let context = match self.session_context(configurations, &work_dirs, |path| {
+            path_style.is_absolute(path)
+        }) {
             Ok(context) => context,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -1310,163 +1347,18 @@ impl AcpV2Connection {
         }
         .boxed_local()
     }
-}
 
-struct AcpV2SessionFork {
-    connection: V2ConnectionTo<Agent>,
-    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
-    pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
-    capabilities: acp::SessionCapabilities,
-    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
-    session_id: acp::SessionId,
-}
-
-impl acp_thread::AgentSessionFork for AcpV2SessionFork {
-    fn run(
-        &self,
-        project: Entity<Project>,
-        work_dirs: PathList,
-        cx: &mut App,
-    ) -> Task<Result<acp::SessionId>> {
-        let path_style = project.read(cx).path_style(cx);
-        let mut seen = collections::HashSet::default();
-        let paths = work_dirs
-            .ordered_paths()
-            .map(|path| super::v1::session_directory_for_path(path))
-            .filter(|path| seen.insert(path.clone()))
-            .collect::<Vec<_>>();
-        let context = match AcpV2Connection::session_context_for_capabilities(
-            &self.capabilities,
-            mcp_configurations_for_project(&project, cx),
-            &PathList::new(&paths),
-            |path| path_style.is_absolute(path),
-        ) {
-            Ok(context) => context,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let request = self.connection.prepare_request(
-            acp::ForkSessionRequest::new(self.session_id.clone(), context.cwd)
-                .additional_directories(context.additional_directories)
-                .mcp_servers(context.mcp_servers),
-        );
-        let request_id = request.id().clone();
-        let (response, applied) = AcpV2Connection::ordered_prepared_response(
-            &self.connection,
-            &self.dispatch_tx,
-            request,
-            {
-                let dispatch_tx = self.dispatch_tx.clone();
-                let request_id = request_id.clone();
-                move || {
-                    enqueue_notification(&dispatch_tx, request_id, begin_session_creation);
-                    Ok(())
-                }
-            },
-            |response| Some(response.session_id.clone()),
-        );
-        let response = {
-            let dispatch_tx = self.dispatch_tx.clone();
-            async move {
-                let response = response.await?;
-                drain_foreground_queue(&dispatch_tx).await?;
-                Ok(response)
-            }
-            .boxed_local()
-        };
-        let pending = self.pending_session_updates.clone();
-        let sessions = self.sessions.clone();
-        let source_id = self.session_id.clone();
-        let connection = self.connection.clone();
-        let dispatch_tx = self.dispatch_tx.clone();
-        let cleanup = util::defer({
-            let dispatch_tx = dispatch_tx.clone();
-            let request_id = request_id.clone();
-            move || enqueue_notification(&dispatch_tx, request_id, finish_session_creation)
-        });
-        let response = AcpV2Connection::apply_ordered_response(
-            response,
-            applied,
-            &self.dispatch_tx,
-            {
-                let connection = connection.clone();
-                let dispatch_tx = dispatch_tx.clone();
-                move |response, _cx| {
-                    let session_id = response.session_id;
-                    anyhow::ensure!(
-                        session_id != source_id && !sessions.borrow().contains_key(&session_id),
-                        "Agent returned an existing session as its fork"
-                    );
-                    // No thread owns this fork. Release it even if the caller cancels
-                    // while waiting for its close acknowledgement.
-                    let abandoned = util::defer({
-                        let session_id = session_id.clone();
-                        move || {
-                            enqueue_notification(
-                                &dispatch_tx,
-                                (session_id, connection),
-                                close_undelivered_session,
-                            )
-                        }
-                    });
-                    pending.borrow_mut().take(&request_id, &session_id)?;
-                    Ok((session_id, abandoned))
-                }
-            },
-            cx,
-        );
-        let async_cx = cx.to_async();
-        cx.foreground_executor().spawn(async move {
-            let _cleanup = cleanup;
-            let (session_id, abandoned) = response.await?;
-            let close = async_cx.update(|cx| {
-                AcpV2Connection::ordered_request(
-                    &connection,
-                    &dispatch_tx,
-                    acp::CloseSessionRequest::new(session_id.clone()),
-                    || Ok(()),
-                    |_| None,
-                    |_, _| Ok(()),
-                    cx,
-                )
-            });
-            close.await?;
-            abandoned.abort();
-            Ok(session_id)
-        })
-    }
-}
-
-impl AgentConnection for AcpV2Connection {
-    fn shutdown(&self) {
-        let runtime = self.runtime.borrow_mut().take();
-        drop(runtime);
-    }
-
-    fn agent_id(&self) -> AgentId {
-        self.id.clone()
-    }
-
-    fn telemetry_id(&self) -> SharedString {
-        self.initialize_response.info.name.clone().into()
-    }
-
-    fn agent_version(&self) -> Option<SharedString> {
-        let version = &self.initialize_response.info.version;
-        (!version.is_empty()).then(|| version.clone().into())
-    }
-
-    fn new_session(
+    fn new_session_with_configurations(
         self: Rc<Self>,
         project: Entity<Project>,
         work_dirs: PathList,
+        configurations: Vec<(String, Arc<ContextServerConfiguration>)>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         let path_style = project.read(cx).path_style(cx);
-        let context = match self.session_context(
-            mcp_configurations_for_project(&project, cx),
-            &work_dirs,
-            |path| path_style.is_absolute(path),
-        ) {
+        let context = match self.session_context(configurations, &work_dirs, |path| {
+            path_style.is_absolute(path)
+        }) {
             Ok(context) => context,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -1602,6 +1494,189 @@ impl AgentConnection for AcpV2Connection {
             self.apply_new_session_defaults(&thread, cx).await?;
             abandoned.abort();
             Ok(thread)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AcpV2SessionFork {
+    connection: V2ConnectionTo<Agent>,
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+    pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
+    capabilities: acp::SessionCapabilities,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+}
+
+impl AcpV2SessionFork {
+    fn run_with_configurations(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        configurations: Vec<(String, Arc<ContextServerConfiguration>)>,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        let path_style = project.read(cx).path_style(cx);
+        let mut seen = collections::HashSet::default();
+        let paths = work_dirs
+            .ordered_paths()
+            .map(|path| super::v1::session_directory_for_path(path))
+            .filter(|path| seen.insert(path.clone()))
+            .collect::<Vec<_>>();
+        let context = match AcpV2Connection::session_context_for_capabilities(
+            &self.capabilities,
+            configurations,
+            &PathList::new(&paths),
+            |path| path_style.is_absolute(path),
+        ) {
+            Ok(context) => context,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let request = self.connection.prepare_request(
+            acp::ForkSessionRequest::new(self.session_id.clone(), context.cwd)
+                .additional_directories(context.additional_directories)
+                .mcp_servers(context.mcp_servers),
+        );
+        let request_id = request.id().clone();
+        let (response, applied) = AcpV2Connection::ordered_prepared_response(
+            &self.connection,
+            &self.dispatch_tx,
+            request,
+            {
+                let dispatch_tx = self.dispatch_tx.clone();
+                let request_id = request_id.clone();
+                move || {
+                    enqueue_notification(&dispatch_tx, request_id, begin_session_creation);
+                    Ok(())
+                }
+            },
+            |response| Some(response.session_id.clone()),
+        );
+        let response = {
+            let dispatch_tx = self.dispatch_tx.clone();
+            async move {
+                let response = response.await?;
+                drain_foreground_queue(&dispatch_tx).await?;
+                Ok(response)
+            }
+            .boxed_local()
+        };
+        let pending = self.pending_session_updates.clone();
+        let sessions = self.sessions.clone();
+        let source_id = self.session_id.clone();
+        let connection = self.connection.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
+        let cleanup = util::defer({
+            let dispatch_tx = dispatch_tx.clone();
+            let request_id = request_id.clone();
+            move || enqueue_notification(&dispatch_tx, request_id, finish_session_creation)
+        });
+        let response = AcpV2Connection::apply_ordered_response(
+            response,
+            applied,
+            &self.dispatch_tx,
+            {
+                let connection = connection.clone();
+                let dispatch_tx = dispatch_tx.clone();
+                move |response, _cx| {
+                    let session_id = response.session_id;
+                    anyhow::ensure!(
+                        session_id != source_id && !sessions.borrow().contains_key(&session_id),
+                        "Agent returned an existing session as its fork"
+                    );
+                    // No thread owns this fork. Release it even if the caller cancels
+                    // while waiting for its close acknowledgement.
+                    let abandoned = util::defer({
+                        let session_id = session_id.clone();
+                        move || {
+                            enqueue_notification(
+                                &dispatch_tx,
+                                (session_id, connection),
+                                close_undelivered_session,
+                            )
+                        }
+                    });
+                    pending.borrow_mut().take(&request_id, &session_id)?;
+                    Ok((session_id, abandoned))
+                }
+            },
+            cx,
+        );
+        let async_cx = cx.to_async();
+        cx.foreground_executor().spawn(async move {
+            let _cleanup = cleanup;
+            let (session_id, abandoned) = response.await?;
+            let close = async_cx.update(|cx| {
+                AcpV2Connection::ordered_request(
+                    &connection,
+                    &dispatch_tx,
+                    acp::CloseSessionRequest::new(session_id.clone()),
+                    || Ok(()),
+                    |_| None,
+                    |_, _| Ok(()),
+                    cx,
+                )
+            });
+            close.await?;
+            abandoned.abort();
+            Ok(session_id)
+        })
+    }
+}
+
+impl acp_thread::AgentSessionFork for AcpV2SessionFork {
+    fn run(
+        &self,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        if let Some(configurations) = try_mcp_configurations_for_project_sync(&project, cx) {
+            return self.run_with_configurations(project, work_dirs, configurations, cx);
+        }
+        let this = self.clone();
+        cx.spawn(async move |cx| {
+            let configurations = resolve_mcp_configurations_for_project(project.clone(), cx).await;
+            cx.update(|cx| this.run_with_configurations(project, work_dirs, configurations, cx))
+                .await
+        })
+    }
+}
+
+impl AgentConnection for AcpV2Connection {
+    fn shutdown(&self) {
+        let runtime = self.runtime.borrow_mut().take();
+        drop(runtime);
+    }
+
+    fn agent_id(&self) -> AgentId {
+        self.id.clone()
+    }
+
+    fn telemetry_id(&self) -> SharedString {
+        self.initialize_response.info.name.clone().into()
+    }
+
+    fn agent_version(&self) -> Option<SharedString> {
+        let version = &self.initialize_response.info.version;
+        (!version.is_empty()).then(|| version.clone().into())
+    }
+
+    fn new_session(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if let Some(configurations) = try_mcp_configurations_for_project_sync(&project, cx) {
+            return self.new_session_with_configurations(project, work_dirs, configurations, cx);
+        }
+        cx.spawn(async move |cx| {
+            let configurations = resolve_mcp_configurations_for_project(project.clone(), cx).await;
+            cx.update(|cx| {
+                self.new_session_with_configurations(project, work_dirs, configurations, cx)
+            })
+            .await
         })
     }
 

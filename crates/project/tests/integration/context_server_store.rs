@@ -1952,3 +1952,242 @@ impl ContextServerDescriptor for FakeContextServerDescriptor {
         Task::ready(Ok(None))
     }
 }
+
+#[derive(Default)]
+struct InMemoryCredentialsProvider {
+    entries: std::sync::Mutex<collections::HashMap<String, (String, Vec<u8>)>>,
+}
+
+impl credentials_provider::CredentialsProvider for InMemoryCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>>
+    {
+        let entry = self
+            .entries
+            .lock()
+            .expect("credentials lock")
+            .get(url)
+            .cloned();
+        Box::pin(async move { Ok(entry) })
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        _cx: &'a AsyncApp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        self.entries
+            .lock()
+            .expect("credentials lock")
+            .insert(url.to_string(), (username.to_string(), password.to_vec()));
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        self.entries.lock().expect("credentials lock").remove(url);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[gpui::test]
+async fn test_oauth_token_for_server_reads_live_refreshes_and_loads_keychain(
+    cx: &mut TestAppContext,
+) {
+    let credentials_provider = Arc::new(InMemoryCredentialsProvider::default());
+    let refresh_http_client = FakeHttpClient::create(|request| async move {
+        assert_eq!(request.uri().to_string(), "https://auth.example.com/token");
+        Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(http_client::AsyncBody::from(
+                json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                })
+                .to_string(),
+            ))
+            .expect("valid JSON response"))
+    });
+
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    cx.update(|cx| {
+        cx.set_http_client(refresh_http_client);
+        cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+            credentials_provider.clone(),
+        ));
+    });
+
+    let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
+    let store = cx.new(|cx| {
+        ContextServerStore::test(
+            registry,
+            project.read(cx).worktree_store(),
+            Some(project.downgrade()),
+            cx,
+        )
+    });
+
+    store.update(cx, |store, cx| {
+        store.test_insert_http_server(
+            "live-valid",
+            "https://mcp.live.example/",
+            collections::HashMap::default(),
+            TestHttpServerOAuth::Valid("live-token".to_string()),
+            ContextServerStatus::Running,
+            cx,
+        );
+        store.test_insert_http_server(
+            "live-expired-no-refresh",
+            "https://mcp.expired.example/",
+            collections::HashMap::default(),
+            TestHttpServerOAuth::Expired,
+            ContextServerStatus::Running,
+            cx,
+        );
+        store.test_insert_http_server(
+            "keychain-valid",
+            "https://mcp.keychain-valid.example/",
+            collections::HashMap::default(),
+            TestHttpServerOAuth::None,
+            ContextServerStatus::Starting,
+            cx,
+        );
+        store.test_insert_http_server(
+            "keychain-expired",
+            "https://mcp.keychain-expired.example/",
+            collections::HashMap::default(),
+            TestHttpServerOAuth::None,
+            ContextServerStatus::Starting,
+            cx,
+        );
+        store.test_insert_http_server(
+            "public",
+            "https://mcp.public.example/",
+            collections::HashMap::default(),
+            TestHttpServerOAuth::None,
+            ContextServerStatus::Running,
+            cx,
+        );
+    });
+
+    let mut async_cx = cx.to_async();
+    let credentials_dyn: Arc<dyn credentials_provider::CredentialsProvider> =
+        credentials_provider.clone();
+
+    let valid_url = url::Url::parse("https://mcp.keychain-valid.example/").expect("valid URL");
+    ContextServerStore::test_store_oauth_session(
+        &credentials_dyn,
+        &valid_url,
+        &context_server::oauth::OAuthSession {
+            token_endpoint: url::Url::parse("https://auth.example.com/token").expect("URL"),
+            resource: valid_url.clone(),
+            client_registration: context_server::oauth::OAuthClientRegistration {
+                client_id: "test-client".to_string(),
+                client_secret: None,
+            },
+            tokens: context_server::oauth::OAuthTokens {
+                access_token: "keychain-access-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+            },
+        },
+        &async_cx,
+    )
+    .await
+    .expect("store valid session");
+
+    let expired_url = url::Url::parse("https://mcp.keychain-expired.example/").expect("valid URL");
+    ContextServerStore::test_store_oauth_session(
+        &credentials_dyn,
+        &expired_url,
+        &context_server::oauth::OAuthSession {
+            token_endpoint: url::Url::parse("https://auth.example.com/token").expect("URL"),
+            resource: expired_url.clone(),
+            client_registration: context_server::oauth::OAuthClientRegistration {
+                client_id: "test-client".to_string(),
+                client_secret: None,
+            },
+            tokens: context_server::oauth::OAuthTokens {
+                access_token: "stale-access-token".to_string(),
+                refresh_token: Some("old-refresh-token".to_string()),
+                expires_at: Some(std::time::UNIX_EPOCH),
+            },
+        },
+        &async_cx,
+    )
+    .await
+    .expect("store expired session");
+
+    assert_eq!(
+        ContextServerStore::oauth_token_for_server(
+            store.clone(),
+            ContextServerId("live-valid".into()),
+            &mut async_cx,
+        )
+        .await,
+        ContextServerOAuthToken::Bearer("live-token".to_string())
+    );
+
+    assert_eq!(
+        ContextServerStore::oauth_token_for_server(
+            store.clone(),
+            ContextServerId("live-expired-no-refresh".into()),
+            &mut async_cx,
+        )
+        .await,
+        ContextServerOAuthToken::Unavailable
+    );
+
+    assert_eq!(
+        ContextServerStore::oauth_token_for_server(
+            store.clone(),
+            ContextServerId("keychain-valid".into()),
+            &mut async_cx,
+        )
+        .await,
+        ContextServerOAuthToken::Bearer("keychain-access-token".to_string())
+    );
+
+    assert_eq!(
+        ContextServerStore::oauth_token_for_server(
+            store.clone(),
+            ContextServerId("keychain-expired".into()),
+            &mut async_cx,
+        )
+        .await,
+        ContextServerOAuthToken::Bearer("refreshed-access-token".to_string())
+    );
+
+    cx.run_until_parked();
+    let persisted =
+        ContextServerStore::test_load_oauth_session(&credentials_dyn, &expired_url, &async_cx)
+            .await
+            .expect("load refreshed session")
+            .expect("persisted session present");
+    assert_eq!(persisted.tokens.access_token, "refreshed-access-token");
+    assert_eq!(
+        persisted.tokens.refresh_token.as_deref(),
+        Some("rotated-refresh-token")
+    );
+
+    assert_eq!(
+        ContextServerStore::oauth_token_for_server(
+            store,
+            ContextServerId("public".into()),
+            &mut async_cx,
+        )
+        .await,
+        ContextServerOAuthToken::NotConfigured
+    );
+}

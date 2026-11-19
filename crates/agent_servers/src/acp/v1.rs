@@ -3,7 +3,7 @@ use super::{
     ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
     drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
     handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
+    resolve_mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
     terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
@@ -1270,6 +1270,7 @@ impl AcpConnection {
             ConnectionTo<Agent>,
             acp_v2::SessionId,
             SessionDirectories,
+            Vec<acp::McpServer>,
             futures::channel::oneshot::Receiver<()>,
         )
             -> futures::future::LocalBoxFuture<'static, Result<SessionConfigResponse>>
@@ -1334,6 +1335,7 @@ impl AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
 
+        let weak_project = project.downgrade();
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let thread = cx.new(|cx| {
             AcpThread::new(
@@ -1369,10 +1371,20 @@ impl AcpConnection {
                         return Ok(());
                     }
 
+                    let mcp_servers = match weak_project.upgrade() {
+                        Some(project) => mcp_servers_for_project(project, cx).await,
+                        None => Vec::new(),
+                    };
+
                     let (response_applied, applied) = futures::channel::oneshot::channel();
-                    let response =
-                        rpc_call(connection.clone(), session_id.clone(), directories, applied)
-                            .await;
+                    let response = rpc_call(
+                        connection.clone(),
+                        session_id.clone(),
+                        directories,
+                        mcp_servers,
+                        applied,
+                    )
+                    .await;
                     if response.is_err() {
                         // Do not let replay from a failed load reach its replacement.
                         drain_foreground_queue(&dispatch_tx).await.log_err();
@@ -1696,12 +1708,12 @@ impl acp_thread::AgentSessionFork for AcpSessionFork {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
-        let mcp_servers = mcp_servers_for_project(&project, cx);
-        let request = directories.into_fork_session_request(self.session_id.clone(), mcp_servers);
         let connection = self.connection.clone();
         let supports_close = self.supports_close;
         let source_id = self.session_id.clone();
-        cx.foreground_executor().spawn(async move {
+        cx.spawn(async move |cx| {
+            let mcp_servers = mcp_servers_for_project(project, cx).await;
+            let request = directories.into_fork_session_request(source_id.clone(), mcp_servers);
             let (sender, received) = futures::channel::oneshot::channel();
             let request = connection.prepare_request(request);
             let cancellation = request.cancellation_handle();
@@ -1924,10 +1936,10 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
 
         cx.spawn(async move |cx| {
+            let mcp_servers = mcp_servers_for_project(project.clone(), cx).await;
             let (response_sender, response_received) = futures::channel::oneshot::channel();
             let (registered, registration_finished) = futures::channel::oneshot::channel();
             let mut request = directories.into_new_session_request(mcp_servers);
@@ -2132,14 +2144,13 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
             true,
-            move |connection, session_id, directories, applied| {
+            move |connection, session_id, directories, mcp_servers, applied| {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
@@ -2176,14 +2187,13 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
             false,
-            move |connection, session_id, directories, applied| {
+            move |connection, session_id, directories, mcp_servers, applied| {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
@@ -7326,7 +7336,7 @@ mod tests {
                     false,
                     {
                         let returned = returned.clone();
-                        |_, _, _, _| {
+                        |_, _, _, _, _| {
                             async move {
                                 Ok(SessionConfigResponse {
                                     modes: None,
@@ -7677,7 +7687,7 @@ mod tests {
                     PathList::new(&[std::path::Path::new("/a")]),
                     None,
                     false,
-                    move |_, _, _, _| {
+                    move |_, _, _, _, _| {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
@@ -7726,7 +7736,7 @@ mod tests {
                     PathList::new(&[std::path::Path::new("/a")]),
                     None,
                     false,
-                    move |_, _, _, _| {
+                    move |_, _, _, _, _| {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
@@ -10252,7 +10262,7 @@ exit 7
                     {
                         let dispatch_tx = connection.dispatch_tx.clone();
                         let updated_options = updated_options.clone();
-                        move |_, session_id, _, _| {
+                        move |_, session_id, _, _, _| {
                             async move {
                                 // Later notifications can already be queued when the response is ready.
                                 enqueue_notification(
@@ -10620,7 +10630,7 @@ exit 7
                 false,
                 {
                     let dispatch_tx = connection.dispatch_tx.clone();
-                    move |_, session_id, _, _| {
+                    move |_, session_id, _, _, _| {
                         async move {
                             response_rx.await?;
                             enqueue_notification(
@@ -11642,8 +11652,12 @@ exit 7
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
-    mcp_configurations_for_project(project, cx)
+async fn mcp_servers_for_project(
+    project: Entity<Project>,
+    cx: &mut AsyncApp,
+) -> Vec<acp::McpServer> {
+    resolve_mcp_configurations_for_project(project, cx)
+        .await
         .into_iter()
         .map(|(name, configuration)| match &*configuration {
             project::context_server_store::ContextServerConfiguration::Custom {

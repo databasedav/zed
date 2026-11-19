@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 pub use settings::ContextServerCommand;
 use url::Url;
 
-use crate::oauth::WwwAuthenticate;
+use crate::oauth::{OAuthTokenProvider, WwwAuthenticate};
 use crate::transport::HttpTransport;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -116,6 +116,14 @@ impl ContextServer {
         match &self.configuration {
             ContextServerTransport::Stdio(..) => None,
             ContextServerTransport::Custom(transport) => transport.auth_challenge(),
+        }
+    }
+
+    /// The OAuth token provider attached to this server's transport, if any.
+    pub fn oauth_token_provider(&self) -> Option<Arc<dyn OAuthTokenProvider>> {
+        match &self.configuration {
+            ContextServerTransport::Stdio(..) => None,
+            ContextServerTransport::Custom(transport) => transport.oauth_token_provider(),
         }
     }
 

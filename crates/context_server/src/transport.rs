@@ -5,8 +5,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use crate::oauth::WwwAuthenticate;
+use crate::oauth::{OAuthTokenProvider, WwwAuthenticate};
 
 pub use http::*;
 pub use stdio_transport::*;
@@ -31,6 +32,11 @@ pub trait Transport: Send + Sync {
     /// here, so a 401 can initiate the OAuth flow even when it arrived on a
     /// notification, with no request in flight to carry a typed error.
     fn auth_challenge(&self) -> Option<WwwAuthenticate> {
+        None
+    }
+
+    /// The OAuth token provider attached to this transport, if any.
+    fn oauth_token_provider(&self) -> Option<Arc<dyn OAuthTokenProvider>> {
         None
     }
 }

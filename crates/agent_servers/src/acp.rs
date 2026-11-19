@@ -32,7 +32,10 @@ use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{Future, channel::mpsc};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 use project::agent_server_store::{AgentServerCommand, AgentServerStore};
-use project::context_server_store::ContextServerConfiguration;
+use project::context_server_store::{
+    ContextServerConfiguration, ContextServerId, ContextServerOAuthToken, ContextServerStatus,
+    ContextServerStore,
+};
 use project::{AgentId, Project};
 use std::{cell::RefCell, path::PathBuf, process::ExitStatus, rc::Rc, sync::Arc};
 use task::SpawnInTerminal;
@@ -42,10 +45,57 @@ use util::path_list::PathList;
 
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn mcp_configurations_for_project(
+enum PendingMcpConfiguration {
+    Ready(String, Arc<ContextServerConfiguration>),
+    PendingHttpOAuth {
+        id: ContextServerId,
+        name: String,
+        configuration: Arc<ContextServerConfiguration>,
+        has_oauth_config: bool,
+    },
+}
+
+fn is_awaiting_oauth(status: Option<&ContextServerStatus>) -> bool {
+    matches!(
+        status,
+        Some(
+            ContextServerStatus::AuthRequired
+                | ContextServerStatus::ClientSecretRequired { .. }
+                | ContextServerStatus::Authenticating
+        )
+    )
+}
+
+fn with_bearer_auth_header(
+    configuration: &ContextServerConfiguration,
+    bearer_token: &str,
+) -> Option<Arc<ContextServerConfiguration>> {
+    let ContextServerConfiguration::Http {
+        url,
+        headers,
+        timeout,
+        oauth,
+    } = configuration
+    else {
+        return None;
+    };
+    let mut headers = headers.clone();
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Bearer {bearer_token}"),
+    );
+    Some(Arc::new(ContextServerConfiguration::Http {
+        url: url.clone(),
+        headers,
+        timeout: *timeout,
+        oauth: oauth.clone(),
+    }))
+}
+
+fn collect_mcp_configurations_for_project(
     project: &Entity<Project>,
     cx: &App,
-) -> Vec<(String, Arc<ContextServerConfiguration>)> {
+) -> Vec<PendingMcpConfiguration> {
     let store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
     store
@@ -60,10 +110,131 @@ fn mcp_configurations_for_project(
                 {
                     None
                 }
-                _ => Some((id.0.to_string(), configuration)),
+                ContextServerConfiguration::Http { oauth, .. }
+                    if !configuration.has_static_auth_header() =>
+                {
+                    let status = store.status_for_server(id);
+                    if is_awaiting_oauth(status.as_ref()) || store.server_has_auth_challenge(id) {
+                        log::info!(
+                            "Skipping HTTP MCP server '{}' for ACP session because it requires authentication",
+                            id
+                        );
+                        return None;
+                    }
+                    if let Some(token) = store.cached_oauth_bearer_token_for_server(id) {
+                        let resolved = with_bearer_auth_header(&configuration, &token)
+                            .unwrap_or(configuration);
+                        Some(PendingMcpConfiguration::Ready(id.0.to_string(), resolved))
+                    } else {
+                        Some(PendingMcpConfiguration::PendingHttpOAuth {
+                            id: id.clone(),
+                            name: id.0.to_string(),
+                            has_oauth_config: oauth.is_some(),
+                            configuration,
+                        })
+                    }
+                }
+                _ => Some(PendingMcpConfiguration::Ready(
+                    id.0.to_string(),
+                    configuration,
+                )),
             }
         })
         .collect()
+}
+
+fn try_mcp_configurations_for_project_sync(
+    project: &Entity<Project>,
+    cx: &App,
+) -> Option<Vec<(String, Arc<ContextServerConfiguration>)>> {
+    let pending = collect_mcp_configurations_for_project(project, cx);
+    let mut resolved = Vec::with_capacity(pending.len());
+    for item in pending {
+        match item {
+            PendingMcpConfiguration::Ready(name, configuration) => {
+                resolved.push((name, configuration));
+            }
+            PendingMcpConfiguration::PendingHttpOAuth { .. } => return None,
+        }
+    }
+    Some(resolved)
+}
+
+async fn resolve_mcp_configurations_for_project(
+    project: Entity<Project>,
+    cx: &mut AsyncApp,
+) -> Vec<(String, Arc<ContextServerConfiguration>)> {
+    let (context_server_store, pending) = cx.update(|cx| {
+        (
+            project.read(cx).context_server_store(),
+            collect_mcp_configurations_for_project(&project, cx),
+        )
+    });
+
+    let mut resolved = Vec::with_capacity(pending.len());
+    for item in pending {
+        match item {
+            PendingMcpConfiguration::Ready(name, configuration) => {
+                resolved.push((name, configuration));
+            }
+            PendingMcpConfiguration::PendingHttpOAuth {
+                id,
+                name,
+                configuration,
+                has_oauth_config,
+            } => {
+                match ContextServerStore::oauth_token_for_server(
+                    context_server_store.clone(),
+                    id.clone(),
+                    cx,
+                )
+                .await
+                {
+                    ContextServerOAuthToken::Bearer(token) => {
+                        let auth_blocked = context_server_store.read_with(cx, |store, _| {
+                            let status = store.status_for_server(&id);
+                            is_awaiting_oauth(status.as_ref())
+                                || store.server_has_auth_challenge(&id)
+                        });
+                        if auth_blocked {
+                            log::info!(
+                                "Skipping HTTP MCP server '{}' for ACP session because it requires authentication",
+                                id
+                            );
+                        } else {
+                            let configuration = with_bearer_auth_header(&configuration, &token)
+                                .unwrap_or(configuration);
+                            resolved.push((name, configuration));
+                        }
+                    }
+                    ContextServerOAuthToken::Unavailable => {
+                        log::info!(
+                            "Skipping HTTP MCP server '{}' for ACP session because its OAuth token is expired or unavailable",
+                            id
+                        );
+                    }
+                    ContextServerOAuthToken::NotConfigured => {
+                        let is_ready_unauthenticated = !has_oauth_config
+                            && context_server_store.read_with(cx, |store, _| {
+                                matches!(
+                                    store.status_for_server(&id),
+                                    Some(ContextServerStatus::Running)
+                                ) && !store.server_has_auth_challenge(&id)
+                            });
+                        if is_ready_unauthenticated {
+                            resolved.push((name, configuration));
+                        } else {
+                            log::info!(
+                                "Skipping HTTP MCP server '{}' for ACP session because it is not running without authentication",
+                                id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    resolved
 }
 
 fn work_dirs_from_session_info(cwd: PathBuf, additional_directories: Vec<PathBuf>) -> PathList {
@@ -1492,6 +1663,132 @@ done
             connection.shutdown();
             drop(connection);
             cx.run_until_parked();
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_oauth_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use project::context_server_store::TestHttpServerOAuth;
+
+    #[gpui::test]
+    async fn test_resolve_mcp_configurations_forwards_oauth_bearer_and_skips_auth_required(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let context_server_store =
+            project.read_with(cx, |project, _| project.context_server_store());
+
+        context_server_store.update(cx, |store, cx| {
+            // 1. Authenticated OAuth HTTP MCP server (e.g. runpod): must forward Bearer token.
+            store.test_insert_http_server(
+                "runpod",
+                "https://mcp.runpod.io/",
+                HashMap::default(),
+                TestHttpServerOAuth::Valid("oauth-access-token".to_string()),
+                ContextServerStatus::Running,
+                cx,
+            );
+            // 2. Unauthenticated OAuth HTTP MCP server: must be skipped to avoid ACP 401 failure.
+            store.test_insert_http_server(
+                "needs-auth",
+                "https://mcp.needs-auth.example/",
+                HashMap::default(),
+                TestHttpServerOAuth::None,
+                ContextServerStatus::AuthRequired,
+                cx,
+            );
+            // 3. Starting unauthenticated HTTP MCP server (pre-401 probe): must be skipped.
+            store.test_insert_http_server(
+                "starting-unauth",
+                "https://mcp.starting.example/",
+                HashMap::default(),
+                TestHttpServerOAuth::None,
+                ContextServerStatus::Starting,
+                cx,
+            );
+            // 4. Expired OAuth token with no refresh token: must be skipped, never sent unauthenticated.
+            store.test_insert_http_server(
+                "expired-oauth",
+                "https://mcp.expired.example/",
+                HashMap::default(),
+                TestHttpServerOAuth::Expired,
+                ContextServerStatus::Running,
+                cx,
+            );
+            // 5. Static Authorization header: must be preserved untouched.
+            store.test_insert_http_server(
+                "static-auth",
+                "https://mcp.static.example/",
+                HashMap::from_iter([(
+                    "Authorization".to_string(),
+                    "Bearer static-secret".to_string(),
+                )]),
+                TestHttpServerOAuth::Valid("ignored-oauth-token".to_string()),
+                ContextServerStatus::Running,
+                cx,
+            );
+            // 6. Running public HTTP MCP server without auth: forwarded as-is.
+            store.test_insert_http_server(
+                "public-docs",
+                "https://mcp.public.example/",
+                HashMap::default(),
+                TestHttpServerOAuth::None,
+                ContextServerStatus::Running,
+                cx,
+            );
+        });
+
+        let mut async_cx = cx.to_async();
+        let resolved = resolve_mcp_configurations_for_project(project.clone(), &mut async_cx).await;
+        let by_name: HashMap<String, Arc<ContextServerConfiguration>> =
+            resolved.into_iter().collect();
+
+        assert!(
+            !by_name.contains_key("needs-auth"),
+            "AuthRequired HTTP MCP server should be skipped"
+        );
+        assert!(
+            !by_name.contains_key("starting-unauth"),
+            "Starting unauthenticated HTTP MCP server should be skipped"
+        );
+        assert!(
+            !by_name.contains_key("expired-oauth"),
+            "Expired OAuth HTTP MCP server should be skipped instead of forwarded without auth"
+        );
+
+        match by_name.get("runpod").map(|config| config.as_ref()) {
+            Some(ContextServerConfiguration::Http { headers, .. }) => {
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer oauth-access-token")
+                );
+            }
+            other => panic!("expected HTTP config for runpod, got {other:?}"),
+        }
+
+        match by_name.get("static-auth").map(|config| config.as_ref()) {
+            Some(ContextServerConfiguration::Http { headers, .. }) => {
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer static-secret")
+                );
+            }
+            other => panic!("expected HTTP config for static-auth, got {other:?}"),
+        }
+
+        match by_name.get("public-docs").map(|config| config.as_ref()) {
+            Some(ContextServerConfiguration::Http { headers, .. }) => {
+                assert!(headers.is_empty());
+            }
+            other => panic!("expected HTTP config for public-docs, got {other:?}"),
         }
     }
 }

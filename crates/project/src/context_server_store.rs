@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
+pub use context_server::ContextServerId;
 use context_server::client::StdinPrefix;
 use context_server::oauth::{self, McpOAuthTokenProvider, OAuthDiscovery, OAuthSession};
 use context_server::transport::HttpTransport;
-use context_server::{ContextServer, ContextServerCommand, ContextServerId};
+use context_server::{ContextServer, ContextServerCommand};
 use credentials_provider::CredentialsProvider;
 use futures::future::Either;
 use futures::{FutureExt as _, StreamExt as _, future::join_all};
@@ -65,6 +66,24 @@ pub enum ContextServerStatus {
     /// The OAuth browser flow is in progress — the user has been redirected
     /// to the authorization server and we're waiting for the callback.
     Authenticating,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextServerOAuthToken {
+    /// No OAuth token provider or stored OAuth session exists for this server.
+    NotConfigured,
+    /// A valid OAuth bearer access token ready to attach as an `Authorization` header.
+    Bearer(String),
+    /// The server uses OAuth, but its token is expired and could not be refreshed.
+    Unavailable,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestHttpServerOAuth {
+    None,
+    Valid(String),
+    Expired,
 }
 
 impl ContextServerStatus {
@@ -463,6 +482,172 @@ impl ContextServerStore {
         self.run_server(server, configuration, cx);
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn test_insert_http_server(
+        &mut self,
+        id: &str,
+        url: &str,
+        headers: HashMap<String, String>,
+        oauth: TestHttpServerOAuth,
+        status: ContextServerStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let id = ContextServerId(Arc::from(id));
+        let url = url::Url::parse(url).expect("valid test MCP HTTP URL");
+        let token_provider: Option<Arc<dyn oauth::OAuthTokenProvider>> = match oauth {
+            TestHttpServerOAuth::None => None,
+            TestHttpServerOAuth::Valid(access_token) => {
+                let session = OAuthSession {
+                    token_endpoint: url.clone(),
+                    resource: url.clone(),
+                    client_registration: oauth::OAuthClientRegistration {
+                        client_id: "test-client".to_string(),
+                        client_secret: None,
+                    },
+                    tokens: oauth::OAuthTokens {
+                        access_token,
+                        refresh_token: None,
+                        expires_at: None,
+                    },
+                };
+                Some(Arc::new(McpOAuthTokenProvider::new(
+                    session,
+                    cx.http_client(),
+                    None,
+                )))
+            }
+            TestHttpServerOAuth::Expired => {
+                let session = OAuthSession {
+                    token_endpoint: url.clone(),
+                    resource: url.clone(),
+                    client_registration: oauth::OAuthClientRegistration {
+                        client_id: "test-client".to_string(),
+                        client_secret: None,
+                    },
+                    tokens: oauth::OAuthTokens {
+                        access_token: "expired-token".to_string(),
+                        refresh_token: None,
+                        expires_at: Some(std::time::UNIX_EPOCH),
+                    },
+                };
+                Some(Arc::new(McpOAuthTokenProvider::new(
+                    session,
+                    cx.http_client(),
+                    None,
+                )))
+            }
+        };
+        let transport = HttpTransport::new_with_token_provider(
+            cx.http_client(),
+            url.to_string(),
+            headers.clone(),
+            cx.background_executor().clone(),
+            token_provider,
+        );
+        let server = Arc::new(ContextServer::new(id.clone(), Arc::new(transport)));
+        let configuration = Arc::new(ContextServerConfiguration::Http {
+            url: url.clone(),
+            headers: headers.clone(),
+            timeout: None,
+            oauth: None,
+        });
+        let discovery = || {
+            Arc::new(OAuthDiscovery {
+                resource_metadata: oauth::ProtectedResourceMetadata {
+                    resource: url.clone(),
+                    authorization_servers: vec![url.clone()],
+                    scopes_supported: None,
+                },
+                auth_server_metadata: oauth::AuthServerMetadata {
+                    issuer: url.clone(),
+                    authorization_endpoint: url.clone(),
+                    token_endpoint: url.clone(),
+                    registration_endpoint: None,
+                    scopes_supported: None,
+                    grant_types_supported: None,
+                    code_challenge_methods_supported: None,
+                    client_id_metadata_document_supported: false,
+                },
+                scopes: Vec::new(),
+            })
+        };
+        let state = match status {
+            ContextServerStatus::Starting => ContextServerState::Starting {
+                server,
+                configuration,
+                _task: Task::ready(()),
+            },
+            ContextServerStatus::Running => ContextServerState::Running {
+                server,
+                configuration,
+                _transport_watch: Task::ready(()),
+            },
+            ContextServerStatus::Stopped => ContextServerState::Stopped {
+                server,
+                configuration,
+            },
+            ContextServerStatus::Error(error) => ContextServerState::Error {
+                server,
+                configuration,
+                error,
+            },
+            ContextServerStatus::AuthRequired => ContextServerState::AuthRequired {
+                server,
+                configuration,
+                discovery: discovery(),
+            },
+            ContextServerStatus::ClientSecretRequired { error } => {
+                ContextServerState::ClientSecretRequired {
+                    server,
+                    configuration,
+                    discovery: discovery(),
+                    error,
+                }
+            }
+            ContextServerStatus::Authenticating => ContextServerState::Authenticating {
+                server,
+                configuration,
+                _task: Task::ready(()),
+            },
+        };
+        self.context_server_settings.insert(
+            id.0.clone(),
+            ContextServerSettingsEntry {
+                worktree_id: None,
+                settings: ContextServerSettings::Http {
+                    enabled: true,
+                    url: url.to_string(),
+                    headers,
+                    timeout: None,
+                    oauth: None,
+                },
+            },
+        );
+        if !self.server_ids.contains(&id) {
+            self.server_ids.push(id.clone());
+        }
+        self.servers.insert(id, state);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn test_store_oauth_session(
+        credentials_provider: &Arc<dyn CredentialsProvider>,
+        server_url: &url::Url,
+        session: &OAuthSession,
+        cx: &AsyncApp,
+    ) -> Result<()> {
+        Self::store_session(credentials_provider, server_url, session, cx).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn test_load_oauth_session(
+        credentials_provider: &Arc<dyn CredentialsProvider>,
+        server_url: &url::Url,
+        cx: &AsyncApp,
+    ) -> Result<Option<OAuthSession>> {
+        Self::load_session(credentials_provider, server_url, cx).await
+    }
+
     fn new_internal(
         maintain_server_loop: bool,
         context_server_factory: Option<ContextServerFactory>,
@@ -562,6 +747,93 @@ impl ContextServerStore {
         id: &ContextServerId,
     ) -> Option<Arc<ContextServerConfiguration>> {
         self.servers.get(id).map(|state| state.configuration())
+    }
+
+    pub fn cached_oauth_bearer_token_for_server(&self, id: &ContextServerId) -> Option<String> {
+        self.get_server(id)?.oauth_token_provider()?.access_token()
+    }
+
+    pub fn server_has_auth_challenge(&self, id: &ContextServerId) -> bool {
+        self.get_server(id)
+            .is_some_and(|server| server.auth_challenge().is_some())
+    }
+
+    pub async fn oauth_token_for_server(
+        store: Entity<Self>,
+        id: ContextServerId,
+        cx: &mut AsyncApp,
+    ) -> ContextServerOAuthToken {
+        let (live_provider, server_url) = store.read_with(cx, |store, _| {
+            let live_provider = store
+                .get_server(&id)
+                .and_then(|server| server.oauth_token_provider());
+            let server_url =
+                store
+                    .configuration_for_server(&id)
+                    .and_then(|config| match config.as_ref() {
+                        ContextServerConfiguration::Http { url, .. }
+                            if !config.has_static_auth_header() =>
+                        {
+                            Some(url.clone())
+                        }
+                        _ => None,
+                    });
+            (live_provider, server_url)
+        });
+
+        if let Some(provider) = live_provider {
+            if let Some(token) = provider.access_token() {
+                return ContextServerOAuthToken::Bearer(token);
+            }
+            return match provider.try_refresh().await {
+                Ok(true) => provider
+                    .access_token()
+                    .map(ContextServerOAuthToken::Bearer)
+                    .unwrap_or(ContextServerOAuthToken::Unavailable),
+                Ok(false) => ContextServerOAuthToken::Unavailable,
+                Err(error) => {
+                    log::warn!("{id} OAuth token refresh failed: {error}");
+                    ContextServerOAuthToken::Unavailable
+                }
+            };
+        }
+
+        let Some(server_url) = server_url else {
+            return ContextServerOAuthToken::NotConfigured;
+        };
+        let credentials_provider = cx.update(|cx| zed_credentials_provider::global(cx));
+        let session = match Self::load_session(&credentials_provider, &server_url, cx).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return ContextServerOAuthToken::NotConfigured,
+            Err(error) => {
+                log::warn!("{id} failed to load cached OAuth session: {error}");
+                return ContextServerOAuthToken::NotConfigured;
+            }
+        };
+
+        let http_client = cx.update(|cx| cx.http_client());
+        let provider = Self::create_oauth_token_provider(
+            &id,
+            &server_url,
+            session,
+            http_client,
+            credentials_provider,
+            cx,
+        );
+        if let Some(token) = provider.access_token() {
+            return ContextServerOAuthToken::Bearer(token);
+        }
+        match provider.try_refresh().await {
+            Ok(true) => provider
+                .access_token()
+                .map(ContextServerOAuthToken::Bearer)
+                .unwrap_or(ContextServerOAuthToken::Unavailable),
+            Ok(false) => ContextServerOAuthToken::Unavailable,
+            Err(error) => {
+                log::warn!("{id} cached OAuth session refresh failed: {error}");
+                ContextServerOAuthToken::Unavailable
+            }
+        }
     }
 
     /// Returns the configured settings for a server, if it is present in the user
