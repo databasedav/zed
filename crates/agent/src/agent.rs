@@ -3518,6 +3518,7 @@ pub struct ExternalSubagentSpawnResponse {
     pub status: String,
     pub model_id: String,
     pub model_name: String,
+    pub thinking_effort: Option<String>,
     pub message_start_index: usize,
     pub interrupt: bool,
     pub pending_steers: usize,
@@ -3533,6 +3534,7 @@ pub struct ExternalSubagentFinishedEvent {
     pub output: String,
     pub message_end_index: Option<usize>,
     pub model_name: String,
+    pub thinking_effort: Option<String>,
     pub canceled_by_parent_stop: bool,
 }
 
@@ -3684,16 +3686,23 @@ impl NativeAgent {
                     )));
                 }
 
-                let (model_id, model_name) = subagent_thread
-                    .read(cx)
-                    .model()
-                    .map(|model| {
-                        (
-                            LanguageModels::model_id(model).as_ref().to_string(),
-                            model.name().0.to_string(),
-                        )
-                    })
-                    .unwrap_or_default();
+                let (model_id, model_name, thinking_effort) = {
+                    let subagent = subagent_thread.read(cx);
+                    let (model_id, model_name) = subagent
+                        .model()
+                        .map(|model| {
+                            (
+                                LanguageModels::model_id(model).as_ref().to_string(),
+                                model.name().0.to_string(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    (
+                        model_id,
+                        model_name,
+                        subagent.thinking_effort_display_name(),
+                    )
+                };
 
                 let is_running = subagent_thread.read(cx).is_active_subagent_run()
                     || acp_thread.read(cx).status() != acp_thread::ThreadStatus::Idle;
@@ -3710,6 +3719,7 @@ impl NativeAgent {
                         status: "steered".to_string(),
                         model_id,
                         model_name,
+                        thinking_effort,
                         message_start_index: entry_count,
                         interrupt,
                         pending_steers,
@@ -3740,6 +3750,7 @@ impl NativeAgent {
                     tool_call_id,
                     label,
                     model_name.clone(),
+                    thinking_effort.clone(),
                     subagent_thread,
                     acp_thread,
                     message,
@@ -3751,6 +3762,7 @@ impl NativeAgent {
                     status: "running".to_string(),
                     model_id,
                     model_name,
+                    thinking_effort,
                     message_start_index,
                     interrupt: false,
                     pending_steers: 0,
@@ -3772,16 +3784,23 @@ impl NativeAgent {
                             "Session {subagent_session_id} is not a subagent of this thread"
                         );
                     }
-                    let (model_id, model_name) = subagent_thread
-                        .read(cx)
-                        .model()
-                        .map(|model| {
-                            (
-                                LanguageModels::model_id(model).as_ref().to_string(),
-                                model.name().0.to_string(),
-                            )
-                        })
-                        .unwrap_or_default();
+                    let (model_id, model_name, thinking_effort) = {
+                        let subagent = subagent_thread.read(cx);
+                        let (model_id, model_name) = subagent
+                            .model()
+                            .map(|model| {
+                                (
+                                    LanguageModels::model_id(model).as_ref().to_string(),
+                                    model.name().0.to_string(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        (
+                            model_id,
+                            model_name,
+                            subagent.thinking_effort_display_name(),
+                        )
+                    };
                     let message_start_index = acp_thread.read(cx).entries().len();
                     if parent_acp_thread
                         .read(cx)
@@ -3807,6 +3826,7 @@ impl NativeAgent {
                         tool_call_id,
                         label,
                         model_name.clone(),
+                        thinking_effort.clone(),
                         subagent_thread,
                         acp_thread,
                         message,
@@ -3818,6 +3838,7 @@ impl NativeAgent {
                         status: "running".to_string(),
                         model_id,
                         model_name,
+                        thinking_effort,
                         message_start_index,
                         interrupt: false,
                         pending_steers: 0,
@@ -3865,6 +3886,7 @@ impl NativeAgent {
         });
 
         let subagent_session_id = subagent_thread.read(cx).id().clone();
+        let thinking_effort = subagent_thread.read(cx).thinking_effort_display_name();
         let acp_thread = self.register_session(subagent_thread.clone(), project_id, cx);
         parent_acp_thread.update(cx, |parent, cx| {
             parent.register_subagent(acp_thread.clone(), cx);
@@ -3885,6 +3907,7 @@ impl NativeAgent {
             tool_call_id,
             label,
             model_name.clone(),
+            thinking_effort.clone(),
             subagent_thread,
             acp_thread,
             message,
@@ -3897,6 +3920,7 @@ impl NativeAgent {
             status: "running".to_string(),
             model_id,
             model_name,
+            thinking_effort,
             message_start_index: 0,
             interrupt: false,
             pending_steers: 0,
@@ -3911,6 +3935,7 @@ impl NativeAgent {
         tool_call_id: String,
         label: String,
         model_name: String,
+        thinking_effort: Option<String>,
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<AcpThread>,
         message: String,
@@ -3942,25 +3967,36 @@ impl NativeAgent {
                 status = status.as_str(),
             );
 
-            let (message_end_index, canceled_by_parent_stop, resolved_model_name) =
-                cx.update(|cx| {
-                    let entry_count = acp_thread.read(cx).entries().len();
-                    let end_index = entry_count.checked_sub(1);
-                    let canceled_by_parent_stop = this
-                        .update(cx, |agent, _| {
-                            agent
-                                .external_subagent_parent_stops
-                                .remove(&subagent_session_id)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    let resolved_model_name = subagent_thread
-                        .read(cx)
-                        .model()
-                        .map(|model| model.name().0.to_string())
-                        .unwrap_or(model_name);
-                    (end_index, canceled_by_parent_stop, resolved_model_name)
-                });
+            let (
+                message_end_index,
+                canceled_by_parent_stop,
+                resolved_model_name,
+                resolved_thinking_effort,
+            ) = cx.update(|cx| {
+                let entry_count = acp_thread.read(cx).entries().len();
+                let end_index = entry_count.checked_sub(1);
+                let canceled_by_parent_stop = this
+                    .update(cx, |agent, _| {
+                        agent
+                            .external_subagent_parent_stops
+                            .remove(&subagent_session_id)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let subagent = subagent_thread.read(cx);
+                let resolved_model_name = subagent
+                    .model()
+                    .map(|model| model.name().0.to_string())
+                    .unwrap_or(model_name);
+                let resolved_thinking_effort =
+                    subagent.thinking_effort_display_name().or(thinking_effort);
+                (
+                    end_index,
+                    canceled_by_parent_stop,
+                    resolved_model_name,
+                    resolved_thinking_effort,
+                )
+            });
 
             on_finished(ExternalSubagentFinishedEvent {
                 parent_session_id,
@@ -3971,6 +4007,7 @@ impl NativeAgent {
                 output,
                 message_end_index,
                 model_name: resolved_model_name,
+                thinking_effort: resolved_thinking_effort,
                 canceled_by_parent_stop,
             });
         })
@@ -4297,12 +4334,16 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                 .subagent_session_info
                 .as_ref()
                 .and_then(|info| info.model_name.clone());
-            Some((call.id.clone(), label, model_name))
+            let thinking_effort = call
+                .subagent_session_info
+                .as_ref()
+                .and_then(|info| info.thinking_effort.clone());
+            Some((call.id.clone(), label, model_name, thinking_effort))
         });
 
         let subagent_label = existing_card
             .as_ref()
-            .map(|(_, label, _)| label.clone())
+            .map(|(_, label, _, _)| label.clone())
             .or_else(|| subagent_acp_thread.read(cx).title())
             .unwrap_or_else(|| SharedString::from("Subagent"));
 
@@ -4322,10 +4363,15 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             message_end_index: None,
             model_name: existing_card
                 .as_ref()
-                .and_then(|(_, _, model_name)| model_name.clone()),
+                .and_then(|(_, _, model_name, _)| model_name.clone())
+                .or_else(|| handle.model_name(cx)),
+            thinking_effort: existing_card
+                .as_ref()
+                .and_then(|(_, _, _, thinking_effort)| thinking_effort.clone())
+                .or_else(|| handle.thinking_effort(cx)),
         };
 
-        if let Some((tool_call_id, _, _)) = &existing_card {
+        if let Some((tool_call_id, _, _, _)) = &existing_card {
             let meta = acp_v2::Meta::from_iter([(
                 acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
@@ -4378,7 +4424,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     ),
                 };
 
-                if let Some((tool_call_id, _, _)) = existing_card {
+                if let Some((tool_call_id, _, _, _)) = existing_card {
                     parent_acp_thread
                         .update(cx, |acp_thread, cx| {
                             if !acp_thread.has_tool_call(&tool_call_id) {
@@ -5049,12 +5095,18 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     agent.interrupt_session_for_follow_up(&session_id);
                 })?;
             }
+            let model_name = subagent_thread
+                .read(cx)
+                .model()
+                .map(|model| model.name().0.to_string());
+            let thinking_effort = subagent_thread.read(cx).thinking_effort_display_name();
             return Ok(crate::SubagentFollowUp::Steered {
                 session_info: acp_thread::SubagentSessionInfo {
                     session_id,
                     message_start_index: entry_count,
                     message_end_index: None,
-                    model_name: None,
+                    model_name,
+                    thinking_effort,
                 },
                 pending_steers,
             });
@@ -5420,6 +5472,17 @@ impl SubagentHandle for NativeSubagentHandle {
         self.acp_thread.read(cx).entries().len()
     }
 
+    fn model_name(&self, cx: &App) -> Option<String> {
+        self.subagent_thread
+            .read(cx)
+            .model()
+            .map(|model| model.name().0.to_string())
+    }
+
+    fn thinking_effort(&self, cx: &App) -> Option<String> {
+        self.subagent_thread.read(cx).thinking_effort_display_name()
+    }
+
     fn mark_started(&self, cx: &mut App) {
         self.subagent_thread
             .update(cx, |thread, _| thread.set_active_subagent_run(true));
@@ -5454,7 +5517,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 crate::SpawnAgentToolOutput::Success {
                     session_id: session_info.session_id.clone(),
                     output: output.clone(),
-                    session_info,
+                    session_info: Box::new(session_info),
                 },
                 acp_v2::ToolCallStatus::Completed,
                 Some(output.clone()),
@@ -5465,7 +5528,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 crate::SpawnAgentToolOutput::Error {
                     session_id: Some(session_info.session_id.clone()),
                     error: error.clone(),
-                    session_info: Some(session_info),
+                    session_info: Some(Box::new(session_info)),
                 },
                 acp_v2::ToolCallStatus::Failed,
                 Some(error.clone()),
@@ -5476,7 +5539,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 crate::SpawnAgentToolOutput::Canceled {
                     session_id: session_info.session_id.clone(),
                     canceled: true,
-                    session_info,
+                    session_info: Box::new(session_info),
                 },
                 acp_v2::ToolCallStatus::Cancelled,
                 None,
@@ -6083,6 +6146,7 @@ mod internal_tests {
         assert_eq!(spawn_resp.status, "running");
         assert_eq!(spawn_resp.model_id, "openai-subscribed/gpt-6.2-astra");
         assert_eq!(spawn_resp.model_name, "GPT-6.2 Astra");
+        assert_eq!(spawn_resp.thinking_effort.as_deref(), Some("Extra High"));
         let sub_session_id = spawn_resp.session_id.clone();
 
         // Child is registered on the external parent AcpThread with xhigh effort applied.
@@ -6121,6 +6185,7 @@ mod internal_tests {
             .await
             .unwrap();
         assert_eq!(steer_resp.status, "steered");
+        assert_eq!(steer_resp.thinking_effort.as_deref(), Some("Extra High"));
         assert_eq!(steer_resp.pending_steers, 1);
 
         // Complete first turn -> subagent immediately drains steer into turn 2.
@@ -6143,6 +6208,7 @@ mod internal_tests {
             assert_eq!(events[0].tool_call_id, "tc-1");
             assert_eq!(events[0].status, "completed");
             assert_eq!(events[0].output, "Updated findings with agent_servers");
+            assert_eq!(events[0].thinking_effort.as_deref(), Some("Extra High"));
             assert!(!events[0].canceled_by_parent_stop);
         }
 

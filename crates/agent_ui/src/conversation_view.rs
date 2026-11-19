@@ -7213,6 +7213,7 @@ pub(crate) mod tests {
                 message_start_index: 2,
                 message_end_index: Some(5),
                 model_name: None,
+                thinking_effort: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -7364,6 +7365,7 @@ pub(crate) mod tests {
                     message_start_index: 0,
                     message_end_index: end,
                     model_name: None,
+                    thinking_effort: None,
                 })
                 .expect("subagent session info should serialize"),
             )]);
@@ -18099,6 +18101,7 @@ pub(crate) mod tests {
                     message_start_index: 0,
                     message_end_index: None,
                     model_name: None,
+                    thinking_effort: None,
                 })
                 .expect("subagent session info should serialize"),
             )]));
@@ -19777,6 +19780,7 @@ pub(crate) mod tests {
                         message_start_index: 0,
                         message_end_index: None,
                         model_name: None,
+                        thinking_effort: None,
                     })
                     .expect("subagent session context"),
                 )]));
@@ -22272,6 +22276,7 @@ pub(crate) mod tests {
                 message_start_index: 0,
                 message_end_index: None,
                 model_name: Some("Gemini 3 Flash".into()),
+                thinking_effort: Some("High".into()),
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22292,6 +22297,7 @@ pub(crate) mod tests {
             };
             let card = subagent_card::SubagentCardState::from_tool_call(tool_call, cx);
             assert_eq!(card.model_name.as_deref(), Some("Gemini 3 Flash"));
+            assert_eq!(card.thinking_effort.as_deref(), Some("High"));
         });
     }
 
@@ -22317,6 +22323,7 @@ pub(crate) mod tests {
                 message_start_index: 0,
                 message_end_index: None,
                 model_name: None,
+                thinking_effort: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22419,6 +22426,7 @@ pub(crate) mod tests {
                 message_start_index: 0,
                 message_end_index: None,
                 model_name: Some("Gemini 3.1 Pro".into()),
+                thinking_effort: Some("High".into()),
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22475,6 +22483,7 @@ pub(crate) mod tests {
                 message_start_index: 0,
                 message_end_index: None,
                 model_name: Some("Claude Sonnet 4.6".into()),
+                thinking_effort: Some("Medium".into()),
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22560,6 +22569,7 @@ pub(crate) mod tests {
                 message_start_index: 0,
                 message_end_index: None,
                 model_name: None,
+                thinking_effort: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22843,6 +22853,87 @@ pub(crate) mod tests {
         assert_eq!(
             thread_view::format_compaction_metrics_label(&completed, None, None).as_deref(),
             Some("256k → 32k (-88%) · 1m 19s"),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_composer_enables_modal_editing_and_message_editor_key_context(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "alt-enter",
+                Chat,
+                Some("MessageEditor > Editor"),
+            )]);
+        });
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("subagent-modal");
+
+        let subagent_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("GPT-5.4".into()),
+                thinking_effort: Some("High".into()),
+            })
+            .expect("subagent session info should serialize"),
+        )]);
+
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-modal", "Check modal composer")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(subagent_meta);
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let card_steer = cx
+            .debug_bounds("steer-subagent-0")
+            .expect("inline subagent card should show steer button");
+        cx.simulate_click(card_steer.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        root_view.read_with(cx, |view, cx| {
+            let editor = view
+                .subagent_composer_editor(&child_session_id)
+                .expect("subagent composer should exist");
+            assert!(
+                editor.read(cx).use_modal_editing(),
+                "subagent steering composer must enable modal editing for Vim/Helix mode",
+            );
+        });
+
+        cx.simulate_input("Steer via MessageEditor keybinding");
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_subagent_message_calls(),
+            vec![(
+                root_session_id,
+                child_session_id,
+                "Steer via MessageEditor keybinding".to_string(),
+                false,
+            )],
         );
     }
 }

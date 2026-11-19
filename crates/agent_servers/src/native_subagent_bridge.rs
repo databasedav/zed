@@ -39,6 +39,7 @@ pub struct NativeSubagentSpawnResponse {
     pub status: String,
     pub model_id: String,
     pub model_name: String,
+    pub thinking_effort: Option<String>,
     pub message_start_index: usize,
     pub interrupt: bool,
     pub pending_steers: usize,
@@ -54,6 +55,7 @@ pub struct NativeSubagentFinishedEvent {
     pub output: String,
     pub message_end_index: Option<usize>,
     pub model_name: String,
+    pub thinking_effort: Option<String>,
     pub canceled_by_parent_stop: bool,
 }
 

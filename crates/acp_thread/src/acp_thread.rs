@@ -331,6 +331,9 @@ pub struct SubagentSessionInfo {
     /// Optional display name of the subagent's model reported by an ACP parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
+    /// Optional display label for the subagent's thinking / reasoning effort level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
 }
 
 /// Helper to extract subagent session id from ACP meta

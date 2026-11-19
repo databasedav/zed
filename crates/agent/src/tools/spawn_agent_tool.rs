@@ -109,19 +109,19 @@ pub enum SpawnAgentToolOutput {
     Success {
         session_id: acp_v2::SessionId,
         output: String,
-        session_info: SubagentSessionInfo,
+        session_info: Box<SubagentSessionInfo>,
     },
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         session_id: Option<acp_v2::SessionId>,
         error: String,
-        session_info: Option<SubagentSessionInfo>,
+        session_info: Option<Box<SubagentSessionInfo>>,
     },
     Canceled {
         session_id: acp_v2::SessionId,
         canceled: bool,
-        session_info: SubagentSessionInfo,
+        session_info: Box<SubagentSessionInfo>,
     },
     Steered {
         session_id: acp_v2::SessionId,
@@ -129,11 +129,11 @@ pub enum SpawnAgentToolOutput {
         interrupt: bool,
         pending_steers: usize,
         message: String,
-        session_info: SubagentSessionInfo,
+        session_info: Box<SubagentSessionInfo>,
     },
     Running {
         session_id: acp_v2::SessionId,
-        session_info: SubagentSessionInfo,
+        session_info: Box<SubagentSessionInfo>,
     },
 }
 
@@ -287,7 +287,8 @@ impl AgentTool for SpawnAgentTool {
                                     session_id: subagent.id(),
                                     message_start_index: subagent.num_entries(cx),
                                     message_end_index: None,
-                                    model_name: None,
+                                    model_name: subagent.model_name(cx),
+                                    thinking_effort: subagent.thinking_effort(cx),
                                 };
                                 LaunchOutcome::Spawned(subagent, session_info)
                             }
@@ -308,7 +309,8 @@ impl AgentTool for SpawnAgentTool {
                                 session_id: subagent.id(),
                                 message_start_index: subagent.num_entries(cx),
                                 message_end_index: None,
-                                model_name: None,
+                                model_name: subagent.model_name(cx),
+                                thinking_effort: subagent.thinking_effort(cx),
                             };
                             LaunchOutcome::Spawned(subagent, session_info)
                         }),
@@ -344,7 +346,7 @@ impl AgentTool for SpawnAgentTool {
                         interrupt,
                         pending_steers,
                         message,
-                        session_info,
+                        session_info: Box::new(session_info),
                     });
                 }
                 LaunchOutcome::Spawned(subagent, session_info) => {
@@ -392,7 +394,7 @@ impl AgentTool for SpawnAgentTool {
 
             Ok(SpawnAgentToolOutput::Running {
                 session_id: session_info.session_id.clone(),
-                session_info,
+                session_info: Box::new(session_info),
             })
         })
     }

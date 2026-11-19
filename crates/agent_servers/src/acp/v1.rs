@@ -194,6 +194,8 @@ struct ZedSpawnNativeSubagentResponse {
     status: String,
     model_id: String,
     model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_effort: Option<String>,
     message_start_index: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     interrupt: bool,
@@ -314,6 +316,8 @@ struct ZedNativeSubagentFinishedNotification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_end_index: Option<usize>,
     model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_effort: Option<String>,
     #[serde(default)]
     canceled_by_parent_stop: bool,
 }
@@ -10880,6 +10884,7 @@ exit 7
             output: "Done".to_string(),
             message_end_index: Some(3),
             model_name: "GPT-6.2 Astra".to_string(),
+            thinking_effort: Some("High".to_string()),
             canceled_by_parent_stop: false,
         };
         assert_eq!(finished_notif.method(), "_zed/native_subagent_finished");
@@ -10894,6 +10899,7 @@ exit 7
                 "output": "Done",
                 "messageEndIndex": 3,
                 "modelName": "GPT-6.2 Astra",
+                "thinkingEffort": "High",
                 "canceledByParentStop": false,
             })
         );
@@ -11322,6 +11328,7 @@ exit 7
                         output: "Native answer".to_string(),
                         message_end_index: Some(2),
                         model_name: "GPT-6.2 Astra".to_string(),
+                        thinking_effort: Some("High".to_string()),
                         canceled_by_parent_stop: false,
                     });
                 })
@@ -11331,6 +11338,7 @@ exit 7
                     status: "running".to_string(),
                     model_id: "openai-subscribed/gpt-6.2-astra".to_string(),
                     model_name: "GPT-6.2 Astra".to_string(),
+                    thinking_effort: Some("High".to_string()),
                     message_start_index: 0,
                     interrupt: false,
                     pending_steers: 0,
@@ -12132,6 +12140,7 @@ fn handle_zed_spawn_native_subagent(
                 output: event.output,
                 message_end_index: event.message_end_index,
                 model_name: event.model_name,
+                thinking_effort: event.thinking_effort,
                 canceled_by_parent_stop: event.canceled_by_parent_stop,
             };
             connection.send_notification(notification).log_err();
@@ -12151,6 +12160,7 @@ fn handle_zed_spawn_native_subagent(
                 status: response.status,
                 model_id: response.model_id,
                 model_name: response.model_name,
+                thinking_effort: response.thinking_effort,
                 message_start_index: response.message_start_index,
                 interrupt: response.interrupt,
                 pending_steers: response.pending_steers,

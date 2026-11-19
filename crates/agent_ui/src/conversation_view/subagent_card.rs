@@ -186,6 +186,7 @@ pub(crate) struct SubagentCardState {
     /// wins over the subagent's title for itself.
     pub label_wins: bool,
     pub model_name: Option<SharedString>,
+    pub thinking_effort: Option<SharedString>,
     pub status: SubagentStatus,
     pub error: Option<SharedString>,
     pub can_stop: bool,
@@ -215,6 +216,12 @@ impl SubagentCardState {
                 .and_then(|info| info.model_name.as_deref())
                 .filter(|name| !name.is_empty())
                 .map(|name| name.to_string().into()),
+            thinking_effort: tool_call
+                .subagent_session_info
+                .as_ref()
+                .and_then(|info| info.thinking_effort.as_deref())
+                .filter(|effort| !effort.is_empty())
+                .map(|effort| effort.to_string().into()),
             status,
             error: tool_call_error(tool_call, cx),
             can_stop: status == SubagentStatus::Running,
@@ -277,6 +284,7 @@ impl SubagentCardState {
             label: Some(subagent_label(thread)),
             label_wins: true,
             model_name: None,
+            thinking_effort: None,
             status,
             error,
             can_stop: status == SubagentStatus::Running && can_cancel,
@@ -349,6 +357,59 @@ fn tool_call_error(tool_call: &ToolCall, cx: &App) -> Option<SharedString> {
     })
 }
 
+fn normalized_effort_token(value: &str) -> String {
+    let compact: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    match compact.as_str() {
+        "extrahigh" | "xhigh" | "veryhigh" => "xhigh".to_string(),
+        "extralow" | "xlow" => "xlow".to_string(),
+        _ => compact,
+    }
+}
+
+fn model_name_contains_effort_suffix(model_name: &str, thinking_effort: &str) -> bool {
+    let target = normalized_effort_token(thinking_effort);
+    if target.is_empty() {
+        return false;
+    }
+    let trimmed = model_name.trim_end();
+    if let Some(without_close) = trimmed.strip_suffix(')')
+        && let Some((_, inside)) = without_close.rsplit_once('(')
+        && normalized_effort_token(inside) == target
+    {
+        return true;
+    }
+    if let Some((_, last_word)) = trimmed.rsplit_once(char::is_whitespace)
+        && normalized_effort_token(last_word) == target
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn format_subagent_model_badge(
+    model_name: Option<&str>,
+    thinking_effort: Option<&str>,
+) -> Option<SharedString> {
+    let model = model_name.map(str::trim).filter(|name| !name.is_empty());
+    let effort = thinking_effort
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty());
+
+    match (model, effort) {
+        (Some(model), Some(effort)) if model_name_contains_effort_suffix(model, effort) => {
+            Some(format!("· {model}").into())
+        }
+        (Some(model), Some(effort)) => Some(format!("· {model} · {effort}").into()),
+        (Some(model), None) => Some(format!("· {model}").into()),
+        (None, Some(effort)) => Some(format!("· {effort}").into()),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +423,51 @@ mod tests {
             label: label.map(|label| label.to_string().into()),
             label_wins: false,
             model_name: None,
+            thinking_effort: None,
             status,
             error: None,
             can_stop: false,
             entries,
         }
+    }
+
+    #[test]
+    fn format_subagent_model_badge_formats_and_deduplicates_effort() {
+        assert_eq!(
+            format_subagent_model_badge(Some("GPT-5.4"), Some("High")).as_deref(),
+            Some("· GPT-5.4 · High"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("GPT-5.4"), Some("Extra High")).as_deref(),
+            Some("· GPT-5.4 · Extra High"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("Gemini 3.1 Pro (High)"), Some("High")).as_deref(),
+            Some("· Gemini 3.1 Pro (High)"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("GPT-5.4 (xhigh)"), Some("Extra High")).as_deref(),
+            Some("· GPT-5.4 (xhigh)"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("Thinking"))
+                .as_deref(),
+            Some("· Claude Opus 4.6 (Thinking)"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("High"))
+                .as_deref(),
+            Some("· Claude Opus 4.6 (Thinking) · High"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("Claude Sonnet 4.6"), None).as_deref(),
+            Some("· Claude Sonnet 4.6"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(None, Some("High")).as_deref(),
+            Some("· High"),
+        );
+        assert_eq!(format_subagent_model_badge(None, None), None);
     }
 
     #[test]

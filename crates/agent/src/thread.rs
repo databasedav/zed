@@ -900,6 +900,14 @@ pub trait SubagentHandle {
     /// The current number of entries in the thread.
     /// Useful for knowing where the next turn will begin
     fn num_entries(&self, cx: &App) -> usize;
+    /// Optional display name of the subagent's active model.
+    fn model_name(&self, _cx: &App) -> Option<String> {
+        None
+    }
+    /// Optional display label for the subagent's active thinking / effort level.
+    fn thinking_effort(&self, _cx: &App) -> Option<String> {
+        None
+    }
     /// Marks that a background subagent run is starting on this handle.
     fn mark_started(&self, _cx: &mut App) {}
     /// Runs a turn for a given message and returns its final outcome.
@@ -2427,6 +2435,38 @@ impl Thread {
 
     pub fn thinking_effort(&self) -> Option<&String> {
         self.thinking_effort.as_ref()
+    }
+
+    pub fn thinking_effort_display_name(&self) -> Option<String> {
+        let model = self.model()?;
+        if !model.supports_thinking() {
+            return None;
+        }
+        let effort_levels = model.supported_effort_levels();
+        let selected_effort = self.thinking_effort.as_deref();
+        let supports_disabling_thinking =
+            model.supports_disabling_thinking_at_effort(selected_effort);
+        let thinking = self.thinking_enabled || !supports_disabling_thinking;
+        if !thinking {
+            return None;
+        }
+        if effort_levels.is_empty() {
+            return Some("Thinking".to_string());
+        }
+        selected_effort
+            .and_then(|effort| {
+                effort_levels
+                    .iter()
+                    .find(|level| level.value.eq_ignore_ascii_case(effort))
+                    .map(|level| level.name.to_string())
+            })
+            .or_else(|| {
+                effort_levels
+                    .iter()
+                    .find(|level| level.is_default)
+                    .map(|level| level.name.to_string())
+            })
+            .or_else(|| selected_effort.map(str::to_string))
     }
 
     pub fn set_thinking_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {

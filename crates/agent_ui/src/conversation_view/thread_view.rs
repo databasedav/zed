@@ -62,6 +62,7 @@ use super::elicitation::{
 };
 use super::subagent_card::{
     AcpSubagentCard, SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card,
+    format_subagent_model_badge,
 };
 use super::*;
 
@@ -886,6 +887,7 @@ struct RunningSubagentItem {
     entry_index: usize,
     title: SharedString,
     model_name: Option<SharedString>,
+    thinking_effort: Option<SharedString>,
     can_stop: bool,
     can_message: bool,
     subagent_thread: Option<Entity<AcpThread>>,
@@ -5112,6 +5114,10 @@ impl ThreadView {
                         .as_ref()
                         .and_then(|view| view.read(cx).subagent_model_name(cx))
                         .or_else(|| state.model_name.clone());
+                    let thinking_effort = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
+                        .or_else(|| state.thinking_effort.clone());
                     let can_message = thread.supports_subagent_messaging(&session_id, cx);
                     by_session.insert(
                         session_id.clone(),
@@ -5120,6 +5126,7 @@ impl ThreadView {
                             entry_index,
                             title,
                             model_name,
+                            thinking_effort,
                             can_stop: state.can_stop,
                             can_message,
                             subagent_thread,
@@ -5146,6 +5153,10 @@ impl ThreadView {
                         .as_ref()
                         .and_then(|view| view.read(cx).subagent_model_name(cx))
                         .or_else(|| state.model_name.clone());
+                    let thinking_effort = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
+                        .or_else(|| state.thinking_effort.clone());
                     let can_message = thread.supports_subagent_messaging(&session_id, cx);
                     by_session.insert(
                         session_id.clone(),
@@ -5154,6 +5165,7 @@ impl ThreadView {
                             entry_index,
                             title,
                             model_name,
+                            thinking_effort,
                             can_stop: state.can_stop,
                             can_message,
                             subagent_thread: Some(card.subagent.clone()),
@@ -5238,8 +5250,13 @@ impl ThreadView {
                 window,
                 cx,
             );
-            editor.register_addon(crate::message_editor::MessageEditorAddon::new());
             editor.set_placeholder_text(placeholder, window, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_soft_wrap();
+            editor.disable_mouse_wheel_zoom();
+            editor.set_use_modal_editing(true);
+            editor.register_addon(crate::message_editor::MessageEditorAddon::new());
             editor
         });
         let subscription = cx.observe(&editor, |_, _, cx| cx.notify());
@@ -5253,6 +5270,16 @@ impl ThreadView {
             },
         );
         editor
+    }
+
+    #[cfg(test)]
+    pub(super) fn subagent_composer_editor(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+    ) -> Option<Entity<Editor>> {
+        self.subagent_composers
+            .get(subagent_session_id)
+            .map(|composer| composer.editor.clone())
     }
 
     fn toggle_subagent_composer(
@@ -5462,6 +5489,7 @@ impl ThreadView {
         Some(
             h_flex()
                 .id(SharedString::from(selector_id.clone()))
+                .key_context("MessageEditor")
                 .debug_selector(move || selector_id)
                 .w_full()
                 .min_w_0()
@@ -5897,14 +5925,20 @@ impl ThreadView {
                                             .size(LabelSize::Small)
                                             .truncate(),
                                     )
-                                    .when_some(item.model_name.clone(), |row, model_name| {
-                                        row.child(
-                                            Label::new(format!("· {model_name}"))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                                .truncate(),
-                                        )
-                                    })
+                                    .when_some(
+                                        format_subagent_model_badge(
+                                            item.model_name.as_deref(),
+                                            item.thinking_effort.as_deref(),
+                                        ),
+                                        |row, model_badge| {
+                                            row.child(
+                                                Label::new(model_badge)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted)
+                                                    .truncate(),
+                                            )
+                                        },
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.list_state.scroll_to(ListOffset {
                                             item_ix: entry_index,
@@ -15393,6 +15427,11 @@ impl ThreadView {
         let model_name = thread_view
             .and_then(|view| view.read(cx).subagent_model_name(cx))
             .or_else(|| state.model_name.clone());
+        let thinking_effort = thread_view
+            .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
+            .or_else(|| state.thinking_effort.clone());
+        let model_badge =
+            format_subagent_model_badge(model_name.as_deref(), thinking_effort.as_deref());
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -15504,9 +15543,9 @@ impl ThreadView {
                                                     .flex_1()
                                                     .truncate(),
                                             )
-                                            .when_some(model_name, |this, model_name| {
+                                            .when_some(model_badge, |this, model_badge| {
                                                 this.child(
-                                                    Label::new(format!("· {model_name}"))
+                                                    Label::new(model_badge)
                                                         .size(LabelSize::Custom(
                                                             self.tool_name_font_size(),
                                                         ))
@@ -16295,6 +16334,23 @@ impl ThreadView {
                 self.config_options_view.as_ref().and_then(|view| {
                     view.read(cx)
                         .selected_category_value_name(acp_v2::SessionConfigOptionCategory::Model)
+                })
+            })
+    }
+
+    pub(crate) fn subagent_thinking_effort(&self, cx: &App) -> Option<SharedString> {
+        self.as_native_thread(cx)
+            .and_then(|thread| {
+                thread
+                    .read(cx)
+                    .thinking_effort_display_name()
+                    .map(SharedString::from)
+            })
+            .or_else(|| {
+                self.config_options_view.as_ref().and_then(|view| {
+                    view.read(cx).selected_category_value_name(
+                        acp_v2::SessionConfigOptionCategory::ThoughtLevel,
+                    )
                 })
             })
     }

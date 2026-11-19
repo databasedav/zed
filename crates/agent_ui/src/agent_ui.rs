@@ -898,6 +898,7 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                         output: event.output,
                         message_end_index: event.message_end_index,
                         model_name: event.model_name,
+                        thinking_effort: event.thinking_effort,
                         canceled_by_parent_stop: event.canceled_by_parent_stop,
                     });
                 }),
@@ -911,6 +912,7 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                 status: response.status,
                 model_id: response.model_id,
                 model_name: response.model_name,
+                thinking_effort: response.thinking_effort,
                 message_start_index: response.message_start_index,
                 interrupt: response.interrupt,
                 pending_steers: response.pending_steers,
