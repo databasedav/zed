@@ -908,6 +908,10 @@ pub trait SubagentHandle {
     fn thinking_effort(&self, _cx: &App) -> Option<String> {
         None
     }
+    /// Optional display label for the subagent's active speed mode (e.g. `"Fast"`).
+    fn speed(&self, _cx: &App) -> Option<String> {
+        None
+    }
     /// Marks that a background subagent run is starting on this handle.
     fn mark_started(&self, _cx: &mut App) {}
     /// Runs a turn for a given message and returns its final outcome.
@@ -949,6 +953,7 @@ pub trait ThreadEnvironment {
         label: String,
         model: Option<AgentModelId>,
         effort: Option<String>,
+        speed: Option<String>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
 
@@ -1091,6 +1096,12 @@ pub struct AvailableModel {
     /// Supported thinking effort values that can be passed via `effort`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_efforts: Vec<String>,
+    /// Whether this model supports fast mode (`speed: "fast"`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_fast_mode: bool,
+    /// Default speed applied when `speed` is omitted (`"standard"` or `"fast"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_speed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2486,6 +2497,17 @@ impl Thread {
 
     pub fn speed(&self) -> Option<Speed> {
         self.speed
+    }
+
+    pub fn speed_display_name(&self) -> Option<String> {
+        let model = self.model()?;
+        if !model.supports_fast_mode() {
+            return None;
+        }
+        match self.speed {
+            Some(Speed::Fast) => Some("Fast".to_string()),
+            Some(Speed::Standard) | None => None,
+        }
     }
 
     pub fn set_speed(&mut self, speed: Speed, cx: &mut Context<Self>) {

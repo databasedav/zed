@@ -44,9 +44,10 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// ### Model selection
 /// - When the user requests a particular model or asks you to choose based on cost or capability, call `list_agents_and_models` first, then pass the exact `models[].id` from the native Zed agent entry (`is_native: true`) in `model`.
 /// - Optionally pass `effort` (e.g., `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"none"` to disable thinking) from `models[].supported_efforts` to override the model's configured default thinking effort.
+/// - Optionally pass `speed` (`"standard"` or `"fast"`) when `models[].supports_fast_mode` is `true` to override the model's configured default speed (`models[].default_speed`).
 /// - Omit `model` to use the user's configured subagent model, or the parent model when no subagent model is configured.
 /// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
-/// - A resumed session keeps its existing model and effort, so `model` and `effort` cannot be combined with `session_id`.
+/// - A resumed session keeps its existing model, effort, and speed, so `model`, `effort`, and `speed` cannot be combined with `session_id`.
 ///
 /// ### Output
 /// - Launching or resuming an idle sub-agent returns `session_id` and `status: "running"` immediately.
@@ -75,6 +76,12 @@ pub struct SpawnAgentToolInput {
     /// `session_id` is provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Optional speed override for a newly spawned subagent (`"standard"` or `"fast"`).
+    /// Check `models[].supports_fast_mode` and `models[].default_speed` from
+    /// `list_agents_and_models`. Omit to use the model's configured default speed.
+    /// Must be omitted when `session_id` is provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     /// Only used when `session_id` refers to a currently running sub-agent:
     /// - `false` (default): steer cleanly at the sub-agent's next tool-call/reasoning boundary.
     /// - `true`: immediately interrupt the sub-agent's current turn/tool call and pivot to `message`.
@@ -252,9 +259,13 @@ impl AgentTool for SpawnAgentTool {
                 session_id,
                 model,
                 effort,
+                speed,
                 interrupt,
             } = input;
             let effort = effort
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let speed = speed
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
             let subagent_label: SharedString = label.clone().into();
@@ -270,14 +281,17 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let launch_outcome = cx.update(|cx| {
-                let outcome = match (session_id, model, effort) {
-                    (Some(_), Some(_), _) => Err(anyhow::anyhow!(
+                let outcome = match (session_id, model, effort, speed) {
+                    (Some(_), Some(_), _, _) => Err(anyhow::anyhow!(
                         "model cannot be changed when resuming a subagent session"
                     )),
-                    (Some(_), None, Some(_)) => Err(anyhow::anyhow!(
+                    (Some(_), None, Some(_), _) => Err(anyhow::anyhow!(
                         "effort cannot be changed when resuming a subagent session"
                     )),
-                    (Some(session_id), None, None) => self
+                    (Some(_), None, None, Some(_)) => Err(anyhow::anyhow!(
+                        "speed cannot be changed when resuming a subagent session"
+                    )),
+                    (Some(session_id), None, None, None) => self
                         .environment
                         .follow_up_subagent(session_id, message.clone(), interrupt, cx)
                         .map(|follow_up| match follow_up {
@@ -289,6 +303,7 @@ impl AgentTool for SpawnAgentTool {
                                     message_end_index: None,
                                     model_name: subagent.model_name(cx),
                                     thinking_effort: subagent.thinking_effort(cx),
+                                    speed: subagent.speed(cx),
                                 };
                                 LaunchOutcome::Spawned(subagent, session_info)
                             }
@@ -300,9 +315,9 @@ impl AgentTool for SpawnAgentTool {
                                 pending_steers,
                             },
                         }),
-                    (None, model, effort) => self
+                    (None, model, effort, speed) => self
                         .environment
-                        .create_subagent(label, model.map(AgentModelId::from), effort, cx)
+                        .create_subagent(label, model.map(AgentModelId::from), effort, speed, cx)
                         .map(|subagent| {
                             subagent.mark_started(cx);
                             let session_info = SubagentSessionInfo {
@@ -311,6 +326,7 @@ impl AgentTool for SpawnAgentTool {
                                 message_end_index: None,
                                 model_name: subagent.model_name(cx),
                                 thinking_effort: subagent.thinking_effort(cx),
+                                speed: subagent.speed(cx),
                             };
                             LaunchOutcome::Spawned(subagent, session_info)
                         }),

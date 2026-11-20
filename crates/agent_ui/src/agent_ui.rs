@@ -865,6 +865,8 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                 supports_thinking: model.supports_thinking,
                 default_effort: model.default_effort,
                 supported_efforts: model.supported_efforts,
+                supports_fast_mode: model.supports_fast_mode,
+                default_speed: model.default_speed,
             })
             .collect()
     }
@@ -887,6 +889,7 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                 session_id: request.session_id,
                 model: request.model,
                 effort: request.effort,
+                speed: request.speed,
                 interrupt: request.interrupt,
                 on_finished: Box::new(move |event| {
                     on_finished(agent_servers::NativeSubagentFinishedEvent {
@@ -899,6 +902,7 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                         message_end_index: event.message_end_index,
                         model_name: event.model_name,
                         thinking_effort: event.thinking_effort,
+                        speed: event.speed,
                         canceled_by_parent_stop: event.canceled_by_parent_stop,
                     });
                 }),
@@ -913,6 +917,7 @@ impl agent_servers::NativeSubagentBridge for AgentUiNativeSubagentBridge {
                 model_id: response.model_id,
                 model_name: response.model_name,
                 thinking_effort: response.thinking_effort,
+                speed: response.speed,
                 message_start_index: response.message_start_index,
                 interrupt: response.interrupt,
                 pending_steers: response.pending_steers,

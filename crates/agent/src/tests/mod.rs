@@ -196,6 +196,7 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
     subagent_efforts: std::cell::RefCell<Vec<Option<String>>>,
+    subagent_speeds: std::cell::RefCell<Vec<Option<String>>>,
 }
 
 impl FakeThreadEnvironment {
@@ -228,6 +229,10 @@ impl FakeThreadEnvironment {
     fn subagent_efforts(&self) -> Vec<Option<String>> {
         self.subagent_efforts.borrow().clone()
     }
+
+    fn subagent_speeds(&self) -> Vec<Option<String>> {
+        self.subagent_speeds.borrow().clone()
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
@@ -256,10 +261,12 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _label: String,
         model: Option<AgentModelId>,
         effort: Option<String>,
+        speed: Option<String>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.subagent_models.borrow_mut().push(model);
         self.subagent_efforts.borrow_mut().push(effort);
+        self.subagent_speeds.borrow_mut().push(speed);
         Ok(self
             .subagent_handle
             .clone()
@@ -305,6 +312,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         _label: String,
         _model: Option<AgentModelId>,
         _effort: Option<String>,
+        _speed: Option<String>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -6111,6 +6119,7 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
                     effort: None,
+                    speed: None,
                     interrupt: false,
                 }),
                 event_stream,
@@ -6146,6 +6155,7 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
                     effort: None,
+                    speed: None,
                     interrupt: false,
                 }),
                 event_stream,
@@ -6188,6 +6198,7 @@ async fn test_spawn_agent_tool_forwards_explicit_effort_and_rejects_on_resume(
                     session_id: None,
                     model: Some("fake-corp/thinking-model".to_string()),
                     effort: Some("xhigh".to_string()),
+                    speed: Some("fast".to_string()),
                     interrupt: false,
                 }),
                 event_stream,
@@ -6201,17 +6212,22 @@ async fn test_spawn_agent_tool_forwards_explicit_effort_and_rejects_on_resume(
         environment.subagent_efforts(),
         vec![Some("xhigh".to_string())]
     );
+    assert_eq!(
+        environment.subagent_speeds(),
+        vec![Some("fast".to_string())]
+    );
 
     let (event_stream, _rx) = ToolCallEventStream::test();
     let resume_result = cx
         .update(|cx| {
-            tool.run(
+            tool.clone().run(
                 ToolInput::resolved(SpawnAgentToolInput {
                     label: "task".to_string(),
                     message: "follow up".to_string(),
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: None,
                     effort: Some("high".to_string()),
+                    speed: None,
                     interrupt: false,
                 }),
                 event_stream,
@@ -6226,6 +6242,33 @@ async fn test_spawn_agent_tool_forwards_explicit_effort_and_rejects_on_resume(
     assert_eq!(
         error,
         "effort cannot be changed when resuming a subagent session"
+    );
+
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let resume_speed_result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "follow up".to_string(),
+                    session_id: Some(acp_v2::SessionId::new("subagent-id")),
+                    model: None,
+                    effort: None,
+                    speed: Some("standard".to_string()),
+                    interrupt: false,
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error { error, .. }) = resume_speed_result else {
+        panic!("expected speed override on resumed session to fail");
+    };
+    assert_eq!(
+        error,
+        "speed cannot be changed when resuming a subagent session"
     );
 }
 
@@ -6284,6 +6327,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6470,6 +6514,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6650,6 +6695,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6790,6 +6836,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6878,6 +6925,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         session_id: Some(subagent_session_id.clone()),
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let resume_tool_use = LanguageModelToolUse {
@@ -7965,6 +8013,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -8134,6 +8183,7 @@ async fn test_subagent_does_not_block_main_thread_or_user_follow_up(cx: &mut Tes
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8236,6 +8286,7 @@ async fn test_subagent_does_not_block_main_thread_or_user_follow_up(cx: &mut Tes
         session_id: Some(subagent_session_id.clone()),
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8391,6 +8442,7 @@ async fn test_subagent_finishing_during_active_parent_turn_delivers_in_turn(
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8499,6 +8551,7 @@ async fn test_stopping_individual_subagent_does_not_wake_idle_parent(cx: &mut Te
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8610,6 +8663,7 @@ async fn test_query_subagent_actions_diffs_and_cursor(cx: &mut TestAppContext) {
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8850,6 +8904,7 @@ async fn test_mid_run_interrupt_steering(cx: &mut TestAppContext) {
         session_id: None,
         model: None,
         effort: None,
+        speed: None,
         interrupt: false,
     };
     fake.send_event(
@@ -8890,6 +8945,7 @@ async fn test_mid_run_interrupt_steering(cx: &mut TestAppContext) {
         session_id: Some(subagent_session_id.clone()),
         model: None,
         effort: None,
+        speed: None,
         interrupt: true,
     };
     fake.send_event(
@@ -10915,7 +10971,9 @@ impl SubagentCompactionTest {
             acp_thread: acp_thread.downgrade(),
         };
         let handle = cx
-            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread("subagent".to_string(), None, None, None, cx)
+            })
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&handle.id()).unwrap().thread.clone()

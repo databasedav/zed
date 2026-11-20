@@ -7214,6 +7214,7 @@ pub(crate) mod tests {
                 message_end_index: Some(5),
                 model_name: None,
                 thinking_effort: None,
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -7366,6 +7367,7 @@ pub(crate) mod tests {
                     message_end_index: end,
                     model_name: None,
                     thinking_effort: None,
+                    speed: None,
                 })
                 .expect("subagent session info should serialize"),
             )]);
@@ -18102,6 +18104,7 @@ pub(crate) mod tests {
                     message_end_index: None,
                     model_name: None,
                     thinking_effort: None,
+                    speed: None,
                 })
                 .expect("subagent session info should serialize"),
             )]));
@@ -19781,6 +19784,7 @@ pub(crate) mod tests {
                         message_end_index: None,
                         model_name: None,
                         thinking_effort: None,
+                        speed: None,
                     })
                     .expect("subagent session context"),
                 )]));
@@ -22424,6 +22428,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: Some("Gemini 3 Flash".into()),
                 thinking_effort: Some("High".into()),
+                speed: Some("Fast".into()),
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22445,6 +22450,7 @@ pub(crate) mod tests {
             let card = subagent_card::SubagentCardState::from_tool_call(tool_call, cx);
             assert_eq!(card.model_name.as_deref(), Some("Gemini 3 Flash"));
             assert_eq!(card.thinking_effort.as_deref(), Some("High"));
+            assert_eq!(card.speed.as_deref(), Some("Fast"));
         });
     }
 
@@ -22471,6 +22477,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: None,
                 thinking_effort: None,
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22574,6 +22581,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: Some("Gemini 3.1 Pro".into()),
                 thinking_effort: Some("High".into()),
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22631,6 +22639,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: Some("Claude Sonnet 4.6".into()),
                 thinking_effort: Some("Medium".into()),
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22717,6 +22726,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: None,
                 thinking_effort: None,
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -23036,6 +23046,7 @@ pub(crate) mod tests {
                 message_end_index: None,
                 model_name: Some("GPT-5.4".into()),
                 thinking_effort: Some("High".into()),
+                speed: None,
             })
             .expect("subagent session info should serialize"),
         )]);

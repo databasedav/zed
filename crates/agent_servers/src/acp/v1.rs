@@ -183,6 +183,8 @@ struct ZedSpawnNativeSubagentRequest {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<String>,
     #[serde(default)]
     interrupt: bool,
 }
@@ -196,6 +198,8 @@ struct ZedSpawnNativeSubagentResponse {
     model_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<String>,
     message_start_index: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     interrupt: bool,
@@ -318,6 +322,8 @@ struct ZedNativeSubagentFinishedNotification {
     model_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<String>,
     #[serde(default)]
     canceled_by_parent_stop: bool,
 }
@@ -10869,6 +10875,7 @@ exit 7
             session_id: None,
             model: Some("openai-subscribed/gpt-6.2-astra".to_string()),
             effort: Some("high".to_string()),
+            speed: Some("fast".to_string()),
             interrupt: false,
         };
         assert_eq!(spawn_native_req.method(), "_zed/spawn_native_subagent");
@@ -10881,6 +10888,7 @@ exit 7
                 "message": "Read files",
                 "model": "openai-subscribed/gpt-6.2-astra",
                 "effort": "high",
+                "speed": "fast",
                 "interrupt": false,
             })
         );
@@ -10895,6 +10903,7 @@ exit 7
             message_end_index: Some(3),
             model_name: "GPT-6.2 Astra".to_string(),
             thinking_effort: Some("High".to_string()),
+            speed: Some("Fast".to_string()),
             canceled_by_parent_stop: false,
         };
         assert_eq!(finished_notif.method(), "_zed/native_subagent_finished");
@@ -10910,6 +10919,7 @@ exit 7
                 "messageEndIndex": 3,
                 "modelName": "GPT-6.2 Astra",
                 "thinkingEffort": "High",
+                "speed": "Fast",
                 "canceledByParentStop": false,
             })
         );
@@ -11292,7 +11302,9 @@ exit 7
     #[gpui::test]
     async fn test_acp_native_subagent_bridge_rpc_round_trip(cx: &mut gpui::TestAppContext) {
         struct FakeBridge {
-            seen_spawns: Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>>,
+            seen_spawns: Arc<
+                std::sync::Mutex<Vec<(String, Option<String>, Option<String>, Option<String>)>>,
+            >,
             seen_cancels: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
         }
 
@@ -11311,6 +11323,8 @@ exit 7
                         "high".to_string(),
                         "xhigh".to_string(),
                     ],
+                    supports_fast_mode: true,
+                    default_speed: Some("fast".to_string()),
                 }]
             }
 
@@ -11323,11 +11337,18 @@ exit 7
                     request.label.clone(),
                     request.model.clone(),
                     request.effort.clone(),
+                    request.speed.clone(),
                 ));
                 let parent_session_id = request.parent_acp_thread.read(cx).session_id().clone();
                 let on_finished = request.on_finished;
                 let tool_call_id = request.tool_call_id;
                 let label = request.label;
+                let resolved_speed = request
+                    .speed
+                    .as_deref()
+                    .filter(|speed| speed.eq_ignore_ascii_case("fast"))
+                    .map(|_| "Fast".to_string());
+                let finish_speed = resolved_speed.clone();
                 cx.spawn(async move |_| {
                     on_finished(crate::NativeSubagentFinishedEvent {
                         parent_session_id,
@@ -11339,6 +11360,7 @@ exit 7
                         message_end_index: Some(2),
                         model_name: "GPT-6.2 Astra".to_string(),
                         thinking_effort: Some("High".to_string()),
+                        speed: finish_speed,
                         canceled_by_parent_stop: false,
                     });
                 })
@@ -11349,6 +11371,7 @@ exit 7
                     model_id: "openai-subscribed/gpt-6.2-astra".to_string(),
                     model_name: "GPT-6.2 Astra".to_string(),
                     thinking_effort: Some("High".to_string()),
+                    speed: resolved_speed,
                     message_start_index: 0,
                     interrupt: false,
                     pending_steers: 0,
@@ -11541,6 +11564,8 @@ exit 7
         assert_eq!(list_resp.models.len(), 1);
         assert_eq!(list_resp.models[0].id, "openai-subscribed/gpt-6.2-astra");
         assert_eq!(list_resp.models[0].default_effort.as_deref(), Some("high"));
+        assert!(list_resp.models[0].supports_fast_mode);
+        assert_eq!(list_resp.models[0].default_speed.as_deref(), Some("fast"));
 
         let spawn_resp = agent_conn
             .send_request(ZedSpawnNativeSubagentRequest {
@@ -11551,6 +11576,7 @@ exit 7
                 session_id: None,
                 model: Some("openai-subscribed/gpt-6.2-astra".to_string()),
                 effort: Some("xhigh".to_string()),
+                speed: Some("fast".to_string()),
                 interrupt: false,
             })
             .block_task()
@@ -11558,6 +11584,7 @@ exit 7
             .expect("spawn native subagent");
         assert_eq!(spawn_resp.session_id.0.as_ref(), "native-sub-1");
         assert_eq!(spawn_resp.status, "running");
+        assert_eq!(spawn_resp.speed.as_deref(), Some("Fast"));
 
         cx.run_until_parked();
         {
@@ -11566,6 +11593,7 @@ exit 7
             assert_eq!(notifs[0].session_id.0.as_ref(), "native-sub-1");
             assert_eq!(notifs[0].output, "Native answer");
             assert_eq!(notifs[0].message_end_index, Some(2));
+            assert_eq!(notifs[0].speed.as_deref(), Some("Fast"));
         }
 
         let query_resp = agent_conn
@@ -11636,6 +11664,7 @@ exit 7
                 "Astra check".to_string(),
                 Some("openai-subscribed/gpt-6.2-astra".to_string()),
                 Some("xhigh".to_string()),
+                Some("fast".to_string()),
             )]
         );
         assert_eq!(
@@ -12143,6 +12172,7 @@ fn handle_zed_spawn_native_subagent(
         session_id: args.session_id.map(|id| acp_v2::SessionId::new(id.0)),
         model: args.model,
         effort: args.effort,
+        speed: args.speed,
         interrupt: args.interrupt,
         on_finished: Box::new(move |event: crate::NativeSubagentFinishedEvent| {
             let notification = ZedNativeSubagentFinishedNotification {
@@ -12155,6 +12185,7 @@ fn handle_zed_spawn_native_subagent(
                 message_end_index: event.message_end_index,
                 model_name: event.model_name,
                 thinking_effort: event.thinking_effort,
+                speed: event.speed,
                 canceled_by_parent_stop: event.canceled_by_parent_stop,
             };
             connection.send_notification(notification).log_err();
@@ -12175,6 +12206,7 @@ fn handle_zed_spawn_native_subagent(
                 model_id: response.model_id,
                 model_name: response.model_name,
                 thinking_effort: response.thinking_effort,
+                speed: response.speed,
                 message_start_index: response.message_start_index,
                 interrupt: response.interrupt,
                 pending_steers: response.pending_steers,

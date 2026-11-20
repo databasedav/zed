@@ -334,6 +334,9 @@ pub struct SubagentSessionInfo {
     /// Optional display label for the subagent's thinking / reasoning effort level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_effort: Option<String>,
+    /// Optional display label for the subagent's speed mode (e.g. `"Fast"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
 }
 
 /// Helper to extract subagent session id from ACP meta

@@ -889,6 +889,7 @@ struct RunningSubagentItem {
     title: SharedString,
     model_name: Option<SharedString>,
     thinking_effort: Option<SharedString>,
+    speed: Option<SharedString>,
     can_stop: bool,
     can_message: bool,
     subagent_thread: Option<Entity<AcpThread>>,
@@ -5139,6 +5140,10 @@ impl ThreadView {
                         .as_ref()
                         .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
                         .or_else(|| state.thinking_effort.clone());
+                    let speed = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_speed(cx))
+                        .unwrap_or_else(|| state.speed.clone());
                     let can_message = thread.supports_subagent_messaging(&session_id, cx);
                     by_session.insert(
                         session_id.clone(),
@@ -5148,6 +5153,7 @@ impl ThreadView {
                             title,
                             model_name,
                             thinking_effort,
+                            speed,
                             can_stop: state.can_stop,
                             can_message,
                             subagent_thread,
@@ -5178,6 +5184,10 @@ impl ThreadView {
                         .as_ref()
                         .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
                         .or_else(|| state.thinking_effort.clone());
+                    let speed = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).subagent_speed(cx))
+                        .unwrap_or_else(|| state.speed.clone());
                     let can_message = thread.supports_subagent_messaging(&session_id, cx);
                     by_session.insert(
                         session_id.clone(),
@@ -5187,6 +5197,7 @@ impl ThreadView {
                             title,
                             model_name,
                             thinking_effort,
+                            speed,
                             can_stop: state.can_stop,
                             can_message,
                             subagent_thread: Some(card.subagent.clone()),
@@ -5950,6 +5961,7 @@ impl ThreadView {
                                         format_subagent_model_badge(
                                             item.model_name.as_deref(),
                                             item.thinking_effort.as_deref(),
+                                            item.speed.as_deref(),
                                         ),
                                         |row, model_badge| {
                                             row.child(
@@ -15451,8 +15463,14 @@ impl ThreadView {
         let thinking_effort = thread_view
             .and_then(|view| view.read(cx).subagent_thinking_effort(cx))
             .or_else(|| state.thinking_effort.clone());
-        let model_badge =
-            format_subagent_model_badge(model_name.as_deref(), thinking_effort.as_deref());
+        let speed = thread_view
+            .and_then(|view| view.read(cx).subagent_speed(cx))
+            .unwrap_or_else(|| state.speed.clone());
+        let model_badge = format_subagent_model_badge(
+            model_name.as_deref(),
+            thinking_effort.as_deref(),
+            speed.as_deref(),
+        );
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -16374,6 +16392,11 @@ impl ThreadView {
                     )
                 })
             })
+    }
+
+    pub(crate) fn subagent_speed(&self, cx: &App) -> Option<Option<SharedString>> {
+        self.as_native_thread(cx)
+            .map(|thread| thread.read(cx).speed_display_name().map(SharedString::from))
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {

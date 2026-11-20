@@ -19,6 +19,10 @@ pub struct NativeSubagentModelInfo {
     pub default_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_efforts: Vec<String>,
+    #[serde(default)]
+    pub supports_fast_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_speed: Option<String>,
 }
 
 pub struct NativeSubagentSpawnRequest {
@@ -29,6 +33,7 @@ pub struct NativeSubagentSpawnRequest {
     pub session_id: Option<acp_v2::SessionId>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub speed: Option<String>,
     pub interrupt: bool,
     pub on_finished: Box<dyn FnOnce(NativeSubagentFinishedEvent) + 'static>,
 }
@@ -40,6 +45,7 @@ pub struct NativeSubagentSpawnResponse {
     pub model_id: String,
     pub model_name: String,
     pub thinking_effort: Option<String>,
+    pub speed: Option<String>,
     pub message_start_index: usize,
     pub interrupt: bool,
     pub pending_steers: usize,
@@ -56,6 +62,7 @@ pub struct NativeSubagentFinishedEvent {
     pub message_end_index: Option<usize>,
     pub model_name: String,
     pub thinking_effort: Option<String>,
+    pub speed: Option<String>,
     pub canceled_by_parent_stop: bool,
 }
 

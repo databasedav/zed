@@ -14,7 +14,9 @@ use crate::{AgentTool, AvailableAgents, ThreadEnvironment, ToolCallEventStream, 
 ///
 /// The result may include external agents. The `spawn_agent` tool creates a
 /// native Zed subagent, so its `model` must be an exact `models[].id` from the
-/// agent entry where `is_native` is `true`.
+/// agent entry where `is_native` is `true` (with optional `effort` from
+/// `models[].supported_efforts` and optional `speed` when
+/// `models[].supports_fast_mode` is `true`).
 ///
 /// Call this before either tool if you need to pick a specific agent or a
 /// non-default model (for example, to use a cheaper model for bulk work). If

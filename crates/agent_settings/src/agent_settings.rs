@@ -510,6 +510,42 @@ pub fn apply_explicit_effort(
     );
 }
 
+/// Validates and applies an explicit per-call `speed` override (`"standard"` or `"fast"`)
+/// to a resolved `LanguageModelSelection`. Returns an error if `"fast"` is requested for a
+/// model that does not support fast mode, or if the value is unrecognized.
+pub fn apply_explicit_speed(
+    selection: &mut LanguageModelSelection,
+    model: &LanguageModel,
+    raw_speed: &str,
+) -> anyhow::Result<()> {
+    let trimmed = raw_speed.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.eq_ignore_ascii_case("fast") {
+        if !model.supports_fast_mode() {
+            anyhow::bail!(
+                "Model {}/{} does not support fast mode.",
+                model.provider_id().0,
+                model.id().0,
+            );
+        }
+        selection.speed = Some(language_model::Speed::Fast);
+        return Ok(());
+    }
+    if trimmed.eq_ignore_ascii_case("standard") {
+        selection.speed = model
+            .supports_fast_mode()
+            .then_some(language_model::Speed::Standard);
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Unsupported speed {trimmed:?} for model {}/{}. Supported values: \"standard\", \"fast\".",
+        model.provider_id().0,
+        model.id().0,
+    );
+}
+
 pub fn language_model_to_selection(
     model: &LanguageModel,
     override_selection: Option<&LanguageModelSelection>,
@@ -2676,5 +2712,35 @@ mod tests {
         locked_model.supports_disabling_thinking = false;
         let mut locked_selection = language_model_to_selection(&locked_model, None);
         assert!(apply_explicit_effort(&mut locked_selection, &locked_model, "off").is_err());
+    }
+
+    #[test]
+    fn test_apply_explicit_speed_validation() {
+        let model = test_thinking_model("openai-subscribed", "gpt-6.2-astra");
+        let mut selection = language_model_to_selection(&model, None);
+        assert_eq!(selection.speed, None);
+
+        apply_explicit_speed(&mut selection, &model, "FAST").unwrap();
+        assert_eq!(selection.speed, Some(language_model::Speed::Fast));
+
+        apply_explicit_speed(&mut selection, &model, "standard").unwrap();
+        assert_eq!(selection.speed, Some(language_model::Speed::Standard));
+
+        let invalid = apply_explicit_speed(&mut selection, &model, "turbo")
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("Unsupported speed"));
+        assert!(invalid.contains("\"fast\""));
+
+        let mut no_fast_model = test_thinking_model("google", "gemini-pro");
+        no_fast_model.supports_fast_mode = false;
+        let mut no_fast_selection = language_model_to_selection(&no_fast_model, None);
+        let unsupported = apply_explicit_speed(&mut no_fast_selection, &no_fast_model, "fast")
+            .unwrap_err()
+            .to_string();
+        assert!(unsupported.contains("does not support fast mode"));
+
+        apply_explicit_speed(&mut no_fast_selection, &no_fast_model, "standard").unwrap();
+        assert_eq!(no_fast_selection.speed, None);
     }
 }

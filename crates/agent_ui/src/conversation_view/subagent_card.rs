@@ -187,6 +187,7 @@ pub(crate) struct SubagentCardState {
     pub label_wins: bool,
     pub model_name: Option<SharedString>,
     pub thinking_effort: Option<SharedString>,
+    pub speed: Option<SharedString>,
     pub status: SubagentStatus,
     pub error: Option<SharedString>,
     pub can_stop: bool,
@@ -222,6 +223,12 @@ impl SubagentCardState {
                 .and_then(|info| info.thinking_effort.as_deref())
                 .filter(|effort| !effort.is_empty())
                 .map(|effort| effort.to_string().into()),
+            speed: tool_call
+                .subagent_session_info
+                .as_ref()
+                .and_then(|info| info.speed.as_deref())
+                .filter(|speed| !speed.is_empty())
+                .map(|speed| speed.to_string().into()),
             status,
             error: tool_call_error(tool_call, cx),
             can_stop: status == SubagentStatus::Running,
@@ -285,6 +292,7 @@ impl SubagentCardState {
             label_wins: true,
             model_name: None,
             thinking_effort: None,
+            speed: None,
             status,
             error,
             can_stop: status == SubagentStatus::Running && can_cancel,
@@ -390,23 +398,47 @@ fn model_name_contains_effort_suffix(model_name: &str, thinking_effort: &str) ->
     false
 }
 
+fn format_speed_label(speed: Option<&str>) -> Option<&str> {
+    let trimmed = speed.map(str::trim).filter(|speed| !speed.is_empty())?;
+    if trimmed.eq_ignore_ascii_case("standard") {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("fast") {
+        return Some("Fast");
+    }
+    Some(trimmed)
+}
+
 pub(crate) fn format_subagent_model_badge(
     model_name: Option<&str>,
     thinking_effort: Option<&str>,
+    speed: Option<&str>,
 ) -> Option<SharedString> {
     let model = model_name.map(str::trim).filter(|name| !name.is_empty());
     let effort = thinking_effort
         .map(str::trim)
         .filter(|effort| !effort.is_empty());
+    let speed = format_speed_label(speed);
 
-    match (model, effort) {
-        (Some(model), Some(effort)) if model_name_contains_effort_suffix(model, effort) => {
-            Some(format!("· {model}").into())
+    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    if let Some(model) = model {
+        parts.push(model);
+        if let Some(effort) = effort
+            && !model_name_contains_effort_suffix(model, effort)
+        {
+            parts.push(effort);
         }
-        (Some(model), Some(effort)) => Some(format!("· {model} · {effort}").into()),
-        (Some(model), None) => Some(format!("· {model}").into()),
-        (None, Some(effort)) => Some(format!("· {effort}").into()),
-        (None, None) => None,
+    } else if let Some(effort) = effort {
+        parts.push(effort);
+    }
+    if let Some(speed) = speed {
+        parts.push(speed);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("· {}", parts.join(" · ")).into())
     }
 }
 
@@ -424,6 +456,7 @@ mod tests {
             label_wins: false,
             model_name: None,
             thinking_effort: None,
+            speed: None,
             status,
             error: None,
             can_stop: false,
@@ -434,40 +467,61 @@ mod tests {
     #[test]
     fn format_subagent_model_badge_formats_and_deduplicates_effort() {
         assert_eq!(
-            format_subagent_model_badge(Some("GPT-5.4"), Some("High")).as_deref(),
+            format_subagent_model_badge(Some("GPT-5.4"), Some("High"), None).as_deref(),
             Some("· GPT-5.4 · High"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("GPT-5.4"), Some("Extra High")).as_deref(),
+            format_subagent_model_badge(Some("GPT-5.4"), Some("Extra High"), Some("Fast"))
+                .as_deref(),
+            Some("· GPT-5.4 · Extra High · Fast"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("GPT-5.4"), Some("Extra High"), Some("fast"))
+                .as_deref(),
+            Some("· GPT-5.4 · Extra High · Fast"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("GPT-5.4"), Some("Extra High"), Some("standard"))
+                .as_deref(),
             Some("· GPT-5.4 · Extra High"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("Gemini 3.1 Pro (High)"), Some("High")).as_deref(),
+            format_subagent_model_badge(Some("GPT-5.4"), None, Some("Fast")).as_deref(),
+            Some("· GPT-5.4 · Fast"),
+        );
+        assert_eq!(
+            format_subagent_model_badge(Some("Gemini 3.1 Pro (High)"), Some("High"), None)
+                .as_deref(),
             Some("· Gemini 3.1 Pro (High)"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("GPT-5.4 (xhigh)"), Some("Extra High")).as_deref(),
-            Some("· GPT-5.4 (xhigh)"),
+            format_subagent_model_badge(Some("GPT-5.4 (xhigh)"), Some("Extra High"), Some("Fast"))
+                .as_deref(),
+            Some("· GPT-5.4 (xhigh) · Fast"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("Thinking"))
+            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("Thinking"), None)
                 .as_deref(),
             Some("· Claude Opus 4.6 (Thinking)"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("High"))
+            format_subagent_model_badge(Some("Claude Opus 4.6 (Thinking)"), Some("High"), None)
                 .as_deref(),
             Some("· Claude Opus 4.6 (Thinking) · High"),
         );
         assert_eq!(
-            format_subagent_model_badge(Some("Claude Sonnet 4.6"), None).as_deref(),
+            format_subagent_model_badge(Some("Claude Sonnet 4.6"), None, None).as_deref(),
             Some("· Claude Sonnet 4.6"),
         );
         assert_eq!(
-            format_subagent_model_badge(None, Some("High")).as_deref(),
+            format_subagent_model_badge(None, Some("High"), None).as_deref(),
             Some("· High"),
         );
-        assert_eq!(format_subagent_model_badge(None, None), None);
+        assert_eq!(
+            format_subagent_model_badge(None, None, Some("Fast")).as_deref(),
+            Some("· Fast"),
+        );
+        assert_eq!(format_subagent_model_badge(None, None, None), None);
     }
 
     #[test]
