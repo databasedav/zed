@@ -92,6 +92,10 @@ pub struct DbThread {
     pub sandbox_grants: DbSandboxGrants,
     #[serde(default)]
     pub action_log: action_log::SerializedActionLog,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_subagent_results: Vec<crate::SubagentResultMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_canceled_subagent_results: Vec<crate::SubagentResultMessage>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -176,6 +180,8 @@ impl SharedThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             action_log: action_log::SerializedActionLog::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         }
     }
 
@@ -221,6 +227,8 @@ impl DbThread {
         // Sandbox grants were approved "for the rest of this thread" only;
         // the fork is a new thread and must re-prompt.
         self.sandbox_grants = DbSandboxGrants::default();
+        self.pending_subagent_results.clear();
+        self.pending_canceled_subagent_results.clear();
         self
     }
 
@@ -388,6 +396,8 @@ impl DbThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             action_log: action_log::SerializedActionLog::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         })
     }
 }
@@ -1013,6 +1023,8 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             action_log: action_log::SerializedActionLog::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         }
     }
 

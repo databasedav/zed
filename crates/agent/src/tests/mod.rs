@@ -9030,6 +9030,441 @@ async fn test_mid_run_interrupt_steering(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_ui_receipt_send_wakes_idle_parent_across_multiple_subagents(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+    cx.run_until_parked();
+
+    // Submit through the UI receipt path (`AcpThread::send`), which discards the
+    // `NativeCompletion` observer without polling it.
+    acp_thread
+        .update(cx, |thread, cx| {
+            thread.send(vec!["Start two workers".into()], cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let initial_parent_request = fake.pending_completions_for(&model).pop().unwrap();
+    for (tool_id, label, message) in [
+        ("spawn_worker_1", "worker one", "first background task"),
+        ("spawn_worker_2", "worker two", "second background task"),
+    ] {
+        let spawn_input = SpawnAgentToolInput {
+            label: label.to_string(),
+            message: message.to_string(),
+            session_id: None,
+            model: None,
+            effort: None,
+            speed: None,
+            interrupt: false,
+        };
+        fake.send_event(
+            &model,
+            &initial_parent_request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: tool_id.into(),
+                name: SpawnAgentTool::NAME.into(),
+                raw_input: serde_json::to_string(&spawn_input).unwrap(),
+                input: language_model::LanguageModelToolUseInput::Json(
+                    serde_json::to_value(&spawn_input).unwrap(),
+                ),
+                is_input_complete: true,
+                thought_signature: None,
+            }),
+        );
+    }
+    fake.end_stream(&model, &initial_parent_request);
+    cx.run_until_parked();
+
+    let subagent_ids = thread.read_with(cx, |thread, cx| thread.running_subagent_ids(cx));
+    assert_eq!(subagent_ids.len(), 2);
+    let first_subagent_id = subagent_ids[0].clone();
+    let second_subagent_id = subagent_ids[1].clone();
+
+    let pending = fake.pending_completions_for(&model);
+    let parent_turn_1_request = pending
+        .iter()
+        .find(|request| request.thread_id.as_deref() == Some(session_id.0.as_ref()))
+        .unwrap()
+        .clone();
+    let first_subagent_request = pending
+        .iter()
+        .find(|request| request.thread_id.as_deref() == Some(first_subagent_id.0.as_ref()))
+        .unwrap()
+        .clone();
+    let second_subagent_request = pending
+        .iter()
+        .find(|request| request.thread_id.as_deref() == Some(second_subagent_id.0.as_ref()))
+        .unwrap()
+        .clone();
+
+    fake.send_text(&model, &parent_turn_1_request, "Waiting for both workers.");
+    fake.end_stream(&model, &parent_turn_1_request);
+    cx.run_until_parked();
+
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+
+    // First background subagent finishes while parent is idle -> must auto-wake parent.
+    fake.send_text(&model, &first_subagent_request, "worker one findings");
+    fake.end_stream(&model, &first_subagent_request);
+    cx.run_until_parked();
+
+    let first_wakeup_request = fake
+        .pending_completions_for(&model)
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(session_id.0.as_ref())
+                && !fake.is_stream_closed(&model, request)
+        })
+        .expect("idle parent must wake up when first background subagent completes");
+    assert!(
+        first_wakeup_request
+            .messages
+            .last()
+            .unwrap()
+            .string_contents()
+            .contains("worker one findings")
+    );
+    fake.send_text(&model, &first_wakeup_request, "Processed worker one.");
+    fake.end_stream(&model, &first_wakeup_request);
+    cx.run_until_parked();
+
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+
+    // Second background subagent finishes after the first continuation -> must auto-wake again.
+    fake.send_text(&model, &second_subagent_request, "worker two findings");
+    fake.end_stream(&model, &second_subagent_request);
+    cx.run_until_parked();
+
+    let second_wakeup_request = fake
+        .pending_completions_for(&model)
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(session_id.0.as_ref())
+                && !fake.is_stream_closed(&model, request)
+        })
+        .expect("idle parent must wake up again when second background subagent completes");
+    assert!(
+        second_wakeup_request
+            .messages
+            .last()
+            .unwrap()
+            .string_contents()
+            .contains("worker two findings")
+    );
+    fake.send_text(&model, &second_wakeup_request, "Processed worker two.");
+    fake.end_stream(&model, &second_wakeup_request);
+    cx.run_until_parked();
+
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+
+    // Subsequent UI follow-up must proceed cleanly without stalling on finished executions.
+    acp_thread
+        .update(cx, |thread, cx| {
+            thread.send(vec!["Summarize both".into()], cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let follow_up_request = fake
+        .pending_completions_for(&model)
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(session_id.0.as_ref())
+                && !fake.is_stream_closed(&model, request)
+        })
+        .expect("follow-up user prompt should start a completion");
+    fake.send_text(&model, &follow_up_request, "Combined summary.");
+    fake.end_stream(&model, &follow_up_request);
+    cx.run_until_parked();
+
+    let final_markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(final_markdown.contains("Processed worker one."));
+    assert!(final_markdown.contains("Processed worker two."));
+    assert!(final_markdown.contains("Combined summary."));
+}
+
+#[gpui::test]
+async fn test_retry_after_failed_subagent_continuation_resumes_turn(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+    cx.run_until_parked();
+
+    acp_thread
+        .update(cx, |thread, cx| thread.send(vec!["Run worker".into()], cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let initial_request = fake.pending_completions_for(&model).pop().unwrap();
+    let spawn_input = SpawnAgentToolInput {
+        label: "retry worker".to_string(),
+        message: "collect report".to_string(),
+        session_id: None,
+        model: None,
+        effort: None,
+        speed: None,
+        interrupt: false,
+    };
+    fake.send_event(
+        &model,
+        &initial_request,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "spawn_retry_worker".into(),
+            name: SpawnAgentTool::NAME.into(),
+            raw_input: serde_json::to_string(&spawn_input).unwrap(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&spawn_input).unwrap(),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_stream(&model, &initial_request);
+    cx.run_until_parked();
+
+    let subagent_id = thread.read_with(cx, |thread, cx| thread.running_subagent_ids(cx)[0].clone());
+    let pending = fake.pending_completions_for(&model);
+    let parent_turn_1 = pending
+        .iter()
+        .find(|request| request.thread_id.as_deref() == Some(session_id.0.as_ref()))
+        .unwrap()
+        .clone();
+    let subagent_request = pending
+        .iter()
+        .find(|request| request.thread_id.as_deref() == Some(subagent_id.0.as_ref()))
+        .unwrap()
+        .clone();
+
+    fake.send_text(&model, &parent_turn_1, "Delegated.");
+    fake.end_stream(&model, &parent_turn_1);
+    cx.run_until_parked();
+
+    fake.send_text(&model, &subagent_request, "worker finished report");
+    fake.end_stream(&model, &subagent_request);
+    cx.run_until_parked();
+
+    let failed_wakeup_request = fake
+        .pending_completions_for(&model)
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(session_id.0.as_ref())
+                && !fake.is_stream_closed(&model, request)
+        })
+        .expect("subagent completion should wake parent");
+    fake.send_error(
+        &model,
+        &failed_wakeup_request,
+        LanguageModelCompletionError::from_http_status(
+            LanguageModelProviderName::new("test"),
+            http_client::StatusCode::BAD_REQUEST,
+            "temporary provider failure".to_string(),
+            None,
+        ),
+    );
+    fake.end_stream(&model, &failed_wakeup_request);
+    cx.run_until_parked();
+
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+
+    acp_thread
+        .update(cx, |thread, cx| thread.retry(cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let retried_request = fake
+        .pending_completions_for(&model)
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(session_id.0.as_ref())
+                && !fake.is_stream_closed(&model, request)
+        })
+        .expect("retrying a failed subagent continuation must resume the model turn");
+    assert!(
+        retried_request
+            .messages
+            .iter()
+            .any(|message| message.string_contents().contains("worker finished report"))
+    );
+    fake.send_text(&model, &retried_request, "Recovered after retry.");
+    fake.end_stream(&model, &retried_request);
+    cx.run_until_parked();
+
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+    let final_markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(final_markdown.contains("Recovered after retry."));
+}
+
+#[gpui::test]
+async fn test_pending_subagent_results_persist_across_db_round_trip(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let action_log = cx.new(|_| ActionLog::new(project.clone()));
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+
+    let thread = cx.new(|cx| {
+        Thread::new(
+            project.clone(),
+            project_context.clone(),
+            context_server_registry.clone(),
+            Templates::new(),
+            None,
+            cx,
+        )
+    });
+
+    thread.update(cx, |thread, cx| {
+        thread.enqueue_subagent_result(
+            crate::SubagentResultMessage {
+                session_id: acp_v2::SessionId::new("sub-canceled"),
+                label: "canceled worker".into(),
+                status: crate::SubagentResultStatus::Canceled,
+                output: "Subagent was canceled by the user.".to_string(),
+            },
+            cx,
+        );
+        thread.enqueue_subagent_result(
+            crate::SubagentResultMessage {
+                session_id: acp_v2::SessionId::new("sub-completed"),
+                label: "completed worker".into(),
+                status: crate::SubagentResultStatus::Completed,
+                output: "persisted subagent output".to_string(),
+            },
+            cx,
+        );
+    });
+
+    let saved_db_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    assert_eq!(saved_db_thread.pending_subagent_results.len(), 1);
+    assert_eq!(saved_db_thread.pending_canceled_subagent_results.len(), 1);
+
+    let forked =
+        serde_json::from_value::<crate::DbThread>(serde_json::to_value(&saved_db_thread).unwrap())
+            .unwrap()
+            .forked();
+    assert!(forked.pending_subagent_results.is_empty());
+    assert!(forked.pending_canceled_subagent_results.is_empty());
+
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "version": crate::DbThread::VERSION,
+        "title": saved_db_thread.title,
+        "messages": saved_db_thread.messages,
+        "updated_at": saved_db_thread.updated_at,
+        "pending_subagent_results": saved_db_thread.pending_subagent_results,
+        "pending_canceled_subagent_results": saved_db_thread.pending_canceled_subagent_results,
+    }))
+    .unwrap();
+    let decoded = crate::DbThread::from_json(&encoded).unwrap();
+    let restored = cx.new(|cx| {
+        Thread::from_db(
+            acp_v2::SessionId::new("restored-parent"),
+            decoded,
+            project.clone(),
+            project_context.clone(),
+            context_server_registry.clone(),
+            Templates::new(),
+            action_log.clone(),
+            cx,
+        )
+    });
+
+    assert!(restored.read_with(cx, |thread, _| thread.has_pending_subagent_results()));
+    let flushed = restored.update(cx, |thread, cx| thread.flush_pending_subagent_results(cx));
+    assert!(flushed);
+    assert!(!restored.read_with(cx, |thread, _| thread.has_pending_subagent_results()));
+
+    let restored_db = restored.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    assert!(restored_db.pending_subagent_results.is_empty());
+    assert!(restored_db.pending_canceled_subagent_results.is_empty());
+    assert_eq!(restored_db.messages.len(), 1);
+    match restored_db.messages[0].as_ref() {
+        crate::Message::SubagentResult { results, .. } => {
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].session_id.0.as_ref(), "sub-canceled");
+            assert_eq!(results[1].session_id.0.as_ref(), "sub-completed");
+            assert_eq!(results[1].output, "persisted subagent output");
+        }
+        other => panic!("expected SubagentResult message, got {other:?}"),
+    }
+}
+
+#[gpui::test]
 async fn test_edit_file_tool_deny_rule_blocks_edit(cx: &mut TestAppContext) {
     init_test(cx);
 

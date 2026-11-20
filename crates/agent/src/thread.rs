@@ -1492,6 +1492,8 @@ pub(crate) struct StreamingSaveKey {
     thinking_effort: Option<String>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
+    pending_subagent_results: Vec<SubagentResultMessage>,
+    pending_canceled_subagent_results: Vec<SubagentResultMessage>,
 }
 
 pub struct Thread {
@@ -2143,8 +2145,8 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
-            pending_subagent_results: Vec::new(),
-            pending_canceled_subagent_results: Vec::new(),
+            pending_subagent_results: db_thread.pending_subagent_results,
+            pending_canceled_subagent_results: db_thread.pending_canceled_subagent_results,
             completed_background_tool_calls: HashMap::default(),
             queued_subagent_steers: std::collections::VecDeque::new(),
             steered_interrupt_requested: false,
@@ -2254,6 +2256,8 @@ impl Thread {
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
             action_log: self.action_log.read(cx).serialize(cx),
+            pending_subagent_results: self.pending_subagent_results.clone(),
+            pending_canceled_subagent_results: self.pending_canceled_subagent_results.clone(),
         };
 
         cx.background_spawn(async move {
@@ -2280,6 +2284,8 @@ impl Thread {
             thinking_effort: self.thinking_effort.clone(),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            pending_subagent_results: self.pending_subagent_results.clone(),
+            pending_canceled_subagent_results: self.pending_canceled_subagent_results.clone(),
         }
     }
 
@@ -2698,8 +2704,13 @@ impl Thread {
                     .detach();
             }
         }
+        let had_pending_subagent_results = !self.pending_subagent_results.is_empty()
+            || !self.pending_canceled_subagent_results.is_empty();
         self.pending_subagent_results.clear();
         self.pending_canceled_subagent_results.clear();
+        if had_pending_subagent_results {
+            cx.notify();
+        }
         self.completed_background_tool_calls.clear();
         self.queued_subagent_steers.clear();
         self.steered_interrupt_requested = false;

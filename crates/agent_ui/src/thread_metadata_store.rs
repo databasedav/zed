@@ -1885,6 +1885,8 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             action_log: Default::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         }
     }
 

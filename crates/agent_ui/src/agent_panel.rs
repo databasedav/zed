@@ -13104,6 +13104,8 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             action_log: action_log::SerializedActionLog::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));

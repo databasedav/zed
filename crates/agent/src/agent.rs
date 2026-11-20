@@ -69,6 +69,7 @@ use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use util::ResultExt;
@@ -259,6 +260,21 @@ struct NativeExecution {
     retry_action: Option<NativeRetryAction>,
     cancellation: Option<oneshot::Sender<NativeCancellation>>,
     completion: NativeCompletion,
+    finished: Arc<AtomicBool>,
+}
+
+impl NativeExecution {
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+struct ExecutionFinishedGuard(Arc<AtomicBool>);
+
+impl Drop for ExecutionFinishedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -980,16 +996,40 @@ impl NativeAgent {
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
-            cx.subscribe(&acp_thread, |_this, thread, event, cx| {
-                if matches!(
-                    event,
-                    acp_thread::AcpThreadEvent::ToolAuthorizationRequested(_)
-                        | acp_thread::AcpThreadEvent::ToolAuthorizationReceived(_)
-                        | acp_thread::AcpThreadEvent::ElicitationRequested(_)
-                        | acp_thread::AcpThreadEvent::ElicitationResponded(_)
-                        | acp_thread::AcpThreadEvent::EntriesRemoved(_)
-                ) {
-                    thread.update(cx, |thread, cx| thread.sync_local_action_state(cx));
+            cx.subscribe(&acp_thread, {
+                let session_id = session_id.clone();
+                move |this, thread, event, cx| {
+                    if matches!(
+                        event,
+                        acp_thread::AcpThreadEvent::ToolAuthorizationRequested(_)
+                            | acp_thread::AcpThreadEvent::ToolAuthorizationReceived(_)
+                            | acp_thread::AcpThreadEvent::ElicitationRequested(_)
+                            | acp_thread::AcpThreadEvent::ElicitationResponded(_)
+                            | acp_thread::AcpThreadEvent::EntriesRemoved(_)
+                    ) {
+                        thread.update(cx, |thread, cx| thread.sync_local_action_state(cx));
+                    } else if matches!(event, acp_thread::AcpThreadEvent::SubmissionUpdated(_)) {
+                        let can_deliver = {
+                            let acp_thread = thread.read(cx);
+                            !acp_thread.has_unsettled_submissions()
+                                && acp_thread.status() == acp_thread::ThreadStatus::Idle
+                                && match acp_thread.foreground_state() {
+                                    None => true,
+                                    Some(acp_v2::StateUpdate::Idle(idle)) => matches!(
+                                        idle.stop_reason,
+                                        None | Some(acp_v2::StopReason::EndTurn)
+                                    ),
+                                    _ => false,
+                                }
+                        };
+                        if can_deliver
+                            && this.sessions.get(&session_id).is_some_and(|session| {
+                                session.thread.read(cx).has_pending_subagent_results()
+                            })
+                        {
+                            this.schedule_subagent_result_delivery(session_id.clone(), cx);
+                        }
+                    }
                 }
             }),
             cx.observe_release(&acp_thread, {
@@ -1129,7 +1169,7 @@ impl NativeAgent {
             if session
                 .execution
                 .as_ref()
-                .is_some_and(|execution| execution.completion.peek().is_none())
+                .is_some_and(|execution| !execution.is_finished())
             {
                 return None;
             }
@@ -1153,6 +1193,7 @@ impl NativeAgent {
             .unwrap_or_else(ClientUserMessageId::new);
         let (completion_sender, completion_receiver) = oneshot::channel();
         let completion = completion_receiver.shared();
+        let finished = Arc::new(AtomicBool::new(false));
         let (cancellation_sender, cancellation_receiver) = oneshot::channel();
         let retry_action = Some(NativeRetryAction::SubagentContinuation);
         let driver = NativeAgentConnection::drive_execution(
@@ -1164,6 +1205,7 @@ impl NativeAgent {
             retry_action.clone(),
             cancellation_receiver,
             completion_sender,
+            finished.clone(),
             cx,
         );
         if let Some(session) = self.sessions.get_mut(session_id) {
@@ -1173,6 +1215,7 @@ impl NativeAgent {
                 retry_action,
                 cancellation: Some(cancellation_sender),
                 completion,
+                finished,
             });
         }
         acp_thread
@@ -2666,7 +2709,7 @@ impl NativeAgentConnection {
                         let Some(execution) = &mut session.execution else {
                             return Ok(None);
                         };
-                        if execution.completion.peek().is_some() {
+                        if execution.is_finished() {
                             return Ok(None);
                         }
                         if let Some(sender) = execution.cancellation.take()
@@ -2758,6 +2801,7 @@ impl NativeAgentConnection {
                         (message_id, retry_action)
                     };
                     let (cancellation_sender, cancellation_receiver) = oneshot::channel();
+                    let finished = Arc::new(AtomicBool::new(false));
                     let driver = Self::drive_execution(
                         agent.clone(),
                         session_id.clone(),
@@ -2767,6 +2811,7 @@ impl NativeAgentConnection {
                         retry_action.clone(),
                         cancellation_receiver,
                         completion_sender,
+                        finished.clone(),
                         cx,
                     );
                     agent.update(cx, |agent, _cx| -> Result<()> {
@@ -2780,6 +2825,7 @@ impl NativeAgentConnection {
                             retry_action,
                             cancellation: Some(cancellation_sender),
                             completion: driver_completion,
+                            finished,
                         });
                         Ok(())
                     })??;
@@ -2813,9 +2859,11 @@ impl NativeAgentConnection {
         retry_action: Option<NativeRetryAction>,
         cancellation: oneshot::Receiver<NativeCancellation>,
         completion: oneshot::Sender<std::result::Result<acp_v2::StopReason, Arc<anyhow::Error>>>,
+        finished: Arc<AtomicBool>,
         cx: &App,
     ) -> Task<()> {
         cx.spawn(async move |cx| {
+            let finished_guard = ExecutionFinishedGuard(finished);
             let execution = cx.spawn({
                 let agent = agent.clone();
                 let session_id = session_id.clone();
@@ -2905,6 +2953,10 @@ impl NativeAgentConnection {
                 }
             };
             let should_check_subagents = matches!(result, Ok(acp_v2::StopReason::EndTurn));
+            // Mark finished before signaling completion or scheduling follow-up
+            // continuations, because receipt callers drop the Shared completion
+            // observer without ever polling it.
+            drop(finished_guard);
             if completion.send(result).is_err() {
                 log::debug!("Native completion observer was dropped");
             }
@@ -4626,15 +4678,23 @@ impl NativeAgentConnection {
                 agent.send_compact_command(message_id, session_id, cx)
             }),
             Some(NativeRetryAction::SubagentContinuation) => {
-                self.run_turn(session_id, cx, |thread, cx| {
-                    thread.update(cx, |thread, cx| {
-                        thread
-                            .deliver_pending_subagent_results(cx)
-                            .unwrap_or_else(|| {
-                                let (_tx, rx) = mpsc::unbounded();
-                                Ok(rx)
-                            })
-                    })
+                let agent = self.0.downgrade();
+                let prepared_session_id = session_id.clone();
+                self.run_turn(session_id, cx, move |thread, cx| {
+                    let stream =
+                        thread.update(cx, |thread, cx| thread.deliver_pending_subagent_results(cx));
+                    match stream {
+                        Some(stream) => {
+                            agent.update(cx, |agent, _cx| {
+                                agent.mark_execution_history_prepared(&prepared_session_id)
+                            })??;
+                            stream
+                        }
+                        None => {
+                            let (_tx, rx) = mpsc::unbounded();
+                            Ok(rx)
+                        }
+                    }
                 })
             }
             None => self.run_turn(session_id, cx, |thread, cx| {
@@ -12340,6 +12400,8 @@ mod internal_tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             action_log: Default::default(),
+            pending_subagent_results: Vec::new(),
+            pending_canceled_subagent_results: Vec::new(),
         };
         database
             .save_thread(
