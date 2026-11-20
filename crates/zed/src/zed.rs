@@ -78,6 +78,7 @@ use settings::{
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
 use sidebar::Sidebar;
+use video_viewer::VideoInfo;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -615,6 +616,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let pending_keystrokes_indicator =
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
+        let video_info = cx.new(|_cx| VideoInfo::new(workspace));
 
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
@@ -647,6 +649,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(line_ending_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            status_bar.add_right_item(video_info, window, cx);
             // Keep these last so they stay leftmost and can change without moving the other items.
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(pending_keystrokes_indicator, window, cx);
@@ -6374,6 +6377,7 @@ mod tests {
                 "toast",
                 "toolchain",
                 "variable_list",
+                "video_viewer",
                 "vim",
                 "which_key",
                 "window",
@@ -6582,6 +6586,7 @@ mod tests {
                 cx,
             );
             image_viewer::init(cx);
+            video_viewer::init(cx);
             language_model::init(cx);
             client::RefreshLlmTokenListener::register(
                 app_state.client.clone(),

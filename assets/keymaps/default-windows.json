@@ -1626,6 +1626,28 @@
     },
   },
   {
+    "context": "VideoViewer",
+    "bindings": {
+      "space": "video_viewer::TogglePlayback",
+      "k": "video_viewer::TogglePlayback",
+      "left": "video_viewer::SeekBackward",
+      "right": "video_viewer::SeekForward",
+      "j": "video_viewer::SeekBackwardLong",
+      "l": "video_viewer::SeekForwardLong",
+      ",": "video_viewer::StepBackward",
+      ".": "video_viewer::StepForward",
+      "0": "video_viewer::SeekToStart",
+      "home": "video_viewer::SeekToStart",
+      "m": "video_viewer::ToggleMute",
+      "up": "video_viewer::VolumeUp",
+      "down": "video_viewer::VolumeDown",
+      "r": "video_viewer::ToggleLoop",
+      "[": "video_viewer::DecreaseSpeed",
+      "]": "video_viewer::IncreaseSpeed",
+      "ctrl-k r": "editor::RevealInFileManager",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "alt-1": "new_process_modal::ActivateTaskTab",

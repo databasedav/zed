@@ -24,6 +24,7 @@ test-support = [
     "editor/test-support",
     "terminal_view/test-support",
     "image_viewer/test-support",
+    "video_viewer/test-support",
     "recent_projects/test-support",
     "repl/test-support",
     "title_bar/test-support",
@@ -42,6 +43,7 @@ visual-tests = [
     "editor/test-support",
     "terminal_view/test-support",
     "image_viewer/test-support",
+    "video_viewer/test-support",
     "clock/test-support",
     "acp_thread/test-support",
     "action_log/test-support",
@@ -223,6 +225,7 @@ url.workspace = true
 urlencoding.workspace = true
 util.workspace = true
 uuid.workspace = true
+video_viewer.workspace = true
 vim.workspace = true
 vim_mode_setting.workspace = true
 watch.workspace = true
@@ -268,6 +271,7 @@ env_logger.workspace = true
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["profiler", "test-support"] }
 image_viewer = { workspace = true, features = ["test-support"] }
+video_viewer = { workspace = true, features = ["test-support"] }
 itertools.workspace = true
 language = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
