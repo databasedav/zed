@@ -304,6 +304,7 @@ impl AgentTool for SpawnAgentTool {
                                     model_name: subagent.model_name(cx),
                                     thinking_effort: subagent.thinking_effort(cx),
                                     speed: subagent.speed(cx),
+                                    is_steer: false,
                                 };
                                 LaunchOutcome::Spawned(subagent, session_info)
                             }
@@ -327,6 +328,7 @@ impl AgentTool for SpawnAgentTool {
                                 model_name: subagent.model_name(cx),
                                 thinking_effort: subagent.thinking_effort(cx),
                                 speed: subagent.speed(cx),
+                                is_steer: false,
                             };
                             LaunchOutcome::Spawned(subagent, session_info)
                         }),

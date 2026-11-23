@@ -4487,6 +4487,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     .as_ref()
                     .and_then(|(_, _, _, _, speed)| speed.clone())
             }),
+            is_steer: false,
         };
 
         if let Some((tool_call_id, _, _, _, _)) = &existing_card {
@@ -5238,6 +5239,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     model_name,
                     thinking_effort,
                     speed,
+                    is_steer: true,
                 },
                 pending_steers,
             });

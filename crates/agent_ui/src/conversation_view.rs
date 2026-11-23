@@ -949,6 +949,11 @@ impl ConversationView {
         connected.navigate_to_thread(session_id);
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
+            view.update(cx, |view, cx| {
+                if view.is_subagent() && view.is_effectively_generating(cx) {
+                    view.list_state.scroll_to_end();
+                }
+            });
         }
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         cx.notify();
@@ -1988,6 +1993,19 @@ impl ConversationView {
         {
             cx.emit(RootThreadUpdated);
         }
+        let should_notify_parent_view = is_subagent
+            && matches!(
+                event,
+                AcpThreadEvent::NewEntry
+                    | AcpThreadEvent::EntryUpdated(_)
+                    | AcpThreadEvent::EntriesRemoved(_)
+                    | AcpThreadEvent::StatusChanged
+                    | AcpThreadEvent::TitleUpdated
+                    | AcpThreadEvent::TokenUsageUpdated(_)
+                    | AcpThreadEvent::Stopped { .. }
+                    | AcpThreadEvent::Error
+                    | AcpThreadEvent::Refusal
+            );
         match event {
             AcpThreadEvent::ActivityConfirmedIdle => {
                 if !is_subagent {
@@ -2151,6 +2169,8 @@ impl ConversationView {
                             window,
                             cx,
                         );
+                    } else {
+                        self.notify_parent_thread_view(thread, cx);
                     }
                     return;
                 }
@@ -2170,6 +2190,8 @@ impl ConversationView {
                             window,
                             cx,
                         );
+                    } else {
+                        self.notify_parent_thread_view(thread, cx);
                     }
                     return;
                 }
@@ -2203,10 +2225,13 @@ impl ConversationView {
                             window,
                             cx,
                         );
+                    } else {
+                        self.notify_parent_thread_view(thread, cx);
                     }
                     return;
                 }
                 if is_subagent {
+                    self.notify_parent_thread_view(thread, cx);
                     return;
                 }
 
@@ -2379,7 +2404,18 @@ impl ConversationView {
                 cx.notify();
             }
         }
+        if should_notify_parent_view {
+            self.notify_parent_thread_view(thread, cx);
+        }
         cx.notify();
+    }
+
+    fn notify_parent_thread_view(&self, thread: &Entity<AcpThread>, cx: &mut Context<Self>) {
+        if let Some(parent_session_id) = thread.read(cx).parent_session_id().cloned()
+            && let Some(parent_view) = self.thread_view(&parent_session_id)
+        {
+            parent_view.update(cx, |_, cx| cx.notify());
+        }
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {
@@ -7215,6 +7251,7 @@ pub(crate) mod tests {
                 model_name: None,
                 thinking_effort: None,
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -7368,6 +7405,7 @@ pub(crate) mod tests {
                     model_name: None,
                     thinking_effort: None,
                     speed: None,
+                    is_steer: false,
                 })
                 .expect("subagent session info should serialize"),
             )]);
@@ -18105,6 +18143,7 @@ pub(crate) mod tests {
                     model_name: None,
                     thinking_effort: None,
                     speed: None,
+                    is_steer: false,
                 })
                 .expect("subagent session info should serialize"),
             )]));
@@ -19785,6 +19824,7 @@ pub(crate) mod tests {
                         model_name: None,
                         thinking_effort: None,
                         speed: None,
+                        is_steer: false,
                     })
                     .expect("subagent session context"),
                 )]));
@@ -22429,6 +22469,7 @@ pub(crate) mod tests {
                 model_name: Some("Gemini 3 Flash".into()),
                 thinking_effort: Some("High".into()),
                 speed: Some("Fast".into()),
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22478,6 +22519,7 @@ pub(crate) mod tests {
                 model_name: None,
                 thinking_effort: None,
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22552,6 +22594,135 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_external_subagent_stays_live_across_steer_and_completes_in_sync(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_subagent_messaging(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root_view = active_thread(&conversation_view, cx);
+        let root_thread = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("subagent-live-sync");
+
+        let run_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 0,
+                message_end_index: None,
+                model_name: Some("Gemini 3.1 Pro".into()),
+                thinking_effort: Some("High".into()),
+                speed: None,
+                is_steer: false,
+            })
+            .expect("run subagent session info should serialize"),
+        )]);
+        cx.update(|_, cx| {
+            let mut call = acp_v1::ToolCall::new("spawn-live", "Investigate live state")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            call.meta = Some(run_meta);
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Emit a completed steer tool call targeting the same running subagent.
+        let steer_meta = acp_v1::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(acp_thread::SubagentSessionInfo {
+                session_id: child_session_id.clone(),
+                message_start_index: 1,
+                message_end_index: Some(1),
+                model_name: Some("Gemini 3.1 Pro".into()),
+                thinking_effort: Some("High".into()),
+                speed: None,
+                is_steer: true,
+            })
+            .expect("steer subagent session info should serialize"),
+        )]);
+        cx.update(|_, cx| {
+            let mut steer_call = acp_v1::ToolCall::new("steer-live", "Steer live state")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::Completed);
+            steer_call.meta = Some(steer_meta);
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(steer_call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Navigate into the subagent fullscreen thread: it must still be actively generating,
+        // with titlebar spinner + Stop button + live generating row in the transcript!
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let child_view = active_thread(&conversation_view, cx);
+        let child_thread = child_view.read_with(cx, |view, _| view.thread.clone());
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating,
+            "external subagent must stay Generating while parent run call is active even after a completed steer",
+        );
+        assert!(
+            child_view.read_with(cx, |view, _| view.generating_indicator_in_list),
+            "running external subagent must render the live generating indicator in its transcript",
+        );
+        assert!(
+            cx.debug_bounds("subagent-titlebar-running").is_some(),
+            "running external subagent titlebar must show live spinner",
+        );
+        assert!(
+            cx.debug_bounds("subagent-titlebar-stop").is_some(),
+            "running external subagent titlebar must keep Stop button visible",
+        );
+
+        // Completing the parent run tool call must transition the fullscreen subagent to Idle
+        // and remove the spinner, Stop button, and live generating indicator.
+        cx.update(|_, cx| {
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                    "spawn-live",
+                    acp_v1::ToolCallUpdateFields::new().status(acp_v1::ToolCallStatus::Completed),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            child_thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle,
+        );
+        assert!(
+            !child_view.read_with(cx, |view, _| view.generating_indicator_in_list),
+            "completed subagent must remove live generating indicator",
+        );
+        assert!(
+            cx.debug_bounds("subagent-titlebar-running").is_none(),
+            "completed subagent titlebar must replace spinner with completion icon",
+        );
+        assert!(
+            cx.debug_bounds("subagent-titlebar-stop").is_none(),
+            "completed subagent titlebar must hide Stop button",
+        );
+    }
+
+    #[gpui::test]
     async fn test_running_subagents_activity_bar_drawer_and_controls(cx: &mut TestAppContext) {
         init_test(cx);
         let connection = StubAgentConnection::new()
@@ -22582,6 +22753,7 @@ pub(crate) mod tests {
                 model_name: Some("Gemini 3.1 Pro".into()),
                 thinking_effort: Some("High".into()),
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22640,6 +22812,7 @@ pub(crate) mod tests {
                 model_name: Some("Claude Sonnet 4.6".into()),
                 thinking_effort: Some("Medium".into()),
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -22727,6 +22900,7 @@ pub(crate) mod tests {
                 model_name: None,
                 thinking_effort: None,
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);
@@ -23047,6 +23221,7 @@ pub(crate) mod tests {
                 model_name: Some("GPT-5.4".into()),
                 thinking_effort: Some("High".into()),
                 speed: None,
+                is_steer: false,
             })
             .expect("subagent session info should serialize"),
         )]);

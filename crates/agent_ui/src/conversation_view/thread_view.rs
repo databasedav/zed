@@ -1644,7 +1644,7 @@ impl ThreadView {
         }
     }
 
-    fn is_subagent(&self) -> bool {
+    pub(crate) fn is_subagent(&self) -> bool {
         self.parent_session_id.is_some()
     }
 
@@ -1695,7 +1695,7 @@ impl ThreadView {
         !self.message_queue.is_empty() || self.pending_queued_dispatch.is_some()
     }
 
-    fn is_effectively_generating(&self, cx: &App) -> bool {
+    pub(crate) fn is_effectively_generating(&self, cx: &App) -> bool {
         let thread = self.thread.read(cx);
         thread.status() == ThreadStatus::Generating
             || self.pending_queued_dispatch.is_some()
@@ -1859,7 +1859,13 @@ impl ThreadView {
                 cx.background_executor()
                     .timer(LIVE_METRICS_TICK_INTERVAL)
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.notify_parent_if_subagent_preview_expanded(cx);
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1903,7 +1909,7 @@ impl ThreadView {
                 thread.effective_live_telemetry(),
             )
         };
-        if !uses_reported_activity {
+        if !uses_reported_activity && !self.is_subagent() {
             return;
         }
 
@@ -1916,7 +1922,8 @@ impl ThreadView {
             ForegroundActivity::Running | ForegroundActivity::RequiresAction => {
                 if self.turn_fields.reported_activity_generation != Some(activity_generation) {
                     self.initialize_turn(cx);
-                    self.turn_fields.turn_started_at = started_at;
+                    self.turn_fields.turn_started_at =
+                        started_at.or(self.turn_fields.turn_started_at);
                     self.turn_fields.reported_activity_generation = Some(activity_generation);
                 }
                 if let Some(output_tokens) = output_tokens {
@@ -1926,6 +1933,7 @@ impl ThreadView {
             ForegroundActivity::Idle => {
                 if self.turn_fields.turn_started_at.is_some() {
                     self.stop_turn(self.turn_fields.turn_generation, cx);
+                    self.clear_auto_expand_tracking(cx);
                 }
                 if self.turn_fields.reported_activity_generation != Some(activity_generation) {
                     self.turn_fields.last_turn_tokens = None;
@@ -1940,6 +1948,61 @@ impl ThreadView {
             }
         }
         cx.notify();
+    }
+
+    fn notify_parent_if_subagent_preview_expanded(&self, cx: &mut Context<Self>) {
+        let Some(parent_session_id) = self.parent_session_id.as_ref() else {
+            return;
+        };
+        let Some(server_view) = self.server_view.upgrade() else {
+            return;
+        };
+        let Some(parent_view) = server_view.read(cx).thread_view(parent_session_id) else {
+            return;
+        };
+        if parent_view
+            .read(cx)
+            .has_expanded_subagent_card_for(&self.session_id, cx)
+        {
+            parent_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn has_expanded_subagent_card_for(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> bool {
+        let thread = self.thread.read(cx);
+        let own_session_id = thread.session_id();
+        thread.entries().iter().any(|entry| match entry {
+            AgentThreadEntry::ToolCall(call) => {
+                call.subagent_session_info
+                    .as_ref()
+                    .is_some_and(|info| &info.session_id == subagent_session_id)
+                    && self
+                        .is_subagent_card_expanded(&SubagentCardId::ToolCall(call.id.clone()), cx)
+            }
+            AgentThreadEntry::SessionMessage(message) => {
+                let SessionMessageSide::Outgoing {
+                    recipient: Some(recipient),
+                } = message.side(own_session_id)
+                else {
+                    return false;
+                };
+                if recipient != subagent_session_id {
+                    return false;
+                }
+                let acp_thread::MessageIdentity::Keyed(message_id) = &message.identity else {
+                    return false;
+                };
+                self.is_subagent_card_expanded(
+                    &SubagentCardId::SessionMessage(message_id.clone()),
+                    cx,
+                )
+            }
+            _ => false,
+        })
     }
 
     pub(crate) fn sync_follow_agent_state(&mut self, cx: &mut Context<Self>) {
@@ -6966,6 +7029,13 @@ impl ThreadView {
                                         .color(Color::Muted),
                                 )
                                 .child(div().flex_1().min_w_0().child(self.title_editor.clone()))
+                                .when(!is_done, |this| {
+                                    this.child(
+                                        div()
+                                            .debug_selector(|| "subagent-titlebar-running".into())
+                                            .child(SpinnerLabel::new().size(LabelSize::Small)),
+                                    )
+                                })
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(Icon::new(IconName::Close).color(Color::Error))
                                 })
@@ -7049,7 +7119,8 @@ impl ThreadView {
             let (reported_status, _) =
                 SubagentStatus::from_reported_state(self.thread.read(cx).foreground_state());
             let is_running = self.thread.read(cx).status() == ThreadStatus::Generating
-                || reported_status == SubagentStatus::Running;
+                || reported_status == SubagentStatus::Running
+                || self.parent_subagent_tool_call_status(cx) == Some(SubagentStatus::Running);
             let session_id = self.session_id.clone();
             self.ensure_subagent_composer(session_id.clone(), is_running, true, window, cx);
             let max_content_width = AgentSettings::get_global(cx).max_content_width;
@@ -15911,6 +15982,14 @@ impl ThreadView {
             })
             .collect();
 
+        let show_live_generating = state.status == SubagentStatus::Running
+            && state.entries.as_ref().is_none_or(|entries| entries.end.is_none())
+            && subagent_view.is_effectively_generating(cx);
+        let generating_indicator = show_live_generating.then(|| {
+            let confirmation = subagent_view.thread.read(cx).is_waiting_for_confirmation();
+            subagent_view.render_generating(confirmation, cx)
+        });
+
         v_flex()
             .w_full()
             .border_t_1()
@@ -15928,7 +16007,8 @@ impl ThreadView {
                     // ids for its inlined entries (avoids duplicate a11y ids).
                     .id(format!("subagent-entries-{}-{}", session_id, card_id))
                     .track_scroll(&scroll_handle)
-                    .children(rendered_entries),
+                    .children(rendered_entries)
+                    .children(generating_indicator),
             )
             .h_56()
             .child(overlay)

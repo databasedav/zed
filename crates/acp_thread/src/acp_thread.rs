@@ -337,6 +337,10 @@ pub struct SubagentSessionInfo {
     /// Optional display label for the subagent's speed mode (e.g. `"Fast"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
+    /// Whether this tool call only delivered a steering message to an already-running
+    /// subagent rather than owning a run of the subagent itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_steer: bool,
 }
 
 /// Helper to extract subagent session id from ACP meta
@@ -2110,6 +2114,15 @@ pub enum ToolCallStatus {
     Rejected,
     /// The user canceled generation so the tool call was canceled.
     Canceled,
+}
+
+impl ToolCallStatus {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::InProgress | Self::Paused | Self::WaitingForConfirmation
+        )
+    }
 }
 
 impl From<acp_v1::ToolCallStatus> for ToolCallStatus {
@@ -5413,6 +5426,80 @@ impl AcpThread {
         }
     }
 
+    /// Synchronizes a `Completion`-transport subagent's foreground activity with its
+    /// parent's `spawn_agent` tool call status.
+    ///
+    /// External ACP v1 subagents loaded via `load_session` never receive a client-driven
+    /// `send()` call and do not emit v2 `state_update` notifications, so their foreground
+    /// activity would otherwise stay permanently `Idle` while the parent's tool call runs.
+    pub fn set_parent_driven_running(&mut self, running: bool, cx: &mut Context<Self>) {
+        if self.uses_reported_activity()
+            || self.subagent_association.is_some()
+            || self.parent_session_id.is_none()
+        {
+            return;
+        }
+        if running == self.foreground_activity().is_active() {
+            return;
+        }
+        if running {
+            let preserved_telemetry = self
+                .reported_live_telemetry
+                .clone()
+                .filter(|(telemetry, reported_at)| {
+                    telemetry.phase != LiveStreamPhase::Idle
+                        && reported_at.elapsed() < Duration::from_secs(10)
+                });
+            let desired = if self.has_pending_turn_action() {
+                acp_v2::StateUpdate::RequiresAction(acp_v2::RequiresActionStateUpdate::new())
+            } else {
+                acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new())
+            };
+            self.set_foreground_state(desired, cx);
+            if let Some(telemetry) = preserved_telemetry {
+                self.reported_live_telemetry = Some(telemetry);
+            }
+        } else {
+            self.set_foreground_state(
+                acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                cx,
+            );
+        }
+        cx.emit(AcpThreadEvent::StatusChanged);
+    }
+
+    fn sync_parent_driven_subagent_activity(
+        &self,
+        subagent_session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subagent) = self.subagents.get(subagent_session_id).cloned() else {
+            return;
+        };
+        let is_running = self
+            .tool_call_for_subagent(subagent_session_id)
+            .is_some_and(|call| call.status().is_active());
+        subagent.update(cx, |subagent, cx| {
+            subagent.set_parent_driven_running(is_running, cx);
+        });
+    }
+
+    fn sync_all_parent_driven_subagent_activities(&self, cx: &mut Context<Self>) {
+        let subagents: Vec<(acp_v2::SessionId, Entity<AcpThread>)> = self
+            .subagents
+            .iter()
+            .map(|(id, thread)| (id.clone(), thread.clone()))
+            .collect();
+        for (session_id, subagent) in subagents {
+            let is_running = self
+                .tool_call_for_subagent(&session_id)
+                .is_some_and(|call| call.status().is_active());
+            subagent.update(cx, |subagent, cx| {
+                subagent.set_parent_driven_running(is_running, cx);
+            });
+        }
+    }
+
     pub fn update_session_state(
         &mut self,
         state: acp_v2::StateUpdate,
@@ -6900,6 +6987,7 @@ impl AcpThread {
             }
         });
         self.subagents.insert(session_id.clone(), subagent);
+        self.sync_parent_driven_subagent_activity(&session_id, cx);
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
 
@@ -7068,6 +7156,10 @@ impl AcpThread {
                         call.status(),
                         ToolCallStatus::Completed | ToolCallStatus::Failed
                     );
+                let subagent_session_id = call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|info| info.session_id.clone());
                 let detached_id =
                     authorization_id.filter(|id| call.authorization_id() != Some(*id));
                 if let Some(id) = detached_id {
@@ -7081,6 +7173,9 @@ impl AcpThread {
                     self.resolve_locations(id, cx);
                 }
                 self.sync_local_stream_tracker_with_tools();
+                if let Some(subagent_session_id) = subagent_session_id {
+                    self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+                }
                 cx.emit(AcpThreadEvent::EntryUpdated(index));
                 if settled_at_boundary
                     && self.end_turn_at_next_boundary
@@ -7228,6 +7323,10 @@ impl AcpThread {
             {
                 call.set_legacy_status(status);
             }
+            let subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
             if let Some(id) = detached_id {
                 self.resolve_permission_request(id, RequestPermissionOutcome::Cancelled, cx);
             }
@@ -7236,6 +7335,9 @@ impl AcpThread {
                 return Err(error);
             }
 
+            if let Some(subagent_session_id) = subagent_session_id {
+                self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+            }
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
         } else {
             anyhow::ensure!(
@@ -7252,7 +7354,14 @@ impl AcpThread {
             if let Some(status) = status {
                 call.set_legacy_status(status);
             }
+            let subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
+            if let Some(subagent_session_id) = subagent_session_id {
+                self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+            }
         };
 
         self.resolve_locations(id, cx);
@@ -7304,26 +7413,39 @@ impl AcpThread {
             terminals: &self.terminals,
             client_managed_only: client_managed_terminals_only,
         };
-        if let Some(index) = self.index_for_tool_call(&id) {
+        let subagent_session_id = if let Some(index) = self.index_for_tool_call(&id) {
             let AgentThreadEntry::ToolCall(call) = &mut self.entries[index] else {
                 unreachable!()
             };
             let authorization_id = call.authorization_id();
             let result = call.apply_patch(patch, languages, terminals, cx);
+            let subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
             let detached_id = authorization_id.filter(|id| call.authorization_id() != Some(*id));
             if let Some(id) = detached_id {
                 self.resolve_permission_request(id, RequestPermissionOutcome::Cancelled, cx);
             }
             cx.emit(AcpThreadEvent::EntryUpdated(index));
             result?;
+            subagent_session_id
         } else {
             let call = ToolCall::from_patch(id.clone(), patch, languages, terminals, cx)?;
+            let subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
-        }
+            subagent_session_id
+        };
         if locations_changed {
             self.resolve_locations(id, cx);
         }
         self.sync_local_stream_tracker_with_tools();
+        if let Some(subagent_session_id) = subagent_session_id {
+            self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+        }
         Ok(())
     }
 
@@ -7427,19 +7549,36 @@ impl AcpThread {
 
     /// The latest tool call that ran the subagent `session_id`. A resumed subagent has one
     /// per run, and the latest says how the subagent's current work went.
+    ///
+    /// An active run call takes precedence over a later completed auxiliary call (such as a
+    /// steering call) referencing the same subagent, and non-steer runs take precedence over
+    /// steer-only calls so a completed steer never masks a running, failed, or canceled run.
     pub fn tool_call_for_subagent(&self, session_id: &acp_v2::SessionId) -> Option<&ToolCall> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            AgentThreadEntry::ToolCall(tool_call) => {
-                if let Some(subagent_session_info) = &tool_call.subagent_session_info
-                    && &subagent_session_info.session_id == session_id
-                {
-                    Some(tool_call)
-                } else {
-                    None
-                }
+        let mut latest_non_steer: Option<&ToolCall> = None;
+        let mut latest_any: Option<&ToolCall> = None;
+
+        for entry in self.entries.iter().rev() {
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+            let Some(subagent_session_info) = &tool_call.subagent_session_info else {
+                continue;
+            };
+            if &subagent_session_info.session_id != session_id {
+                continue;
             }
-            _ => None,
-        })
+            if !subagent_session_info.is_steer && tool_call.status().is_active() {
+                return Some(tool_call);
+            }
+            if !subagent_session_info.is_steer && latest_non_steer.is_none() {
+                latest_non_steer = Some(tool_call);
+            }
+            if latest_any.is_none() {
+                latest_any = Some(tool_call);
+            }
+        }
+
+        latest_non_steer.or(latest_any)
     }
 
     pub fn resolve_locations(&mut self, id: acp_v2::ToolCallId, cx: &mut Context<Self>) {
@@ -7745,13 +7884,21 @@ impl AcpThread {
         let Some(request) = self.permission_requests.get(&id) else {
             return;
         };
+        let mut subagent_session_id = None;
         if let Some(tool_call_id) = request.legacy_tool_call_id().cloned()
             && let Some((_, call)) = self.tool_call_mut(&tool_call_id)
             && call.authorization_id() == Some(id)
         {
             call.set_local_status(ToolCallStatus::Canceled);
+            subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
         }
         self.resolve_permission_request(id, outcome, cx);
+        if let Some(subagent_session_id) = subagent_session_id {
+            self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+        }
     }
 
     pub fn authorize_tool_call(
@@ -7823,7 +7970,14 @@ impl AcpThread {
             }
         };
         call.set_local_status(new_status);
+        let subagent_session_id = call
+            .subagent_session_info
+            .as_ref()
+            .map(|info| info.session_id.clone());
         self.resolve_permission_request(id, RequestPermissionOutcome::Selected(outcome), cx);
+        if let Some(subagent_session_id) = subagent_session_id {
+            self.sync_parent_driven_subagent_activity(&subagent_session_id, cx);
+        }
     }
 
     fn resolve_permission_request(
@@ -9089,6 +9243,9 @@ impl AcpThread {
                 }
                 _ => {}
             }
+        }
+        if canceled_any && cancel_subagents {
+            self.sync_all_parent_driven_subagent_activities(cx);
         }
         for terminal in canceled_terminals {
             terminal.update(cx, |terminal, cx| {
@@ -19143,6 +19300,181 @@ mod tests {
                 .expect("the subagent has a tool call");
             assert_eq!(latest.id, acp_v2::ToolCallId::new("resumed-run"));
             assert_eq!(latest.status(), ToolCallStatus::InProgress);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_for_subagent_prefers_active_run_over_completed_steer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("active-run"), "Run subagent")
+                        .status(acp_v1::ToolCallStatus::InProgress)
+                        .meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            json!({"session_id": "child", "message_start_index": 0}),
+                        )])),
+                    cx,
+                )
+                .expect("run tool call");
+            // Legacy completed steer without `is_steer` must not shadow an active run.
+            thread
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(
+                        acp_v1::ToolCallId::new("legacy-steer"),
+                        "Steer subagent",
+                    )
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .meta(acp_v1::Meta::from_iter([(
+                        SUBAGENT_SESSION_INFO_META_KEY.into(),
+                        json!({"session_id": "child", "message_start_index": 2, "message_end_index": 2}),
+                    )])),
+                    cx,
+                )
+                .expect("legacy steer tool call");
+            let selected = thread
+                .tool_call_for_subagent(&acp_v2::SessionId::new("child"))
+                .expect("should resolve active run");
+            assert_eq!(selected.id, acp_v2::ToolCallId::new("active-run"));
+            assert_eq!(selected.status(), ToolCallStatus::InProgress);
+
+            // Marked steer (`is_steer: true`) must also never shadow a failed run after completion.
+            thread
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("failed-run"), "Run subagent 2")
+                        .status(acp_v1::ToolCallStatus::Failed)
+                        .meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            json!({"session_id": "child-2", "message_start_index": 0}),
+                        )])),
+                    cx,
+                )
+                .expect("failed run");
+            thread
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("marked-steer"), "Steer 2")
+                        .status(acp_v1::ToolCallStatus::Completed)
+                        .meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            json!({
+                                "session_id": "child-2",
+                                "message_start_index": 1,
+                                "message_end_index": 1,
+                                "is_steer": true
+                            }),
+                        )])),
+                    cx,
+                )
+                .expect("marked steer");
+            let selected_failed = thread
+                .tool_call_for_subagent(&acp_v2::SessionId::new("child-2"))
+                .expect("should resolve failed run over completed steer");
+            assert_eq!(selected_failed.id, acp_v2::ToolCallId::new("failed-run"));
+            assert_eq!(selected_failed.status(), ToolCallStatus::Failed);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_parent_driven_running_syncs_completion_subagent_activity_and_live_telemetry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let parent = new_test_thread(cx).await;
+        let child = new_test_thread(cx).await;
+        let child_id = child.read_with(cx, |thread, _| thread.session_id().clone());
+        let status_changes = Rc::new(RefCell::new(0usize));
+        let _sub = cx.update(|cx| {
+            let status_changes = status_changes.clone();
+            cx.subscribe(&child, move |_, event, _| {
+                if matches!(event, AcpThreadEvent::StatusChanged) {
+                    *status_changes.borrow_mut() += 1;
+                }
+            })
+        });
+
+        parent.update(cx, |parent, cx| {
+            parent
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("run-1"), "Run child")
+                        .status(acp_v1::ToolCallStatus::InProgress)
+                        .meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            json!({"session_id": child_id.0, "message_start_index": 0}),
+                        )])),
+                    cx,
+                )
+                .expect("run tool call");
+            parent.register_subagent(child.clone(), cx);
+        });
+
+        child.read_with(cx, |child, _| {
+            assert!(!child.uses_reported_activity());
+            assert_eq!(child.status(), ThreadStatus::Generating);
+        });
+        assert!(*status_changes.borrow() >= 1);
+
+        // Live telemetry updates from the agent must remain active instead of being forced to Idle.
+        child.update(cx, |child, cx| {
+            let meta = acp_v2::Meta::from_iter([(
+                LIVE_TELEMETRY_META_KEY.into(),
+                json!({
+                    "phase": "streaming_response",
+                    "ttft_ms": 420,
+                    "call_elapsed_ms": 1500,
+                    "turn_output_tokens": 128,
+                    "output_tokens_per_sec": 64.5
+                }),
+            )]);
+            child.update_usage(acp_v2::UsageUpdate::new(2048, 100_000).meta(meta), cx);
+            let telemetry = child.effective_live_telemetry();
+            assert_eq!(telemetry.phase, LiveStreamPhase::StreamingResponse);
+            assert_eq!(telemetry.ttft_ms, Some(420));
+            assert_eq!(telemetry.turn_output_tokens, Some(128));
+        });
+
+        // A completed steer tool call must leave the child Generating.
+        parent.update(cx, |parent, cx| {
+            parent
+                .upsert_tool_call(
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("steer-1"), "Steer child")
+                        .status(acp_v1::ToolCallStatus::Completed)
+                        .meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            json!({
+                                "session_id": child_id.0,
+                                "message_start_index": 1,
+                                "message_end_index": 1,
+                                "is_steer": true
+                            }),
+                        )])),
+                    cx,
+                )
+                .expect("steer tool call");
+        });
+        child.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Generating);
+        });
+
+        // Finishing the parent run tool call transitions the child back to Idle.
+        parent.update(cx, |parent, cx| {
+            parent
+                .update_tool_call(
+                    acp_v1::ToolCallUpdate::new(
+                        acp_v1::ToolCallId::new("run-1"),
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                )
+                .expect("complete run");
+        });
+        child.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Idle);
+            assert_eq!(child.effective_live_telemetry().phase, LiveStreamPhase::Idle);
         });
     }
 
